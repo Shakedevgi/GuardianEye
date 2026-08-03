@@ -15,7 +15,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` complete & docs-a
 OpenCV. No AI yet. No risk logic yet.
 **Done when:** you can run one script and see a live raw video window from the
 USB camera, with no crashes, for several minutes straight.
-`[ ]`
+`[x]`
 
 ### Phase 2 — Baseline detection
 **Owner:** cv-agent
