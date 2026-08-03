@@ -1,0 +1,7 @@
+# GuardianEye - cv component - Phase 1 dependencies
+#
+# Phase 1 is raw camera capture only, no AI yet, so this list is intentionally
+# short. YOLO/torch/ultralytics get added in Phase 2 - don't add them here
+# early, per PHASE_PLAN.md.
+
+opencv-python>=4.9
