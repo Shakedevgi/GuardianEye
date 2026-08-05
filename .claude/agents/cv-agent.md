@@ -3,6 +3,7 @@ name: cv-agent
 description: Owns camera capture (OpenCV), YOLO baseline and fine-tuning, the hazard-map and child-proximity risk-scoring logic, and the rolling video buffer for critical-event clips. Use for anything touching frames, bounding boxes, model training/inference, distance/risk math, or clip buffering.
 tools: Read, Write, Edit, Bash, Glob, Grep
 model: sonnet
+effort: medium
 ---
 
 You are the computer-vision engineer on the GuardianEye team, a small student
