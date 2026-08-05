@@ -7,42 +7,34 @@ unprocessed video feed in a window, continuously, until the user quits.
 This is deliberately dumb: no detection, no risk scoring, nothing but
 "can we reliably pull frames off this camera and show them." That's all
 Phase 1 is asking for (see PHASE_PLAN.md). YOLO gets layered on top of this
-same capture loop in Phase 2.
+same capture loop in Phase 2 (see detect_stream.py) - frame acquisition
+itself now lives in camera.py so both scripts share one implementation.
 
 Usage:
     python stream_camera.py                # uses default index (see below)
     python stream_camera.py --index 1      # use camera index 1 explicitly
+    python stream_camera.py --name Arducam # select by device name (see below)
 
-Run detect_cameras.py first if you don't know which index your USB camera is.
+Run detect_cameras.py first if you don't know which index/name your USB
+camera is.
+
+Selecting by --name is the more robust option for a fixed room camera:
+AVFoundation camera indices are NOT stable across replugs or reboots (see
+docs/phase-writeups/phase-2.md) - a numeric index can silently point at a
+different physical camera later. --name re-resolves the current index every
+time the camera is (re)opened, including on a mid-stream reconnect. If both
+--index and --name are given, --name wins (see camera.py).
 
 Quit with the 'q' key (window must be focused) or by closing the window.
 """
 
 import argparse
-import time
 
 import cv2
 
-# Fallback if --index isn't passed. This is very likely NOT the USB camera on
-# a laptop (index 0 is usually the built-in webcam) - run detect_cameras.py
-# and pass --index explicitly once you know the real value. It's a constant
-# here (not hardcoded deep in the logic) specifically so it's easy to find
-# and change.
-DEFAULT_CAMERA_INDEX = 0
+from camera import DEFAULT_CAMERA_INDEX, CameraCapture, CameraSelectionError, startup_failure_message
 
 WINDOW_NAME = "GuardianEye - raw feed (Phase 1)"
-
-# If frame reads start failing (e.g. USB camera briefly disconnects), how
-# many consecutive failures we tolerate before trying to fully reopen the
-# capture, and how long to wait between reopen attempts. Simple backoff -
-# this is Phase 1, not a production reconnect strategy.
-MAX_CONSECUTIVE_READ_FAILURES = 10
-REOPEN_RETRY_DELAY_SECONDS = 1.0
-
-
-def open_capture(index: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(index)
-    return cap
 
 
 def main() -> None:
@@ -50,53 +42,57 @@ def main() -> None:
     parser.add_argument(
         "--index",
         type=int,
-        default=DEFAULT_CAMERA_INDEX,
-        help=f"OpenCV camera device index (default: {DEFAULT_CAMERA_INDEX}). "
-        "Run detect_cameras.py to find the right value for your USB camera.",
+        default=None,
+        help=f"OpenCV camera device index (default: {DEFAULT_CAMERA_INDEX} if "
+        "neither --index nor --name is given). Run detect_cameras.py to find "
+        "the right value for your USB camera. Ignored if --name is also given.",
+    )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="Select the camera by a substring of its device name (e.g. "
+        "'Arducam') instead of a numeric index. Preferred for a fixed room "
+        "camera: the index is re-resolved from the current device listing on "
+        "every (re)open, so a replug that shuffles indices can't silently "
+        "swap in the wrong camera. Wins over --index if both are given.",
     )
     args = parser.parse_args()
 
-    camera_index = args.index
-
-    cap = open_capture(camera_index)
-    if not cap.isOpened():
-        print(
-            f"Could not open camera at index {camera_index}. "
-            "Run detect_cameras.py to find a working index, or check that "
-            "the camera is plugged in and macOS camera permissions are granted."
-        )
+    try:
+        camera = CameraCapture(index=args.index, name=args.name)
+    except CameraSelectionError as exc:
+        print(str(exc))
         return
 
-    print(f"Streaming from camera index {camera_index}. Press 'q' to quit.")
+    ok, first_frame = camera.verify_startup()
+    if not ok:
+        print(startup_failure_message(camera.index))
+        camera.release()
+        return
 
-    consecutive_failures = 0
+    height, width = first_frame.shape[:2]
+    device_label = camera.resolved_name or f"index {camera.index}"
+    print(
+        f"Streaming from camera {camera.index} ({device_label}) at "
+        f"{width}x{height}. Press 'q' to quit."
+    )
+
+    # Show the verified first frame before entering the loop below so a
+    # window always exists. If the camera died the instant streaming
+    # started, waitKey() in the loop would otherwise have no window to pump
+    # events for, and neither 'q' nor the close button would do anything.
+    cv2.imshow(WINDOW_NAME, first_frame)
+    cv2.waitKey(1)
 
     try:
-        while True:
-            ok, frame = cap.read()
-
-            if not ok or frame is None:
-                consecutive_failures += 1
-                print(
-                    f"Warning: frame read failed ({consecutive_failures}/"
-                    f"{MAX_CONSECUTIVE_READ_FAILURES})"
-                )
-
-                if consecutive_failures >= MAX_CONSECUTIVE_READ_FAILURES:
-                    print("Too many failed reads in a row - reopening camera...")
-                    cap.release()
-                    time.sleep(REOPEN_RETRY_DELAY_SECONDS)
-                    cap = open_capture(camera_index)
-                    consecutive_failures = 0
-
-                    if not cap.isOpened():
-                        print("Reopen failed. Retrying in a moment...")
-                        time.sleep(REOPEN_RETRY_DELAY_SECONDS)
-
-                continue
-
-            consecutive_failures = 0
-            cv2.imshow(WINDOW_NAME, frame)
+        for frame in camera.frames():
+            # camera.frames() yields None while a read is failing/
+            # reconnecting (see its docstring) - skip display but still
+            # pump the GUI event loop and check for quit below, or the
+            # window freezes and only Ctrl+C can end the session.
+            if frame is not None:
+                cv2.imshow(WINDOW_NAME, frame)
 
             # waitKey also pumps the GUI event loop - required for imshow to
             # actually render and for the window's close button to register.
@@ -115,7 +111,7 @@ def main() -> None:
         print("Interrupted (Ctrl+C) - exiting.")
 
     finally:
-        cap.release()
+        camera.release()
         cv2.destroyAllWindows()
 
 

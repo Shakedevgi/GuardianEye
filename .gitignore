@@ -7,6 +7,14 @@ venv/
 # OS
 .DS_Store
 
+# Model weights - not source, don't belong in git (large binaries, fetched
+# on first run instead)
+*.pt
+cv/models/
+
 # Editors
 .vscode/
 .idea/
+
+# Captured frames from detect_stream.py (dataset material, not source)
+cv/captures/

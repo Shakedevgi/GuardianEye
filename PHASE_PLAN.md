@@ -23,7 +23,7 @@ USB camera, with no crashes, for several minutes straight.
 person / oven / knife / etc. No custom classes, no risk logic yet.
 **Done when:** live feed shows correct bounding boxes + labels for whatever
 COCO objects are actually in the room, in real time.
-`[ ]`
+`[x]`
 
 ### Phase 3 — Custom hazard classes
 **Owner:** cv-agent

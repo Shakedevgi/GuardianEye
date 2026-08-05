@@ -1,7 +1,33 @@
-# GuardianEye - cv component - Phase 1 dependencies
+# GuardianEye - cv component - dependencies
 #
-# Phase 1 is raw camera capture only, no AI yet, so this list is intentionally
-# short. YOLO/torch/ultralytics get added in Phase 2 - don't add them here
-# early, per PHASE_PLAN.md.
+# Phase 1 added opencv-python for raw camera capture. Phase 2 adds
+# YOLO/torch/ultralytics for stock COCO-class detection on top of that same
+# capture loop - see PHASE_PLAN.md.
+#
+# torch/torchvision/ultralytics are pinned exactly (not >=) rather than
+# following opencv-python's floor-only style: this stack is new enough
+# (YOLO26, torch 2.13, Python 3.14/cp314 wheels) that letting pip pick "any
+# newer" risks silently landing on an untested combination. Revisit pins
+# deliberately, not via auto-upgrade.
+#
+# pyobjc-framework-AVFoundation (2026-08-05, "capability matching" follow-up)
+# is macOS-ONLY - do not expect this to install on Linux/Windows, and
+# camera.py guards the import accordingly (falls back to "name-based camera
+# selection unavailable, use --index" rather than crashing on import). It
+# replaced an earlier, unpinned attempt to enumerate cameras positionally via
+# `system_profiler` that shipped, then failed in the field: two independent
+# enumeration sources (system_profiler and this same pyobjc/AVFoundation API)
+# agreed with each other on device order and BOTH disagreed with OpenCV's
+# real index order (see docs/decision-log.md, 2026-08-05 "capability
+# matching" entry). This dependency is now used only to query a NAMED
+# device's resolution capability, never to enumerate positional order -
+# capability is then matched against what OpenCV itself delivers at each
+# index (see camera.py). Pinned exactly, same reasoning as torch/ultralytics
+# above: verified resolvable for Python 3.14/cp314 on this machine at time
+# of pinning (12.2.1 was the latest available).
 
 opencv-python>=4.9
+torch==2.13.0
+torchvision==0.28.0
+ultralytics==8.4.115
+pyobjc-framework-AVFoundation==12.2.1 ; sys_platform == "darwin"
