@@ -347,3 +347,27 @@ resolution shipped, then failed in the field)
   yet on whether to accept it, bound the probe sweep, or otherwise address
   it. See `docs/phase-writeups/phase-2.md`, "After sign-off" section, for
   the full writeup. This is a flagged risk, not a decision either way.
+
+### 2026-08-05 — Phase 3 scoping (decided before the phase starts)
+
+- **Labelling and training stay entirely local; no cloud upload of training
+  images.** `PHASE_PLAN.md` previously said "Roboflow or similar." Training
+  images for this project are photographs of a real home and, unavoidably,
+  of a child. CLAUDE.md decision 8's privacy requirement is written about
+  event logs and video clips rather than training data, so this isn't
+  strictly a violation — but uploading family photos to a third-party
+  service plainly contradicts its spirit, and the gap existed only because
+  nobody had thought about training data when decision 8 was written.
+  Locally-run labelling (Label Studio / self-hosted CVAT) plus Ultralytics
+  fine-tuning on the M5 Pro via MPS means no stage of Phase 3 needs cloud.
+- **Phase 3 starts by measuring, not collecting.** Phase 2's late discovery
+  that input resolution dominates small-object detection invalidated every
+  earlier "COCO can't detect this" observation, since they were all taken at
+  imgsz 640. The list of classes actually needing fine-tuning is therefore
+  unknown until re-tested at `yolo26x --imgsz 1600`. Collecting and
+  labelling before producing that list risks spending the phase's effort on
+  classes the stock model already handles.
+- **Dataset must span varied camera placement.** There is no single
+  permanent mounting position — the camera moves between testing areas at
+  different heights and angles. A dataset shot from one fixed setup would
+  train for a scene that rarely recurs.

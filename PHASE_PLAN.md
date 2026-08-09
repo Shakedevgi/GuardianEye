@@ -27,8 +27,36 @@ COCO objects are actually in the room, in real time.
 
 ### Phase 3 — Custom hazard classes
 **Owner:** cv-agent
-**Goal:** dataset collection (Roboflow or similar) + fine-tuning for the small
-set of classes COCO doesn't cover (small choking-hazard objects, stairs, etc.)
+**Goal:** dataset collection + fine-tuning for the classes stock COCO doesn't
+handle well enough (small choking-hazard objects, stairs, etc.)
+
+**Step 0 — measure before collecting.** Phase 2 found that input resolution,
+not model size, dominates small-object detection (see
+`docs/phase-writeups/phase-2.md`). Every "COCO can't see this" observation
+made before that discovery was taken at settings that were starving the
+model, so the list of classes needing fine-tuning is currently *unknown*.
+Re-test with `yolo26x --imgsz 1600` across the real testing areas and write
+down which hazard classes stock COCO actually handles and which it doesn't.
+That list defines this phase's scope — collecting data before producing it
+risks labelling things the stock model could already detect. This also
+settles whether CLAUDE.md decision 7 (fine-tune only what COCO lacks) still
+holds or needs amending.
+
+**Labelling stays local — no cloud upload of training images.** The earlier
+"Roboflow or similar" note is superseded. Training images are photographs of
+a real home and, unavoidably in this project, of a child. Uploading them to
+a third-party service contradicts the spirit of the privacy requirement in
+CLAUDE.md decision 8, even though that decision is written about event logs
+and clips rather than training data. Use a locally-run labelling tool
+(e.g. Label Studio, self-hosted CVAT); fine-tuning itself already runs
+locally on the M5 Pro via MPS, so no stage of this phase needs the cloud.
+
+**Dataset must span the real deployment variation.** There is no single
+permanent camera position — the camera moves between testing areas at
+varying heights and angles. Data collected from one fixed setup would train
+a model that works in that setup and fails elsewhere, so deliberately vary
+area, height, angle and lighting. Variety matters more than sheer volume.
+
 **Done when:** the fine-tuned model reliably detects the new classes on test
 footage, without badly regressing the original COCO classes.
 `[ ]`
