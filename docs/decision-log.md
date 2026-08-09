@@ -312,9 +312,17 @@ resolution shipped, then failed in the field)
   an independent confirmation — logged here rather than left buried in a
   chat transcript because it changes the honest status of a previously
   flagged open risk.
-- **Still NOT confirmed, and not the same claim as the one above: a real
+- **NOW CONFIRMED (2026-08-05, superseding the caveat below): a real
+  physical unplug/replug recovers correctly under the current
+  capability-matching reopen path.** The user performed the physical test
+  and reported it working. This closes the last unverified path in the
+  camera layer — every safety-relevant claim about camera identity is now
+  backed by a test on real hardware rather than by a mocked simulation.
+  The original caveat is kept below so the log shows what was and wasn't
+  known at the time, rather than reading as if it had always been verified.
+- ~~**Still NOT confirmed, and not the same claim as the one above: a real
   physical unplug/replug recovering correctly under the current
-  capability-matching reopen path.** The Round 2 entry above ("follow-up
+  capability-matching reopen path.**~~ The Round 2 entry above ("follow-up
   round 2") states its reopen fix was verified against a monkeypatched fake
   capture object, not real hardware. Nothing since has claimed a real
   unplug/replug test against the current capability-matching `_reopen()`.

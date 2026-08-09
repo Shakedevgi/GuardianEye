@@ -18,3 +18,14 @@ cv/models/
 
 # Captured frames from detect_stream.py (dataset material, not source)
 cv/captures/
+
+# Belt-and-braces: ANY image captured under cv/, wherever it lands. These are
+# photographs of a real home and the people in it - including, in Phase 3, a
+# child. They must never reach a public repo, so this is deliberately broader
+# than cv/captures/ above rather than relying on frames always being saved to
+# the expected directory.
+cv/**/*.jpg
+cv/**/*.jpeg
+cv/**/*.png
+cv/**/*.mp4
+cv/**/*.mov

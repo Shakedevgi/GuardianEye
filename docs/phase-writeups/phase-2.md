@@ -567,10 +567,13 @@ it's the harder, later-solved one of the two.
 
 ### What I'd still want proven before trusting this fully
 
-- Physical unplug/replug recovery, on real hardware, under the *current*
-  capability-matching reopen path — not the mocked test from Round 2, and
-  not the same thing as confirming `--name` resolves correctly at a cold
-  start.
+- ~~Physical unplug/replug recovery, on real hardware, under the *current*
+  capability-matching reopen path~~ — **done (2026-08-05). The user ran the
+  physical unplug/replug test against the capability-matching reopen path
+  and it recovered correctly.** With this, every safety-relevant claim about
+  camera identity in this phase rests on a real-hardware test rather than a
+  mock. The remaining open item below (reopen responsiveness) is about the
+  window briefly freezing, not about monitoring the wrong camera.
 - Whether the tens-of-seconds worst-case reopen latency for `--name`
   selection (flagged above) is something the team wants to accept, bound, or
   address — right now it's an unflagged side effect, not a decision anyone
