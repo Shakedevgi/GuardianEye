@@ -1257,3 +1257,29 @@ authority delegated on mechanism per the task above)
   live-verified (approach-to-unreviewed-object) is real code with a real
   unit test, flagged as the first thing to check in Phase 5 or a future
   recording, not hidden inside a claim of full verification.
+
+## 2026-08-22 — Decision 1 clarified: diagnostics are JSON, boxes are pixels
+
+**Decision:** CLAUDE.md decision 1 now states explicitly what may be drawn into
+the frame FastAPI serves. Hazard/person boxes may be (they are product — a
+parent should see what is flagged). Diagnostics — FPS, model/`imgsz`/`conf`,
+device, raw normalized distances — may not; they become `/risk_status` JSON
+fields and the UI decides whether to render them.
+
+**Reason:** Pixels are one-way. Anything painted into the frame is permanent by
+the time Flet receives it, so a choice made in the cv layer silently becomes a
+choice the UI layer cannot undo — the exact coupling decision 1 exists to
+prevent. Raised by docs-agent at Phase 4 close (see the previous entry, item 1,
+where it was logged as a proposal awaiting sign-off).
+
+**Scope — this changes no code today.** `risk_engine.py`'s `draw_overlay_line`
+telemetry currently feeds only the local `cv2.imshow` debug window, which is a
+developer tool and stays verbose. The clarification is a constraint on Phase 7:
+build `/video_feed` from a clean annotated frame plus `/risk_status`, rather
+than reusing the debug window's image. Cost is ~nil now and grows once Phase 8
+is built on top of it, which is why it was settled before Phase 7 rather than
+during it.
+
+**Approval:** Approved by Shaked 2026-08-22; Shaked is briefing Yahli. Recorded
+here rather than treated as a fait accompli, per CLAUDE.md's rule that decisions
+may be questioned freely but not changed without asking.

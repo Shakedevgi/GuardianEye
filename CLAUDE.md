@@ -34,6 +34,27 @@ Team: Shaked Ivgi, Yahli Mazri. Advisor: Tom Cohen.
    and a local Web App from the same codebase, both talking to the same FastAPI
    backend.
 
+   **What may be drawn into the served frame, and what may not** (clarified
+   2026-08-22, approved by Shaked; raised by docs-agent at Phase 4 close):
+
+   - **Hazard and person boxes may be drawn onto the frame.** They are product,
+     not diagnostics — a parent should see what the system has flagged.
+   - **Diagnostics must NOT be drawn onto the frame.** FPS, model name/`imgsz`/
+     `conf`, device, and raw normalized distances are `/risk_status` JSON
+     fields. The UI decides whether to render them; a parent view hides them,
+     a developer view shows them.
+
+   The reason is that pixels are one-way. Anything painted into the frame is
+   permanent by the time Flet receives it, so a decision made in the cv layer
+   silently becomes a decision the UI layer cannot undo — which is exactly the
+   coupling this decision exists to prevent.
+
+   **This does not constrain the local OpenCV debug window.** `risk_engine.py`'s
+   `cv2.imshow` view is a developer tool and should stay as verbose as it is
+   useful. The rule applies to what Phase 7 *serves*: build `/video_feed` from
+   a clean annotated frame plus `/risk_status`, rather than reusing the debug
+   window's image.
+
 2. **Single YOLO pass per frame**, detecting both the child/person class and all
    hazard classes together. There is no separate "person detector" and "hazard
    detector." (Reaffirmed and strengthened 2026-08-13: `oven`/`microwave`/
