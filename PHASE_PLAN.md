@@ -139,10 +139,40 @@ afterwards is noticed and alerted on without anyone touching the app, and (c)
 moving toward a hazard visibly and correctly escalates the risk level in real
 time.
 
-`[~]` — Layers A and B, proximity scoring, zone thresholds and the
-scan/confirm loop are built and live-verified across five recorded sessions.
-The 2026-08-13 reset (simplifying five models to two, and making "unreviewed
-means dangerous" real) is in progress.
+`[x]` — closed 2026-08-22 by docs-agent, after the 2026-08-13 scope reset
+(five detection models down to two — per-frame YOLO for person/oven/
+microwave/refrigerator, plus a periodic class-agnostic room scan — and one
+rule: nothing auto-adds a hazard, every detector proposes and a human
+disposes) and a live hardware test the same day the phase closed. Full
+reasoning, including exactly what is and isn't proven, in
+`docs/phase-writeups/phase-4.md`. Read "done when" here precisely, not as a
+blanket pass:
+- **(b) new object noticed/alerted without touching the app** and
+  **(c) approach to a hazard escalates risk in real time** — both
+  live-verified on real hardware (FPS restored 2→15, no freezes, a placed
+  object caught by the scan and alerted on its own, approach to a confirmed
+  hazard correctly firing RED, removal clearing a hazard's box, and the
+  "spot changed since dismissal" re-raise rule firing for real) — checked by
+  docs-agent directly against the actual recorded frames, not taken on the
+  report alone.
+- **(a) "a parent can tap through the room's objects"** is met at the logic
+  layer only (the scan/confirm/dismiss/re-raise state machine is real,
+  tested, and live-verified) — the *keyboard* h/n/s loop that exercises it
+  is a developer stand-in, not a parent-usable interaction. That interaction
+  is explicitly Phase 8's job.
+- **One specific, safety-critical path is code-and-test-verified but NOT
+  yet watched happen on camera**: approaching an *unreviewed* hazard
+  (arrived after the first scan, not yet confirmed) escalating to RED —
+  CLAUDE.md decision 4's "unreviewed means dangerous" row. Every RED event
+  in the live test was against an already-confirmed hazard. Flagged as the
+  first thing to check in a future recording, not hidden inside "Phase 4
+  works."
+- **Two forward pointers, not silently dropped**: debug telemetry (FPS,
+  model config, raw distances) is currently drawn into the served frame's
+  pixels rather than exposed as `/risk_status` JSON — a concrete note for
+  Phase 7's design, proposed in `docs/decision-log.md`'s 2026-08-22 entry,
+  awaiting Shaked/Yahli confirmation, not yet a CLAUDE.md change. Overlapping
+  hazard-box labels when boxes cluster is cosmetic, filed for Phase 8.
 
 ### Phase 5 — Alerts + event capture
 **Owner:** cv-agent (buffer/trigger logic) + backend-agent (clip storage hookup)

@@ -1175,3 +1175,85 @@ authority delegated on mechanism per the task above)
   actually fixes the ~2fps collapse, which is the leading hypothesis but
   unconfirmed without a camera) all still need Shaked's live testing, same
   as every previous slice.
+
+### 2026-08-22 — Phase 4 live-verified on the two-model build; Phase 4 closed
+(docs-agent audit, following Shaked's recorded live test)
+
+- **The gap left open on 2026-08-13 is now closed for the headline claim.**
+  Nine days after the rewrite above (no intermediate session in between - the
+  next message in the session transcript is this test), Shaked ran
+  `risk_engine.py --name Arducam` against real hardware and recorded a 54.6s
+  clip. Docs-agent independently re-checked the claim rather than taking the
+  chat summary on faith: pulled every frame via `ffmpeg`, ran an automatic
+  freeze check across the full clip (none found), and read the on-screen FPS
+  readout directly off multiple frames.
+- **FPS: 15.0-15.2 for the full clip, confirmed by direct frame inspection,
+  not just reported.** This was 2.0-2.5 before the 2026-08-13 reset. Confirms
+  the reset's leading hypothesis (Grounding DINO plus the two YOLO-World
+  passes were the cost, not the scan or person tracking) was correct.
+- **Live-verified, by watching real pixels, not just trusting overlay text:**
+  a new object placed in frame was picked up by the periodic scan on its own,
+  boxed orange as `NEW-UNREVIEWED`, with `ALERT: New object detected (room
+  scan)` firing - no button touched. Approaching a CONFIRMED hazard produced
+  `RISK: RED` with the connector line drawn to it. Removing a confirmed
+  object made its box disappear on its own (hazard count dropped 17 -> 11)
+  without any timer - the scan-comparison mechanism, not a stale-entry
+  timeout, per the 2026-08-13 redesign. Duplicate boxes on the same physical
+  object are "mostly gone," per Shaked directly - not claimed as fully
+  solved; `SCAN_DUPLICATE_IOU_THRESHOLD=0.4` is still an unmeasured first
+  guess in the code, and this is the first live evidence it's roughly the
+  right ballpark, not a tuned result.
+- **Also caught live, not specifically asked for: the dismissal re-raise
+  rule fired for real.** The overlay read `ALERT: New object detected (spot
+  changed since dismissal)` at one point in the clip - CLAUDE.md decision 4's
+  "better safe than sorry" re-raise (Shaked, 2026-08-13) behaving correctly
+  against a real dismissed spot that later looked different, not just
+  passing its unit test (`test_apply_scan_candidates_dismissed_entry_reraised_on_material_change`).
+- **One specific, safety-critical path is still NOT live-verified, and this
+  is being logged rather than smoothed over:** approaching an *unreviewed*
+  (PENDING, arrived-after-first-scan) hazard is supposed to alert RED the
+  same as a confirmed one (`hazard_alerts_on_approach`, CLAUDE.md decision
+  4's "unreviewed means dangerous" row). Every RED event in this clip was
+  against an already-confirmed hazard, because everything on screen had
+  already been reviewed by the time the approach happened. The code
+  implements this path (`hazard_alerts_on_approach` returns `True` for
+  `PENDING` when `is_first_scan` is `False`, and `main()` filters hazards
+  through exactly that function before handing them to `score_frame`,
+  which does not itself look at `.state` at all) and it has a direct unit
+  test (`test_hazard_alerts_on_approach_pending_arrived_later_does_alert`).
+  What does not exist is a test, live or unit, that composes the two - an
+  unreviewed arrived entry actually scored into a "red" zone by
+  `score_frame`. This is a real, narrow, named gap, not a hidden one - flagged
+  in the phase write-up as the next thing to check on camera.
+- **Three items handed off explicitly, not silently dropped** (full detail
+  in `docs/phase-writeups/phase-4.md`):
+  1. **Debug telemetry (FPS, model/imgsz/conf, raw distances) is drawn
+     directly onto the same `annotated` frame pixels** (`risk_engine.py`
+     `draw_overlay_line` calls in `main()`) that Phase 7's MJPEG stream is
+     meant to serve. Per CLAUDE.md decision 1 (Flet is a pure client of
+     FastAPI, never touching frame pixels), this needs to become
+     `/risk_status` JSON fields the UI decides whether to render - a
+     concrete Phase 7 architecture note, not cosmetic. **Proposed, not
+     applied: no CLAUDE.md edit made here** - flagging this as something
+     Phase 7 should account for when designing `/risk_status`, for
+     Shaked/Yahli to confirm before Phase 7 starts.
+  2. **The h/n/s keypress review loop is a developer stand-in, not the
+     parent-facing feature PHASE_PLAN.md's Phase 4 done-when (a)
+     describes.** The scan/confirm *logic* is real, tested, and live-verified
+     above; the *interaction* a parent would actually use (tapping through
+     objects in the Flet app) does not exist yet and is explicitly Phase 8's
+     job. Phase 4's done-when (a) is being read as satisfied at the logic
+     layer, not as "a parent could use this today" - same reading Phase 3
+     used for its own "demoably works" bar.
+  3. **Overlapping bounding-box labels when boxes cluster (e.g. the
+     top-left corner) is genuinely cosmetic** - Phase 8's problem, noted so
+     it isn't forgotten, no action taken now.
+- **`PHASE_PLAN.md`'s Phase 4 status set to `[x]`.** Reasoning in full in
+  the phase write-up; short version: (b) and (c) of the done-when bar are
+  now live-verified on real hardware with independently-checked evidence
+  (not just a chat summary), (a) is met at the logic layer with the
+  parent-interaction gap explicitly named as Phase 8's job rather than
+  silently assumed done, and the one specific safety-critical path not yet
+  live-verified (approach-to-unreviewed-object) is real code with a real
+  unit test, flagged as the first thing to check in Phase 5 or a future
+  recording, not hidden inside a claim of full verification.

@@ -697,3 +697,168 @@ measurement work was set up to take.
   produced diminishing, sometimes actively misleading, guidance about what
   to fix next, precisely because the measurement was structurally blind to
   the failure mode that mattered (behavior under integration).
+
+---
+
+## Entry 7 — Phase 4 (2026-08-12 to 2026-08-22): the same isolated-fix loop
+recurred at a larger scale, a human recognized it faster the second time, and
+a session outliving its own tooling became part of the record
+
+Phase 4 is the first phase where I have the actual primary source — a full
+session transcript, extracted from the raw JSONL after the live session hung
+and could no longer be responded to in-app — rather than reconstructing
+events from committed docs and an orchestrator's secondhand account (Entries
+5 and 6 both had to caveat that limitation explicitly; this entry doesn't
+need to). That difference in evidentiary quality is itself a process finding
+worth naming before the technical one.
+
+### The same loop as Phase 3's Entry 6, replayed one layer up
+
+Entry 6 named a specific pattern: five isolated fix-measure-fix rounds across
+two mechanisms, each fix solving the exact problem the last measurement
+found and each one's side effect only visible after it shipped, because
+nothing was ever tested as a running whole. Phase 4 reproduced the identical
+shape at a different scale, in days rather than the prior phase's weeks:
+five detection models (person/hazard YOLO, two YOLO-World passes, Grounding
+DINO, the pixel-change detector), each individually tested and each passing
+its own isolated check, collapsed the live loop to 2fps, filled blank walls
+with boxes, and silently merged distinct hazards into one entry the moment
+they all ran together. Nobody built any one of those five models carelessly
+— the transcript shows each was added deliberately, with its own reasoning
+and its own offline verification, exactly the discipline Entries 1–6 called
+for. The failure was structural, not a quality lapse: **isolated correctness
+of N components does not compose into correctness of the N-component
+system**, and this project has now demonstrated that twice, in two
+completely different subsystems (a fine-tuned classifier plus a change
+detector in Phase 3; five live-running models in Phase 4), which is stronger
+evidence for the paper than either instance alone.
+
+### The human caught it faster this time, and said so explicitly
+
+This is the part worth calling out as genuine progress, not just a repeat.
+In Phase 3, recognizing "this is an unproductive loop, not five separate
+bugs" took five rounds across roughly a week. In Phase 4, Shaked stopped the
+session after roughly two days of the same symptom pattern (freeze, wall
+spam, duplicate merges), and his own words in the transcript name the same
+recognition Entry 6 described as the hard-to-build skill: *"I think we got
+lost and stuck on specific things and we need to rethink it."* Whether this
+is because the team had already been through the pattern once (Phase 3) and
+recognized its shape faster, or because five simultaneously-running models
+produce more visibly-tangled symptoms than five sequential offline rounds
+do, isn't fully separable from the transcript alone — but the plainest
+reading is that **the team's own prior experience with this exact failure
+mode is what shortened the loop**, which is a real argument for keeping
+Entries like 5/6 as more than archival record: they're the thing that made
+Entry 7 shorter than it could have been.
+
+### Full authority delegated on mechanism — a different, more efficient
+handoff than anything in Entries 1–6
+
+Every previous phase's delegation was scoped to "implement this spec."
+Phase 4's reset delegation was different in kind: Shaked explicitly handed
+over the *how* — "you have full authority to decide the technical approach"
+— while retaining three non-negotiable conditions (plain-language
+explanation, justification against the actual four-line requirement, and
+real documentation in the same turn). This produced, in the transcript, a
+genuinely good outcome: a clear before/cut/keep table justified against the
+stated requirement, a caught omission (the "unreviewed means dangerous" gap
+in the first draft, which Shaked himself caught by asking "what about a kid
+approaching something that isn't cleared or marked as hazard?" before any
+code was written), and a same-session CLAUDE.md update with the reasoning
+attached. Worth naming for the paper as a distinct delegation pattern from
+"implement this spec": **delegating the mechanism while retaining the
+requirement and the explain/justify/document conditions let the human catch
+a real safety gap by asking a clarifying question about intent, without
+needing to read or reason about any of the underlying code.** That's a
+cheaper, more scalable review mechanism than code-level review for a
+non-engineer stakeholder (or, in this project's case, a stakeholder choosing
+not to spend review time at the code level for this particular decision),
+and it worked here specifically because the plain-language explanation was a
+real condition, not a formality — the "Q1/Q2" exchange in the transcript is
+a stakeholder finding a hole in a design by reasoning about the stated
+rules, not the implementation.
+
+### A nine-day gap in the middle of one continuous session, and what that
+means for reading "verified"
+
+The transcript shows something structurally unusual: the reset and rebuild
+happened in one sitting on 2026-08-13, ending with the agent handing back
+concrete instructions for what to test on camera. The very next message in
+the same session is dated 2026-08-22 — nine days later — and is the human
+reporting back with the recording. Nothing else happened in between, in this
+session or apparently at all, on the code. This is worth naming plainly
+because it's a real risk for any project run through infrequent, bursty
+human availability rather than continuous engagement: **a "ready to test"
+handoff is only as good as someone actually running the test soon enough
+that the context (what to look for, why each of the five checks matters) is
+still fresh.** It happened to work out here — Shaked's Aug 22 message
+correctly executed exactly the five-item checklist from Aug 13 — but that's
+not guaranteed by the workflow itself, and a team with less careful written
+handoffs (the numbered "what I'd love to see in a recording" list in the
+transcript) could easily have lost the thread over a nine-day gap.
+
+### The session hanging and needing raw-JSONL extraction is itself a
+process finding, not just an operational footnote
+
+Per this task's own instruction, worth logging here rather than only as a
+one-off incident: the in-app session became unresponsive after the final
+exchange, and the transcript I worked from (`docs/session-logs/
+phase-4-session-transcript.md`) was produced by a separate extraction script
+(`extract_session.py`) reading the raw JSONL directly, not by continuing the
+hung session. Nothing was lost in that extraction — I was able to verify its
+content against the committed code and decision log with no gaps — but it's
+a real, now-observed failure mode of this workflow: a long-running,
+multi-sitting session (spanning ten days here) is a single point of failure
+for the record of *why* decisions were made, distinct from the record of
+*what* the decisions were (which the decision log already captures
+independently). **Recommendation for a future team doing this kind of
+work**: treat "the session might become unrecoverable" as a standing risk
+for any session expected to span multiple real-world days, and build the
+extraction step into the normal workflow rather than as an emergency
+recovery — which is exactly what's now been done here, and is worth
+watching whether it recurs at the end of future phases, since the task that
+produced this entry explicitly predicted it will.
+
+### Docs-agent's own role in this phase
+
+This is the first phase where I had a full primary-source transcript instead
+of a mix of committed docs and an orchestrator's secondhand account of
+things it hadn't shown me (Entries 5 and 6's "same sourcing caveat" moments).
+The difference showed up concretely: I could verify the FPS claim, the
+duplicate-merge bug's root cause, and the "unreviewed means dangerous"
+correction directly against the conversation that produced them, rather than
+trusting a summary. I also independently re-pulled the actual video frames
+from the 2026-08-22 test clip and ran my own freeze check, rather than
+accepting "no freezes, FPS 15" as reported — this matches the standard set
+in Phase 2's audits (don't trust a printed claim you can cheaply re-check
+yourself) and found no discrepancy this time, which is itself worth
+recording: the report matched the evidence, for once without a correction
+needed.
+
+### What I'd tell another student team about this phase specifically
+
+- If your team has already been through one "isolated components don't
+  compose" loop, watch for the same shape recurring at a different scale
+  (a training pipeline versus a live multi-model runtime are very different
+  kinds of systems, and the lesson still transferred) — and expect
+  recognizing it to go faster the second time specifically because someone
+  remembers the first time, not because the second instance is inherently
+  easier to see.
+- Delegating *mechanism* while retaining *requirement-level* review
+  conditions (plain-language explanation, justify against the actual
+  requirement, document in the same turn) is a distinct and, in this
+  instance, effective pattern from delegating implementation against a
+  fixed spec — it let a non-code-level review catch a real safety gap by
+  reasoning about stated behavior, not by reading a diff.
+- A "ready to test, here's exactly what to check" handoff is only as
+  reliable as how soon someone runs it and how well the checklist survives
+  the gap. If your team's availability is bursty rather than continuous,
+  write the test checklist assuming it'll be read cold, days later, by
+  someone who's forgotten the surrounding context — which is what actually
+  happened here and, on this occasion, worked.
+- Plan for a long-running agent session to become unrecoverable at some
+  point and need raw-log extraction to preserve the reasoning trail, not
+  just the code diffs — the decision log captures *what* was decided
+  independently of any one session, but *why*, in the team's own words, at
+  the moment it was decided, lives in the transcript and nowhere else once
+  the session itself is gone.
