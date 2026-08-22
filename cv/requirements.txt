@@ -10,6 +10,18 @@
 # newer" risks silently landing on an untested combination. Revisit pins
 # deliberately, not via auto-upgrade.
 #
+# transformers (2026-08-12, Phase 4 Part 1) is pinned exactly for the same
+# reason as torch/torchvision/ultralytics above, not floor-only: it loads
+# Grounding DINO (docs/phase-4-detection-research.md, Part 3), a large
+# zero-shot transformer, and an untested newer version could silently change
+# post_process_grounded_object_detection()'s API shape again (it already
+# renamed box_threshold -> threshold once between versions - see that
+# doc and measure_grounddino.py's docstring). 5.15.0 is the exact version
+# the original research session ran against torch==2.13.0 on MPS; verified
+# AGAIN in this repo's own .venv (not just copied from the research
+# session's throwaway venv) before committing this pin - real inference on
+# real MPS hardware, not just an import check.
+#
 # pyobjc-framework-AVFoundation (2026-08-05, "capability matching" follow-up)
 # is macOS-ONLY - do not expect this to install on Linux/Windows, and
 # camera.py guards the import accordingly (falls back to "name-based camera
@@ -30,4 +42,5 @@ opencv-python>=4.9
 torch==2.13.0
 torchvision==0.28.0
 ultralytics==8.4.115
+transformers==5.15.0
 pyobjc-framework-AVFoundation==12.2.1 ; sys_platform == "darwin"

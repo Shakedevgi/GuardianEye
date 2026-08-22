@@ -313,3 +313,387 @@ real bugs were hiding.
   afterward. Don't treat sign-off as the point where a phase stops being
   worth auditing closely — the most instructive incident in Phase 2 happened
   entirely after this document first said "done."
+
+---
+
+## Entry 4 — Phase 3, Step 0 (2026-08-09): the orchestrator correcting its
+own team's prior analysis, and a live preview lying by omission
+
+Step 0 was a deliberate insertion into the plan, not a phase anyone had
+originally scheduled: Phase 2 found that `imgsz` dominates small-object
+detection, which meant every earlier "COCO can't see this" belief was
+measured at a setting now known to be unreliable for exactly the objects in
+question. Rather than start Phase 3's data collection on top of that, the
+team stopped and built a measurement step first. That decision itself is
+worth naming as a process choice, not just a technical one: it would have
+been easy to let `docs/phase-3-scoping-notes.md` (three annotated
+screenshots, one session) stand in as "the Phase 3 scope" and start shooting
+a dataset against it. Nobody did that.
+
+### The orchestrator caught its own prior work being over-stated, by going
+back to the raw evidence instead of trusting the summary
+
+This is the process observation I'd put first for the final paper. The
+scoping notes weren't produced by an outside party — they were the
+project's own earlier analysis, written in good faith, by the same process
+that later corrected them. `docs/phase-3-step0-findings.md` explicitly
+states it "supersedes `docs/phase-3-scoping-notes.md` wherever the two
+disagree," and does not soften what disagreement means: the scoping notes'
+"person detection is weaker than expected" conclusion and its "scissors:
+complete miss, and not a resolution problem" conclusion were both real
+observations that were also, on the specific point they generalized to,
+wrong — both were measured at exactly the one `imgsz` setting that produces
+that failure mode, and neither scoping-notes writer went back to check
+whether the failure held at other settings before writing a general
+conclusion. What actually caught this was not a subagent auditing another
+subagent's work; per the orchestrator's own account, it was the orchestrator
+declining to accept the prior analysis's conclusions at face value and going
+back to look at the raw evidence — the same underlying frames, re-measured
+systematically — rather than treating "we already looked at this" as a
+reason not to look again. Worth stating plainly: this is exactly the kind of
+self-correction a project can quietly fail to do, because revisiting your
+own team's earlier conclusion doesn't feel like finding a bug, it feels like
+re-litigating settled work. The two Phase 2 findings that got corrected here
+weren't caught by an adversarial audit — they were caught by someone with
+the authority to say "let's actually check" choosing to say it about their
+own side's prior output, not just an external agent's.
+
+### A live preview cannot tell a human "these boxes are wrong," only "boxes
+are drawn"
+
+The single most consequential finding of this phase — small choking hazards
+being confidently mislabelled as `cell phone`/`sports ball` rather than
+missed — was captured on video, watched live by the operator, and reported
+as a *failed* block: "it didn't even detect anything." The measurement said
+the opposite of what the live impression said, and said something more
+important than either a clean success or a clean failure would have been.
+This is worth treating as a structural property of this project's own
+architecture (CLAUDE.md decision 1: the video pipeline streams live
+annotated frames as its primary interface), not just an anecdote from one
+session: a real-time overlay is very good at showing *that* the pipeline
+did something, and offers no signal at all about whether what it did was
+correct. A human watching MJPEG output — which is most of how this system
+will ever be observed, by design — structurally cannot distinguish a
+correct detection from a confidently wrong one without a second, offline,
+adversarial check. Step 0 built that check (`measure_detection.py`) mostly
+to solve a resolution-vs-confidence measurement problem; it turned out to
+also be the only thing in the project so far capable of catching this class
+of bug at all. Worth flagging for later phases: Phase 4's risk engine and
+Phase 5's alerting both inherit this same blind spot — a risk score or an
+alert that fires confidently on a wrong detection will look, from the live
+UI, identical to one firing correctly on a right one. Nothing about
+CLAUDE.md's current architecture has an equivalent of `measure_detection.py`
+for those later layers yet.
+
+### A second forgotten-flag incident, same shape as Phase 2's
+
+`--4k` didn't take during the second live session — all 21 frames came out
+at 1080p — and it wasn't diagnosed as a bug; a later session confirmed the
+flag works correctly on real hardware once actually passed. This is the
+same shape of mistake as Phase 2's `isOpened()`-lies saga: a human's
+impression of what the tool did ("I shot this in 4K") didn't match what was
+actually invoked, and the gap wasn't caught until someone checked the
+concrete, measured output (`frame.shape`, printed at startup) rather than
+trusting intent. Two instances of the identical failure mode in two
+different phases is worth naming as a pattern for the paper: this team's
+tooling is generally good about never trusting a status flag over a real
+measurement *inside* the code (see Phase 2's "isOpened() lies" theme), but
+the same discipline hasn't yet been extended to the human operator's own
+side of the interaction — nothing forced a "you asked for 4K, here's what
+you got" comparison to be checked before the session was treated as done.
+`detect_stream.py` does print the actually-delivered resolution at
+startup; the gap here was a human not reading it, not the code failing to
+report it. Worth considering, for a later phase: whether a mismatch between
+a requested capture mode and what a session's saved frames actually turned
+out to be should be flagged more loudly than a startup print line that's
+easy to lose in scrollback, given this has now cost one whole session's
+resolution once already.
+
+### What I'd tell another student team about this phase specifically
+
+- Build the "go re-measure instead of trusting the last analysis" instinct
+  into the process itself, not just into individual agents' diligence. This
+  phase's best catch happened because someone in the orchestrator role
+  treated their own team's prior conclusion as needing the same scrutiny as
+  anyone else's, not because a role boundary made it happen automatically.
+- If your system's primary interface is a live visual stream (true for this
+  project by architecture, not incidentally), assume it cannot tell your
+  human operators the difference between "correct" and "confidently wrong."
+  Build the offline, adversarial check before you need it, not after a wrong
+  label has already sat unnoticed in a review session.
+- A forgotten flag is not a rare, one-off human error if it's already
+  happened once for the identical underlying reason (trusting intent over a
+  printed measurement) — treat a second occurrence as a signal the
+  confirmation step itself is too easy to skip, not as bad luck.
+
+---
+
+## Entry 5 — Phase 3, after Step 0 (2026-08-09 to 2026-08-11): three failed
+fine-tunes, a rejected VLM, five failed single-frame detectors, and the
+correction that closed the phase
+
+This is the longest, most expensive stretch of the project so far in terms
+of measured negative results per day, and it's the entry I'd point another
+student team to first if they only had time to read one. The short version:
+this phase spent three fine-tuning rounds and five separate detection
+methods finding out, rigorously, that the thing it was trying to build
+couldn't be built the way it was being attempted — and then a single human
+correction reframed the actual requirement in a way that made the problem
+tractable. Both halves of that sentence matter for the paper equally; a
+write-up that only covered the correction would make it look obvious in
+hindsight, and it wasn't.
+
+### "Measure before committing" caught three separate wrong assumptions in
+one phase, not one
+
+This is worth stating as a pattern rather than three anecdotes, because by
+this phase it's clearly not a fluke:
+
+1. **imgsz** (technically Phase 2/Step 0, but it set up everything after):
+   assuming higher resolution always helps small objects was wrong in a way
+   that inverted `person` detection specifically at the one setting nobody
+   had thought to doubt.
+2. **Memorisation vs. generalisation**: round 1's own validation split said
+   0.902/0.607 — genuinely good-looking numbers — and was simply lying about
+   what the model had learned. Only a second, physically different building
+   caught it. This is the same underlying lesson as Phase 2's "`isOpened()`
+   lies, don't trust a status flag" theme, recurring one layer up in a
+   completely different part of the stack: a same-building validation split
+   is a status flag for "did the model learn something," and it can be
+   `True` while the answer is "no, it copied answers."
+3. **The classification framing itself**: three rounds of measurement went
+   into making named classification work before anyone asked whether
+   classification was even the right *shape* of solution for "is there
+   something here that shouldn't be." The five-detector sweep (named
+   classification, colour clustering, texture objectness, a VLM,
+   class-agnostic segmentation) wasn't run to pick a winner among five
+   variants of the same idea — every one of the five *is* "make a model
+   judge alone," and all five failing is what proved the idea itself, not
+   any specific implementation of it, was the wrong target.
+
+The throughline: at three different scales (a hyperparameter, a training
+methodology, a problem framing), the team's instinct to re-measure rather
+than trust the most recent confident-looking result caught something a
+skim would have missed. None of these three corrections happened because
+someone was suspicious in the abstract — each happened because a specific,
+cheap, concrete check (re-run at another `imgsz`, evaluate on another
+building, count how many *different* methods fail at the same job) was
+actually run.
+
+### The moment worth naming most specifically: "let it learn passively" was
+proposed, and rejected as a retreat, not just a bad idea
+
+Per the orchestrator's own account for this write-up (I want to be precise
+about sourcing here: this is not something visible in `docs/decision-log.md`'s
+committed text the way the rest of this phase is — I have no session
+transcript access, only the repo's file state, so I'm recording what I was
+told happened, not something I independently verified against a primary
+source the way I verified the numeric claims above): at the point where five
+single-frame detection methods had all failed, one candidate fix on the
+table was to relax the requirement — have the system watch passively over
+multiple sessions and gradually build confidence about what's a hazard,
+rather than needing to judge correctly on sight. Shaked rejected this,
+correctly, as a retreat from the actual requirement rather than a genuine
+fix: CLAUDE.md decision 3 already commits to **no persistence between
+sessions** — every session starts with a fresh, empty hazard map, because
+camera angle/room/lighting can't be assumed identical to last time. A model
+that "learns passively over multiple sessions" either quietly breaks that
+no-persistence guarantee, or accomplishes nothing, since a fresh map every
+session gives passive learning no time to accumulate anything before it's
+wiped. This would have been an easy trade to wave through under time
+pressure — it looks like progress ("the system gets smarter over time")
+while actually just deferring the exact problem the five failed detectors
+had already shown doesn't have a single-session answer. The correction that
+actually shipped (the guided, parent-confirmed walkthrough) solves the same
+problem a completely different way: instead of buying more *time* for a
+model to become confident, it removes the requirement that the model be
+confident *alone* at all, by handing the judgment to a human who already has
+to be in the room during setup anyway. Worth naming for the paper: rejecting
+a proposal for violating an existing, already-logged constraint (rather than
+on vague "that doesn't feel right" grounds) is a much stronger, more
+defensible move than it might look like in isolation — it's a concrete
+example of CLAUDE.md's decision log actually being consulted as a constraint
+during live problem-solving, not just archived as a record of the past.
+
+### A phase can produce excellent measured evidence and still leave a real
+gap between what's claimed and what's checkable
+
+The least comfortable finding of this phase's audit, worth stating plainly
+for the paper rather than softened: not everything in this phase has the
+same evidentiary weight, and the difference is easy to miss if you're
+reading CLAUDE.md and the decision log as a flat list of equally-supported
+facts. Three fine-tuning rounds, the VLM rejection, and the Open Images pull
+are all backed by committed code, and in most cases prose a reader can trace
+back to a specific CSV row — the same discipline Step 0 established. The
+two methods that got the *least* individual attention in the writing
+(colour clustering, texture objectness) have **no committed code at all** —
+their numbers exist only as one-line assertions repeated in CLAUDE.md and
+the decision log, with nothing behind them a reader of this repository can
+check. And the single most load-bearing empirical claim in the whole
+reframe — that change detection works, fast, and correctly handled two named
+test objects — has the same problem: no code, no CSV, not even a
+findings-document paragraph, despite being cited by name in an architecture
+decision. This happened for a specific, deliberate reason (the task that
+produced this work explicitly told the responsible agent to keep evidence in
+scratchpad, not the repo, likely to keep exploratory work from cluttering
+the permanent record) — but the effect, regardless of intent, is that a
+reader trusting CLAUDE.md at face value cannot currently tell "measured and
+traceable" apart from "measured, we're told, somewhere we can't see" apart
+from "asserted." Worth a concrete recommendation for future phases: if a
+scratchpad experiment produces a result that's going to be cited by name in
+CLAUDE.md or the decision log, the *conclusion* can stay light, but the
+*evidence for the conclusion* — even a three-line CSV, even a screenshot —
+should get one committed artifact, specifically so a later audit (or a later
+skeptical team member, or an advisor) has something to check against besides
+another paragraph of prose.
+
+### What I'd tell another student team about this phase specifically
+
+- Running the same underlying idea through several different techniques
+  (named classification, clustering, texture, a VLM, segmentation) and
+  having all of them fail is a *stronger*, more actionable result than one
+  failed attempt — it's evidence about the problem, not the technique. Don't
+  under-sell a swept negative result as "we tried five things and none
+  worked"; the sweep itself is the finding.
+- Watch for proposals that sound like progress but actually just relax an
+  existing, already-agreed constraint to make a hard problem look solved.
+  The fastest way to catch this is checking the proposal against decisions
+  already on record, the way this phase's "no persistence between sessions"
+  rejection did — not against a vague sense that something's off.
+- A same-location validation split and a same-technique "it still doesn't
+  work, try a variant" loop share a failure mode: both can look like careful
+  engineering while actually just re-confirming the same blind spot from a
+  slightly different angle. The thing that actually breaks the loop, in both
+  cases this phase, was changing what's held constant (a different building;
+  a fundamentally different technique, not a tuned version of the same one).
+- If your process explicitly tells an agent to keep working evidence out of
+  the repo (for good reasons — cleanliness, scope, not wanting throwaway
+  experiments checked in), build in a deliberate exception for whatever
+  specific numbers end up quoted by name in a permanent architecture
+  document. The citation outliving the evidence behind it is a predictable
+  consequence of that instruction, not a one-off oversight, and it's worth
+  deciding in advance rather than finding out during an audit.
+
+---
+
+## Entry 6 — Phase 3, closing it twice (2026-08-11): an isolated-fix loop
+across two mechanisms, and a human recognizing it as a loop rather than
+running a sixth attempt
+
+Entry 5 covered the five single-frame detection methods and the reframe they
+produced. This entry covers what happened *after* that reframe, when
+closing the phase surfaced a second, structurally similar loop in a
+completely different piece of the system — and, more importantly, covers
+the moment someone stepped outside the loop instead of taking one more turn
+through it. This is a separate process finding from Entry 5's, worth
+documenting with the same weight, not folded into "the team measured
+honestly" as if it were the same story.
+
+### The shape of the loop, traced across two mechanisms and five rounds
+
+Line up what actually happened, mechanism by mechanism, and the pattern is
+identical each time even though the two mechanisms (a fine-tuned classifier,
+a classical change detector) share no code and were worked on at different
+points in the phase:
+
+- **Fine-tuning round 2** (train on public data first, then our own frames)
+  fixed `sharp_object` recall — genuine transfer, not memorisation — and, as
+  an unplanned side effect nobody had specifically asked to trade away,
+  `small_swallowable` recall collapsed, because the schedule that protected
+  class 1 from memorising left class 2 under-supervised.
+- **Fine-tuning round 3**, aimed squarely at fixing that specific side
+  effect (supervise both classes the whole time), produced the single worst
+  result of the entire phase on both classes at once. The mechanism chosen
+  to "supervise class 1 more" (14x file-list duplication) was itself a new,
+  different mistake, not a refinement of the round 2 idea.
+- **Change detection's first fix** (person-overlap suppression, built to
+  address the dominant known false-positive source) turned out to delete
+  real hazards the instant they're placed, because an object moving in an
+  open palm sits inside exactly the region the fix discards.
+- **Change detection's second fix** (persistence tracking, built to address
+  that) fixed the deletion problem and produced the phase's first genuine,
+  eyeballed catch of a placed object — and, measured honestly rather than
+  cherry-picked, made recall *worse* on every previously-usable labelled
+  test burst, because the new confirmation requirement needs more closely-
+  spaced frames than that data has.
+
+Five rounds. Two mechanisms that don't share a line of code. The identical
+shape every time: each fix correctly solved the specific problem the last
+measurement had surfaced, and each one's side effect was only visible
+*after* it shipped, because the thing being measured against was always a
+static slice of photos or a short clip — never the system actually running,
+continuously, doing the job it's meant to do end to end.
+
+### What makes this a genuinely different finding from Entry 5's, not a repeat of it
+
+It would be easy to read this as the same lesson as Entry 5 — "measure
+before trusting a result" — restated with different numbers. It isn't. Entry
+5's five methods were five *different ideas* tried at the *same* question
+("can a model judge one unfamiliar frame's hazards alone"), and their
+collective failure was evidence about the *problem*, not about the testing
+method. This entry's five rounds are different: each one is a *direct fix*
+for a problem the previous round's measurement found, using the same kind of
+test (a static offline evaluation) to validate it — and the fixes kept
+trading known problems for new, previously-invisible ones, at a rate that
+didn't visibly slow down across five attempts. That's evidence about the
+*testing method* itself, specifically about what static, isolated,
+single-mechanism testing structurally cannot see: how a component behaves
+once other parts of the system are actually depending on it, running
+continuously, under conditions a hand-picked test set doesn't reproduce.
+
+### The moment worth naming for the paper: recognizing a loop is not the same skill as debugging one more round of it
+
+Per the orchestrator's account for this write-up (same sourcing caveat as
+Entry 5's "let it learn passively" moment — I have no session transcript,
+only the repo's file state and what I was told, so this is reported, not
+independently verified against a primary source): at the point where the
+second change-detection fix had produced its own honest, mixed result —
+genuinely catches a placed object, still ~33% precision, recall regressed on
+old data — the natural next move, and the one every previous round had
+taken, was a sixth fix: address the "person-adjacent settling artifact"
+failure mode the second round's own measurement had just identified. Shaked
+stopped that from happening. His reasoning, as reported: five rounds of
+carefully measuring a static test, fixing what it found, and watching the
+fix create a new problem invisible to that same static test, is itself
+evidence that the static test is the thing that's stopped being useful —
+not that the team hasn't found the right fix yet. The correction wasn't
+"do less measurement" — every round up to this point *was* careful,
+honest measurement, arguably more rigorous each time than the last. It was
+"change what's being measured against" — from an offline photo/clip test to
+the actual running system, which is a materially different move than either
+"try harder" or "give up." This is worth naming specifically because it's a
+different kind of catch than anything in Entries 1-5: not a bug found, not
+a wrong number found, but a *diminishing-returns pattern across five rounds*
+recognized as a pattern, by a human, in time to redirect effort before a
+sixth round repeated it. None of the individual subagent work in any of the
+five rounds was sloppy or dishonest — each round's write-up is exactly as
+careful as the one before it. The loop wasn't a quality problem in any
+single round; it was a property of the *strategy* (isolated, static,
+single-mechanism testing) that only became visible by looking across all
+five rounds at once, which is a longer view than any single round's own
+measurement work was set up to take.
+
+### What I'd tell another student team about this specifically
+
+- If you find yourself running the same shape of fix-measure-fix cycle more
+  than two or three times on the same component, and each fix's side effect
+  keeps surprising the next round rather than the surprises getting smaller,
+  treat that convergence rate itself as data — it's telling you something
+  about the *test*, not just about how hard the component is.
+- The skill of noticing "we're in an unproductive loop" is distinct from,
+  and harder to build into an agent workflow than, the skill of executing
+  one more careful round of the loop. Every individual round in this phase
+  was executed well; what was missing until a human stepped in was someone
+  whose job was to look across rounds, not within one.
+- "Stop testing in isolation, test the integrated system" is a legitimate
+  and sometimes necessary redirection — but say so explicitly, the way
+  Shaked did here, rather than letting it read as lowering the bar. Closing
+  a phase with a known-weak component, on purpose, because isolated testing
+  stopped producing useful information, is a different and more defensible
+  claim than closing it because nobody had time for a sixth round.
+- Don't let "we measured this carefully" and "this measurement told us what
+  we needed to know" collapse into the same claim. This phase is good
+  evidence they can come apart: five rounds of genuinely careful measurement
+  produced diminishing, sometimes actively misleading, guidance about what
+  to fix next, precisely because the measurement was structurally blind to
+  the failure mode that mattered (behavior under integration).

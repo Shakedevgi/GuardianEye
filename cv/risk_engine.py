@@ -1,0 +1,1298 @@
+"""
+risk_engine.py - Phase 4 main script: live risk overlay on the camera feed.
+
+Implements CLAUDE.md's two always-on layers plus the object-review workflow
+decisions 3/4/7 describe (rewritten 2026-08-13 - see docs/decision-log.md,
+"Scope reset", for why this file looks the way it does and what it replaced;
+this docstring describes current behaviour only):
+
+  A camera detects objects. A human classifies which are dangerous. The
+  system detects new objects appearing after that. It alerts.
+
+Concretely:
+
+  Layer A - hazard map (HazardMap below). In-memory only, empty at the start
+  of every run (CLAUDE.md decision 3 - no persistence between sessions). Two
+  detectors feed it, and NEITHER is allowed to add a hazard on its own -
+  every detection becomes a HazardEntry in PENDING state, awaiting a human
+  decision (CLAUDE.md decision 7: "nothing auto-adds a hazard; every detector
+  proposes, the parent disposes"):
+
+    - The per-frame pass: the same single YOLO26 inference this file already
+      runs for `person` also yields `oven`/`microwave`/`refrigerator` at no
+      extra cost (CLAUDE.md decision 2). A second, cadenced, open-vocabulary
+      pass adds `wall_socket` the same way, since a socket is flush with a
+      wall and therefore invisible to the surface scan below. Both are
+      matched against existing entries by position (find_match) so the same
+      physical fridge doesn't spawn a new entry every frame.
+    - The periodic scan: every `--scan-interval` seconds (a few, by default -
+      this is Layer A, not latency-critical), a class-agnostic segmentation
+      pass (FastSAM, via measure_segmentation.py, imported not reimplemented)
+      lists occupied spots on reachable surfaces. Comparing that list against
+      what is already known is Layer A's entire "detect new" mechanism
+      (CLAUDE.md decision 3):
+        - a spot with no match in the map -> something arrived
+        - a known spot with no match in the new scan -> something was
+          removed, and it clears
+        - everything else -> unchanged, stay quiet
+      A spot must appear in two CONSECUTIVE scans before it counts as
+      "arrived," and a known spot must be absent from two consecutive scans
+      before it's cleared - guards against a single noisy scan reading as
+      churn (see HazardMap.apply_scan_candidates and _Provisional below).
+
+  Three states a HazardEntry can be in (CLAUDE.md decision 7's rule replaced
+  five source-specific hazard categories with this one):
+    - PENDING   - proposed by a detector, no human judgment yet.
+    - CONFIRMED - a human pressed 'h'. This is a hazard.
+    - DISMISSED - a human pressed 'n'. Not a hazard, remembered - but a
+      dismissal is re-raised (back to PENDING) if a later scan finds that
+      exact spot looking materially changed (region_change_frac, imported
+      from measure_change_detection.py), per Shaked's "better safe than
+      sorry" ruling: a real hazard placed where something harmless was
+      dismissed must not silently inherit that dismissal.
+
+  Every HazardEntry also carries `is_first_scan`: True if it was proposed
+  before the very first periodic scan finished looking at the room (i.e. it
+  is part of the room's starting state, reviewed with a human presumably
+  still standing in front of the camera), False if it showed up later.
+
+  Layer B - proximity scoring (score_frame, PersonTracker, unchanged in
+  spirit since Phase 4 Slice 1): for every tracked person, bbox-center
+  Euclidean distance to every ALERT-ELIGIBLE hazard-map entry, normalized by
+  frame diagonal (CLAUDE.md decision 5 - resolution-independent, not real-
+  world distance - no depth sensing, no calibration ritual, a deliberate,
+  documented approximation), smoothed over a rolling window per (person,
+  hazard) pair. Which entries are alert-eligible is CLAUDE.md decision 4's
+  table, implemented directly in hazard_alerts_on_approach():
+
+      state                              | alerts on approach?
+      -----------------------------------|--------------------
+      CONFIRMED                          | yes
+      PENDING, arrived after first scan  | yes - unreviewed means unknown,
+                                          |   and unknown is treated as
+                                          |   dangerous
+      PENDING, from the first scan       | no - this is the room's normal
+                                          |   state with a human present
+                                          |   reviewing it
+      DISMISSED                          | no
+
+  A newly arrived object (not from the first scan) also raises an alert the
+  moment it's noticed, not only on approach (CLAUDE.md decision 4) - the
+  parent should not have to be watching the screen to learn something showed
+  up. See ALERT_BANNER_SECONDS and main()'s scan/propose call sites.
+
+  The human review queue (ReviewQueue below) is a live FIFO of PENDING
+  entries awaiting an 'h'/'n' decision, drawn one at a time on the live feed
+  ('h' = confirm hazard, 'n' = not a hazard, 's' = skip everything currently
+  queued - new arrivals still get queued afterward). It receives new items
+  continuously from either detector, for as long as the camera runs - there
+  is no separate "setup phase" that ends (CLAUDE.md decision 3).
+
+Usage:
+    python risk_engine.py                                # default index, mps, yolo26l
+    python risk_engine.py --name Arducam
+    python risk_engine.py --seed-hazard 200,400,300,200,test_stove
+    python risk_engine.py --scan-interval 4               # faster room re-scan
+    python risk_engine.py --disable-socket-detect          # skip the wall-socket pass
+    python risk_engine.py --disable-scan                   # skip the periodic room scan
+                                                            # (named-class detection only)
+
+--seed-hazard is repeatable, takes pixel coordinates of the ACTUAL capture
+resolution (not display resolution), and is added directly as a CONFIRMED
+hazard - it exists purely for deterministic testing of Layer B's zone
+escalation without needing a real hazard in frame. x,y is the top-left
+corner, w,h is the box's width/height; label is free text (everything after
+the fourth comma, so a label can't itself contain a comma).
+
+Keys (window must be focused):
+    q   quit
+    h   confirm the entry currently at the front of the review queue as a
+        hazard (state -> CONFIRMED)
+    n   dismiss it - "not a hazard" (state -> DISMISSED; re-raised later if
+        that spot's appearance changes materially)
+    s   clear everything currently queued for review without deciding (they
+        stay PENDING and keep alerting per the table above if they arrived
+        after the first scan) - future arrivals still get queued normally
+"""
+
+import argparse
+import math
+import os
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+
+# Must be set before torch is imported anywhere (including transitively via
+# ultralytics) - see detect_stream.py's identical comment.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+import cv2
+
+from camera import (
+    DEFAULT_CAMERA_INDEX,
+    CameraCapture,
+    CameraSelectionError,
+    startup_failure_message,
+)
+from detect_stream import (
+    DEFAULT_CONF_THRESHOLD,
+    DEFAULT_IMGSZ,
+    DEFAULT_MODEL,
+    FPS_SMOOTHING_ALPHA,
+    OVERLAY_COLOR,
+    OVERLAY_OUTLINE,
+    draw_overlay_line,
+    load_model,
+    prepare_for_display,
+    resolve_device,
+)
+
+# Wall-socket open-vocabulary detection - reused, not reimplemented (see
+# measure_openvocab.py's own docstring for the YOLOWorld/YOLOE set_classes()
+# binding this wraps).
+from measure_openvocab import load_open_vocab_model
+
+# Only region_change_frac survives from measure_change_detection.py - it is
+# reused here for the dismissal re-raise check (Step 4: does a dismissed
+# spot look materially different now?), not for the frame-to-frame change
+# detector this module used to run live. That detector (and the rest of this
+# module's live wiring) is gone from the live pipeline as of the 2026-08-13
+# scope reset - docs/decision-log.md has the full reasoning. The offline
+# measurement script itself (cv/measure_change_detection.py) is kept intact
+# as a research artifact.
+from measure_change_detection import region_change_frac
+
+# Class-agnostic segmentation candidate generation for the periodic room
+# scan - reused from measure_segmentation.py exactly as tuned there
+# (MAX_AREA_FRAC tightened in Phase 3 Part 5, zero measured recall cost).
+# `--min-aspect-ratio` is deliberately never enabled - Phase 3 measured it
+# costing 46-50% of recall on elongated true positives (knives/scissors),
+# this project's own most safety-critical shape.
+from ultralytics import FastSAM
+from measure_segmentation import (
+    DEFAULT_SEG_IMGSZ,
+    DEFAULT_SEG_MODEL,
+    MAX_AREA_FRAC,
+    MIN_AREA_FRAC,
+    MIN_EXTENT,
+    PERSON_OVERLAP_THRESHOLD,
+    apply_filter as seg_apply_filter,
+    load_weights as load_seg_weights,
+    segment_frame,
+)
+
+WINDOW_NAME = "GuardianEye - risk engine"
+
+# --- Layer A/B tuning constants -------------------------------------------
+
+# Hazard-map matching: an incoming detection updates an existing entry
+# instead of spawning a new one if it clears EITHER threshold - high IoU
+# (same box, roughly), or a close center even if the box size changed a bit
+# frame to frame (partial occlusion, angle change). Matching is scoped to a
+# candidate pool the caller chooses (same label for named-class entries;
+# same origin for scan entries - see find_match's `label` parameter and
+# HazardMap below) so, e.g., an oven detection can never merge into a
+# refrigerator entry just because they happen to be adjacent.
+HAZARD_MATCH_IOU_THRESHOLD = 0.3
+HAZARD_MATCH_CENTER_DIST_FRAC = 0.08
+
+# Two overlapping segmentation candidates from the SAME scan pass, above
+# this IoU, are treated as one physical object and deduplicated before
+# anything is queued for review (Step 3's "duplicate-candidate bug" fix) -
+# looser than HAZARD_MATCH_IOU_THRESHOLD on purpose: two boxes from one
+# segmentation pass describing the same object can disagree on exact edges
+# more than two independent detections of an already-tracked entry would.
+SCAN_DUPLICATE_IOU_THRESHOLD = 0.4
+
+# A dismissed spot is re-raised to PENDING if a later scan finds it changed
+# by more than this fraction of pixels (region_change_frac, imported from
+# measure_change_detection.py). Deliberately LOWER (more sensitive) than
+# that module's own STABILITY_MAX_CHANGE_FRAC (0.3, tuned to ask "did this
+# stay the same" when CONFIRMING persistence) - here the goal is the
+# opposite: erring toward re-asking rather than missing a hazard placed
+# where something harmless was previously dismissed (Shaked, 2026-08-13:
+# "keep it as double and even triple mark - better safe than sorry"). Not
+# measured against a live re-raise scenario yet - a deliberate first guess
+# in the direction the task calls for, flagged as such.
+DISMISS_REAPPEAR_CHANGE_FRAC = 0.15
+
+# A scan-origin spot must appear in this many CONSECUTIVE scans before it's
+# added to the map as "arrived," and a known scan-origin entry must be
+# absent from this many consecutive scans before it's cleared as "removed."
+# 2 is the smallest value that is a guard at all (1 would mean no guard).
+# Not measured against real scan-to-scan jitter yet (no camera in this
+# session) - see the report for what that means is still unverified.
+SCAN_CONSECUTIVE_SCANS_REQUIRED = 2
+
+# If tracked people cover more than this fraction of the frame when a scan
+# is due, the scan is deferred to the next cadence tick instead of run this
+# tick. Reasoning: person-overlap suppression (reused from
+# measure_segmentation.py's own apply_filter) already drops segments
+# overlapping a person, but if a person fills most of the frame there is
+# too little of the room actually visible for "removed" to mean anything -
+# without this guard, a person standing in front of most of a shelf could
+# read as several hazards disappearing at once. A first-guess threshold,
+# not measured live.
+SCAN_PERSON_COVERAGE_SKIP_FRAC = 0.35
+
+# A tracked person not matched by any detection for this long (wall-clock
+# seconds) is dropped, along with their rolling-window history - otherwise
+# someone who walks out of frame and back in would incorrectly inherit a
+# stale smoothed distance instead of the risk score correctly resetting.
+PERSON_MATCH_IOU_THRESHOLD = 0.2
+PERSON_MATCH_CENTER_DIST_FRAC = 0.15
+PERSON_STALE_SECONDS = 1.0
+
+# Rolling window length in FRAMES (not seconds) per (person, hazard) pair,
+# per CLAUDE.md decision 5 ("~5-10 frames"). Unmeasured/untuned midpoint.
+ROLLING_WINDOW_SIZE = 8
+
+# Zone thresholds on NORMALIZED distance (raw pixel distance / frame
+# diagonal - decision 5 requires resolution-independence, not raw pixels).
+# THESE ARE A FIRST GUESS, not a measured result - unchanged since Phase 4
+# kickoff (docs/decision-log.md, 2026-08-12), still awaiting live tuning.
+RISK_ZONE_RED_MAX = 0.15
+RISK_ZONE_ORANGE_MAX = 0.30
+RISK_ZONE_YELLOW_MAX = 0.50
+RISK_ZONE_NONE = "none"
+RISK_ZONE_ORDER = ("none", "yellow", "orange", "red")
+
+# --- Hazard entry state / origin --------------------------------------------
+
+HAZARD_STATE_PENDING = "pending"
+HAZARD_STATE_CONFIRMED = "confirmed"
+HAZARD_STATE_DISMISSED = "dismissed"
+
+# `origin` records WHICH detector proposed an entry, purely to decide which
+# mechanism is responsible for keeping it current - it has no bearing on
+# alerting (that's `state` + `is_first_scan`, see hazard_alerts_on_approach).
+#   NAMED - the per-frame YOLO pass (oven/microwave/refrigerator) or the
+#     cadenced wall-socket pass. Re-checked every time its own detector
+#     runs, so its bbox stays fresh on a match; nothing here ever removes it
+#     (a fridge does not legitimately vanish mid-session the way a small
+#     object left on a scanned surface can).
+#   SCAN - the periodic class-agnostic room scan. Subject to
+#     HazardMap.apply_scan_candidates' arrived/removed diffing and the
+#     dismissal re-raise check - the only origin either of those touches.
+#   SEED - a manually seeded entry (--seed-hazard), added directly as
+#     CONFIRMED for deterministic zone-escalation testing. Untouched by
+#     either detector.
+HAZARD_ORIGIN_NAMED = "named"
+HAZARD_ORIGIN_SCAN = "scan"
+HAZARD_ORIGIN_SEED = "seed"
+
+# Named-class -> hazard-map label grouping. Only classes Phase 3 measured as
+# reliable without training (docs/decision-log.md, 2026-08-12): oven and
+# microwave fold into one "oven_microwave" concept because both classes fire
+# on the same physical countertop object, not two different objects. "chair"
+# is deliberately excluded - a live test showed it repeatedly false-firing
+# on a coffee table/shelf structure, and a chair was never really the
+# hazard anyway (the hazard is whatever ends up placed on a reachable
+# surface, which the room scan is meant to catch).
+HAZARD_LABEL_BY_CLASS_NAME = {
+    "oven": "oven_microwave",
+    "microwave": "oven_microwave",
+    "refrigerator": "refrigerator",
+}
+
+# --- Wall-socket open-vocabulary detection ----------------------------------
+#
+# A socket is flush with a wall, so it is never "an object sitting on a
+# surface" and is structurally invisible to the room scan below - CLAUDE.md
+# decision 7 keeps this as the one extra named detector earning its keep.
+# Model/imgsz/conf choices are the measured values from Phase 3/4 (see
+# cv/measurements/openvocab.csv): yolov8s-worldv2.pt reached 0.90 confidence
+# at imgsz 1600 and 0.85 at imgsz 1280 - imgsz 1280 is the default since it's
+# within 0.05 of 1600's ceiling at near-identical inference cost. conf 0.4
+# sits below the real-socket range's floor (0.48-0.90) with margin, well
+# above the measured noise median (0.02-0.08).
+DEFAULT_SOCKET_MODEL = "yolov8s-worldv2.pt"
+DEFAULT_SOCKET_PROMPTS = ["wall socket"]
+DEFAULT_SOCKET_IMGSZ = 1280
+DEFAULT_SOCKET_CONF = 0.4
+# Wall-clock seconds between socket-detection passes - sockets are static
+# once found and this is Layer A, not Layer B, so a cadence (not every
+# frame) is deliberate, not an oversight. Unmeasured first guess.
+DEFAULT_SOCKET_SCAN_INTERVAL_SECONDS = 2.0
+SOCKET_HAZARD_LABEL = "wall_socket"
+
+# --- Periodic room scan (class-agnostic segmentation) -----------------------
+#
+# CLAUDE.md decision 3: "every few seconds," explicitly not latency-critical
+# since this is Layer A. Unmeasured first guess, cheap to retune via
+# --scan-interval once someone is watching this live.
+DEFAULT_SCAN_INTERVAL_SECONDS = 5.0
+SCAN_HAZARD_LABEL = "object"
+
+# --- Overlay colors ----------------------------------------------------------
+#
+# Distinct from person boxes (green) and from each risk zone's connector-
+# line color, so "hazard-map entry state" is never confused with "risk
+# level right now" at a glance - those are two different axes (see the
+# module docstring's Layer A/B split).
+PERSON_BOX_COLOR = (0, 255, 0)  # green (BGR)
+HAZARD_STATE_BOX_COLOR = {
+    HAZARD_STATE_CONFIRMED: (0, 0, 255),  # red - a human confirmed this is a hazard
+    HAZARD_STATE_DISMISSED: (140, 140, 140),  # grey - a human said "not a hazard"
+}
+# PENDING is split into two colors because its ALERTING behaviour differs
+# (see hazard_alerts_on_approach) and the overlay should make that visible,
+# not just the state name:
+PENDING_FIRST_SCAN_BOX_COLOR = (255, 255, 0)  # cyan - awaiting review, room's
+# normal starting state, does not alert yet.
+PENDING_ARRIVED_BOX_COLOR = (0, 140, 255)  # orange - awaiting review, but
+# arrived after the first scan, so it alerts on approach same as a
+# confirmed hazard ("unreviewed means unknown, and unknown is dangerous").
+# The entry currently sitting at the front of the review queue (about to be
+# judged) also gets a white outline on top of its state color, so "this box
+# is the one awaiting your h/n/s keypress right now" is never confused with
+# "this box is just pending in general."
+REVIEW_CANDIDATE_OUTLINE_COLOR = (255, 255, 255)  # white (BGR)
+ZONE_COLORS = {
+    "red": (0, 0, 255),
+    "orange": (0, 140, 255),
+    "yellow": (0, 255, 255),
+    RISK_ZONE_NONE: (140, 140, 140),
+}
+
+# How long a "new object" banner stays on screen after arrival/re-raise.
+ALERT_BANNER_SECONDS = 4.0
+
+
+# --- geometry helpers -------------------------------------------------------
+
+
+def bbox_center(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    x1, y1, x2, y2 = box
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
+def bbox_iou(box_a, box_b) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
+    inter_x2, inter_y2 = min(ax2, bx2), min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+    return inter_area / union
+
+
+def normalized_center_distance(box_a, box_b, frame_diagonal: float) -> float:
+    """Euclidean distance between two bbox centers, normalized by frame
+    diagonal - CLAUDE.md decision 5's exact model. Deliberately NOT also
+    normalized by hazard bbox size (decision 5 says "and/or"); frame
+    diagonal alone is simpler to reason about and is revisited only if live
+    testing shows it isn't resolution-independent enough in practice.
+    """
+    (ax, ay), (bx, by) = bbox_center(box_a), bbox_center(box_b)
+    dist = math.hypot(ax - bx, ay - by)
+    return dist / frame_diagonal if frame_diagonal > 0 else 0.0
+
+
+def classify_zone(normalized_distance: float) -> str:
+    if normalized_distance < RISK_ZONE_RED_MAX:
+        return "red"
+    if normalized_distance < RISK_ZONE_ORANGE_MAX:
+        return "orange"
+    if normalized_distance < RISK_ZONE_YELLOW_MAX:
+        return "yellow"
+    return RISK_ZONE_NONE
+
+
+def zone_rank(zone: str) -> int:
+    return RISK_ZONE_ORDER.index(zone)
+
+
+def find_match(new_box, entries, frame_diagonal, iou_threshold, center_dist_frac, label=None):
+    """Return the best-matching entry for `new_box` among `entries` (any
+    object exposing a `.bbox` attribute), or None if nothing clears either
+    threshold.
+
+    An entry matches if its IoU with `new_box` clears `iou_threshold` OR its
+    normalized center distance is within `center_dist_frac` - either
+    condition alone can miss real matches (a box that shrank/grew a bit
+    still has close centers; a box that shifted sideways at a fixed size
+    still has decent IoU), so either is accepted. Ties are broken by
+    preferring the highest IoU. If `label` is given, only entries whose
+    `.label` equals it are considered.
+    """
+    best = None
+    best_iou = -1.0
+    for entry in entries:
+        if label is not None and getattr(entry, "label", None) != label:
+            continue
+        iou = bbox_iou(new_box, entry.bbox)
+        center_dist = normalized_center_distance(new_box, entry.bbox, frame_diagonal)
+        if iou >= iou_threshold or center_dist <= center_dist_frac:
+            if iou > best_iou:
+                best = entry
+                best_iou = iou
+    return best
+
+
+def dedupe_candidates(candidates: list, iou_threshold: float = SCAN_DUPLICATE_IOU_THRESHOLD) -> list:
+    """Step 3's duplicate-candidate fix: segmentation sometimes proposes two
+    overlapping boxes for the same physical object. Keep the first of any
+    group of candidates whose IoU with an already-kept candidate clears
+    `iou_threshold`, drop the rest. Order-preserving, pure geometry - no
+    frame/model dependency, so it's directly testable.
+    """
+    kept: list = []
+    for candidate in candidates:
+        if any(bbox_iou(candidate, k) >= iou_threshold for k in kept):
+            continue
+        kept.append(candidate)
+    return kept
+
+
+def crop_bbox(frame, bbox):
+    """Clamp `bbox` to `frame`'s bounds and return the cropped region (a
+    copy, so it survives after `frame` itself is overwritten next
+    iteration), or None if the clamped region is empty.
+    """
+    x1, y1, x2, y2 = (int(round(v)) for v in bbox)
+    h, w = frame.shape[:2]
+    x1c, y1c = max(0, x1), max(0, y1)
+    x2c, y2c = min(w, x2), min(h, y2)
+    if x2c <= x1c or y2c <= y1c:
+        return None
+    return frame[y1c:y2c, x1c:x2c].copy()
+
+
+def fingerprint_changed(
+    fingerprint, frame, bbox, threshold: float = DISMISS_REAPPEAR_CHANGE_FRAC
+) -> bool:
+    """Step 4: has the spot behind a DISMISSED entry changed materially
+    since it was dismissed? `fingerprint` is the crop captured at dismissal
+    time (see HazardMap.dismiss). Reuses region_change_frac's pixel-diff
+    core (measure_change_detection.py) rather than inventing a new
+    comparison - both crops are resized to match if the bbox's own size
+    changed slightly between scans (segmentation boxes are not pixel-
+    identical run to run even for a static scene).
+
+    Missing/degenerate input (no fingerprint recorded, or the current frame
+    can't produce a matching crop) returns True - err toward re-asking
+    rather than silently trusting a comparison that couldn't actually run,
+    per Shaked's "better safe than sorry" ruling.
+    """
+    if fingerprint is None or fingerprint.size == 0:
+        return True
+    current_crop = crop_bbox(frame, bbox)
+    if current_crop is None:
+        return True
+    if current_crop.shape != fingerprint.shape:
+        current_crop = cv2.resize(current_crop, (fingerprint.shape[1], fingerprint.shape[0]))
+    local_bbox = (0, 0, fingerprint.shape[1], fingerprint.shape[0])
+    frac = region_change_frac(fingerprint, current_crop, local_bbox)
+    return frac > threshold
+
+
+def person_coverage_frac(person_boxes, frame_width: int, frame_height: int) -> float:
+    """Rough fraction of the frame covered by tracked people, used to decide
+    whether to defer a scan (SCAN_PERSON_COVERAGE_SKIP_FRAC). Sums bbox
+    areas without correcting for overlap between multiple people - a
+    deliberate simplification (this project targets a single-child home,
+    not a crowd), fine for a threshold check that only needs to be roughly
+    right.
+    """
+    frame_area = float(frame_width * frame_height)
+    if frame_area <= 0:
+        return 0.0
+    total = sum(max(0.0, (x2 - x1) * (y2 - y1)) for x1, y1, x2, y2 in person_boxes)
+    return min(1.0, total / frame_area)
+
+
+# --- Layer A: hazard map ----------------------------------------------------
+
+
+@dataclass
+class HazardEntry:
+    id: int
+    label: str
+    bbox: tuple[float, float, float, float]
+    origin: str  # HAZARD_ORIGIN_NAMED / _SCAN / _SEED
+    state: str = HAZARD_STATE_PENDING
+    is_first_scan: bool = False
+    last_seen: float = 0.0
+    hits: int = 1
+    # Only meaningful for origin == HAZARD_ORIGIN_SCAN: consecutive periodic
+    # scans this entry went unmatched. Reset to 0 on every match, entry is
+    # removed once this reaches SCAN_CONSECUTIVE_SCANS_REQUIRED.
+    absent_scans: int = 0
+    # Only set once state == HAZARD_STATE_DISMISSED (see HazardMap.dismiss):
+    # a small crop of the frame at the moment of dismissal, compared against
+    # later scans via fingerprint_changed() to decide whether to re-raise.
+    fingerprint: object = None
+
+
+@dataclass
+class _Provisional:
+    """A scan-origin candidate seen exactly once, not yet matched a second
+    consecutive time - see SCAN_CONSECUTIVE_SCANS_REQUIRED and
+    HazardMap.apply_scan_candidates. Not yet a HazardEntry: it has no id, no
+    state, and is never drawn or scored.
+    """
+
+    bbox: tuple[float, float, float, float]
+    is_first_scan: bool
+
+
+@dataclass
+class ScanDiffResult:
+    """What one HazardMap.apply_scan_candidates() call did, for the caller
+    (main()) to react to - enqueue newly-visible entries for review, alert
+    on the ones that mean "something new is here right now," and drop
+    removed entries from the review queue if they happened to be sitting in
+    it.
+    """
+
+    arrived: list = field(default_factory=list)
+    reraised: list = field(default_factory=list)
+    removed: list = field(default_factory=list)
+
+
+class HazardMap:
+    """Layer A per CLAUDE.md decision 3: in-memory only, empty at
+    construction, never written to or read from disk - a fresh HazardMap()
+    every run is the whole point, since a new session cannot assume the
+    camera angle/room/lighting match a previous one.
+    """
+
+    def __init__(self):
+        self.entries: list[HazardEntry] = []
+        self._next_id = 1
+        self._provisional: list[_Provisional] = []
+
+    def get(self, entry_id: int):
+        for entry in self.entries:
+            if entry.id == entry_id:
+                return entry
+        return None
+
+    def _new_entry(self, label, bbox, origin, is_first_scan, state=HAZARD_STATE_PENDING) -> HazardEntry:
+        entry = HazardEntry(
+            id=self._next_id,
+            label=label,
+            bbox=bbox,
+            origin=origin,
+            state=state,
+            is_first_scan=is_first_scan,
+            last_seen=time.monotonic(),
+        )
+        self._next_id += 1
+        self.entries.append(entry)
+        return entry
+
+    def add_seed(self, bbox, label: str) -> HazardEntry:
+        """--seed-hazard: added directly as CONFIRMED, for deterministic
+        Layer B testing without a real hazard in frame. Not touched by
+        either detector (origin is neither NAMED nor SCAN).
+        """
+        return self._new_entry(
+            label, bbox, HAZARD_ORIGIN_SEED, is_first_scan=True, state=HAZARD_STATE_CONFIRMED
+        )
+
+    def propose_named(
+        self, bbox, label: str, frame_diagonal: float, is_first_scan: bool
+    ) -> tuple[HazardEntry, bool]:
+        """The per-frame/named-class and wall-socket detectors' single entry
+        point. Matches against existing NAMED-origin entries sharing `label`
+        (so an oven detection can never merge into a refrigerator entry);
+        refreshes position on a match, otherwise creates a new PENDING
+        entry. Returns (entry, created) so the caller can enqueue/alert only
+        on genuinely new entries.
+        """
+        candidates = [e for e in self.entries if e.label == label and e.origin == HAZARD_ORIGIN_NAMED]
+        match = find_match(bbox, candidates, frame_diagonal, HAZARD_MATCH_IOU_THRESHOLD, HAZARD_MATCH_CENTER_DIST_FRAC)
+        if match is not None:
+            match.bbox = bbox
+            match.last_seen = time.monotonic()
+            match.hits += 1
+            return match, False
+        entry = self._new_entry(label, bbox, HAZARD_ORIGIN_NAMED, is_first_scan)
+        return entry, True
+
+    def confirm(self, entry_id: int):
+        """'h' - a human says this is a hazard."""
+        entry = self.get(entry_id)
+        if entry is not None:
+            entry.state = HAZARD_STATE_CONFIRMED
+        return entry
+
+    def dismiss(self, entry_id: int, frame):
+        """'n' - a human says this is not a hazard. Records a fingerprint
+        crop of the spot so a later scan can tell if it's since changed
+        (Step 4) - see fingerprint_changed().
+        """
+        entry = self.get(entry_id)
+        if entry is None:
+            return None
+        entry.state = HAZARD_STATE_DISMISSED
+        entry.fingerprint = crop_bbox(frame, entry.bbox)
+        entry.absent_scans = 0
+        return entry
+
+    def apply_scan_candidates(
+        self, raw_candidates: list, frame, frame_diagonal: float, is_first_scan_cycle: bool
+    ) -> ScanDiffResult:
+        """The periodic room scan's entire "detect new"/"detect removed"
+        mechanism (CLAUDE.md decision 3), run once per scan cadence tick.
+
+        `raw_candidates` is this scan's occupied-spot bboxes, already
+        person-suppressed (see generate_scan_candidates), NOT yet
+        deduplicated - deduplication happens here first (Step 3's
+        duplicate-candidate fix).
+
+        Sequence:
+          1. Dedupe overlapping candidates from this one scan pass.
+          2. Match each candidate against known SCAN-origin entries
+             (any state, including DISMISSED - a dismissed spot is still a
+             "known spot" for matching purposes). A match refreshes
+             position and resets the absence counter; a match against a
+             DISMISSED entry additionally checks fingerprint_changed() and
+             re-raises to PENDING if the spot looks materially different.
+          3. Every known SCAN-origin entry NOT matched this cycle gets its
+             absence counter bumped; once that counter reaches
+             SCAN_CONSECUTIVE_SCANS_REQUIRED, the entry is removed.
+          4. Every candidate NOT matched to a known entry is checked against
+             last cycle's provisional (seen-once) list. A second consecutive
+             sighting promotes it to a real PENDING entry ("arrived");
+             anything else becomes this cycle's new provisional list.
+        """
+        candidates = dedupe_candidates(raw_candidates)
+        scan_entries = [e for e in self.entries if e.origin == HAZARD_ORIGIN_SCAN]
+
+        matched_ids: set[int] = set()
+        reraised: list[HazardEntry] = []
+        unmatched_candidates: list = []
+
+        for candidate in candidates:
+            pool = [e for e in scan_entries if e.id not in matched_ids]
+            match = find_match(candidate, pool, frame_diagonal, HAZARD_MATCH_IOU_THRESHOLD, HAZARD_MATCH_CENTER_DIST_FRAC)
+            if match is None:
+                unmatched_candidates.append(candidate)
+                continue
+            matched_ids.add(match.id)
+            match.bbox = candidate
+            match.last_seen = time.monotonic()
+            match.hits += 1
+            match.absent_scans = 0
+            if match.state == HAZARD_STATE_DISMISSED and fingerprint_changed(match.fingerprint, frame, candidate):
+                match.state = HAZARD_STATE_PENDING
+                # A re-raise is, by definition, not part of the room's
+                # original starting state - the parent already judged this
+                # spot once, so it alerts like any other later arrival.
+                match.is_first_scan = False
+                match.fingerprint = None
+                reraised.append(match)
+
+        removed: list[HazardEntry] = []
+        for entry in scan_entries:
+            if entry.id in matched_ids:
+                continue
+            entry.absent_scans += 1
+            if entry.absent_scans >= SCAN_CONSECUTIVE_SCANS_REQUIRED:
+                removed.append(entry)
+        if removed:
+            removed_ids = {e.id for e in removed}
+            self.entries = [e for e in self.entries if e.id not in removed_ids]
+
+        arrived: list[HazardEntry] = []
+        remaining_provisional = list(self._provisional)
+        new_provisional: list[_Provisional] = []
+        for candidate in unmatched_candidates:
+            match = find_match(
+                candidate, remaining_provisional, frame_diagonal,
+                HAZARD_MATCH_IOU_THRESHOLD, HAZARD_MATCH_CENTER_DIST_FRAC,
+            )
+            if match is not None:
+                remaining_provisional = [p for p in remaining_provisional if p is not match]
+                entry = self._new_entry(SCAN_HAZARD_LABEL, candidate, HAZARD_ORIGIN_SCAN, match.is_first_scan)
+                arrived.append(entry)
+            else:
+                new_provisional.append(_Provisional(bbox=candidate, is_first_scan=is_first_scan_cycle))
+        self._provisional = new_provisional
+
+        return ScanDiffResult(arrived=arrived, reraised=reraised, removed=removed)
+
+
+def hazard_alerts_on_approach(entry: HazardEntry) -> bool:
+    """CLAUDE.md decision 4's table, as code:
+
+        CONFIRMED                            -> alert
+        PENDING, arrived after the first scan -> alert (unreviewed = unknown
+                                                  = treated as dangerous)
+        PENDING, from the first scan          -> no alert (room's normal
+                                                  starting state, human
+                                                  present reviewing it)
+        DISMISSED                             -> never alert
+    """
+    if entry.state == HAZARD_STATE_CONFIRMED:
+        return True
+    if entry.state == HAZARD_STATE_PENDING:
+        return not entry.is_first_scan
+    return False
+
+
+# --- Human review queue ------------------------------------------------------
+
+
+class ReviewQueue:
+    """A live FIFO of HazardEntry ids awaiting an 'h'/'n' decision. Can
+    receive new items at any time (from either detector, for as long as the
+    camera runs) - there is no fixed startup list and no "review is closed"
+    state, per CLAUDE.md decision 3.
+    """
+
+    def __init__(self):
+        self._ids: deque[int] = deque()
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def enqueue(self, entry_id: int) -> None:
+        self._ids.append(entry_id)
+
+    def current_id(self):
+        return self._ids[0] if self._ids else None
+
+    def advance(self) -> None:
+        """'h'/'n' - the current item has been decided, move to the next."""
+        if self._ids:
+            self._ids.popleft()
+
+    def skip_remaining(self) -> None:
+        """'s' - clear everything currently queued. The underlying
+        HazardEntry objects are untouched (still PENDING, still alert-
+        eligible per hazard_alerts_on_approach if they arrived after the
+        first scan) - only their place in the review queue is dropped.
+        Future arrivals still enqueue normally afterward.
+        """
+        self._ids.clear()
+
+    def discard(self, entry_id: int) -> None:
+        """Remove one specific id from wherever it sits in the queue - used
+        when the scan's own removal logic clears a HazardEntry that was
+        still awaiting review.
+        """
+        if entry_id in self._ids:
+            self._ids = deque(i for i in self._ids if i != entry_id)
+
+
+# --- Periodic room scan: candidate generation -------------------------------
+
+
+def generate_scan_candidates(frame, seg_model, person_boxes, imgsz: int, device: str) -> list:
+    """One scan cycle's occupied-spot candidates: runs
+    measure_segmentation.py's segment_frame()/apply_filter() (imported
+    unmodified) against `frame`, person-suppressed using THIS script's own
+    already-computed person boxes (no second person-detection model). Called
+    on a cadence from main(), not once at startup - CLAUDE.md decision 3.
+
+    Returns a plain list of (x1, y1, x2, y2) bboxes in `frame`'s own pixel
+    coordinates.
+    """
+    segments = segment_frame(seg_model, frame, imgsz, device)
+    person_dicts = [{"x1": b[0], "y1": b[1], "x2": b[2], "y2": b[3]} for b in person_boxes]
+    filtered = seg_apply_filter(
+        segments, person_dicts, MIN_AREA_FRAC, MAX_AREA_FRAC, PERSON_OVERLAP_THRESHOLD,
+        MIN_EXTENT, y_containment_frac=None, min_aspect_ratio=None,
+    )
+    return [(seg["x1"], seg["y1"], seg["x2"], seg["y2"]) for seg in filtered]
+
+
+# --- Layer B: person tracking + proximity scoring ---------------------------
+
+
+@dataclass
+class PersonEntry:
+    id: int
+    bbox: tuple[float, float, float, float]
+    last_seen: float
+
+
+class PersonTracker:
+    """A minimal nearest-match tracker, NOT a real multi-object tracker (no
+    motion model, no optimal assignment, no re-identification after
+    occlusion) - adequate for a single-camera proximity signal, flagged as a
+    known simplification rather than presented as more than it is. Exists so
+    Layer B's rolling window can be keyed per (person, hazard) pair across
+    frames instead of resetting every frame's smoothing.
+    """
+
+    def __init__(self):
+        self.entries: list[PersonEntry] = []
+        self._next_id = 1
+
+    def update(self, detection_boxes, frame_diagonal: float) -> list[PersonEntry]:
+        now = time.monotonic()
+        claimed_ids: set[int] = set()
+        live: list[PersonEntry] = []
+
+        for box in detection_boxes:
+            match = find_match(
+                box, [e for e in self.entries if e.id not in claimed_ids], frame_diagonal,
+                PERSON_MATCH_IOU_THRESHOLD, PERSON_MATCH_CENTER_DIST_FRAC,
+            )
+            if match is not None:
+                match.bbox = box
+                match.last_seen = now
+                claimed_ids.add(match.id)
+                live.append(match)
+            else:
+                entry = PersonEntry(id=self._next_id, bbox=box, last_seen=now)
+                self._next_id += 1
+                self.entries.append(entry)
+                claimed_ids.add(entry.id)
+                live.append(entry)
+
+        self.entries = [e for e in self.entries if now - e.last_seen <= PERSON_STALE_SECONDS]
+        return live
+
+
+def score_frame(live_persons, hazard_entries, frame_diagonal: float, rolling_windows: dict):
+    """Layer B core: for every live person x every ALERT-ELIGIBLE hazard-map
+    entry (caller filters by hazard_alerts_on_approach before calling this),
+    compute the normalized center distance, push it into that pair's rolling
+    window, and classify the smoothed distance into a zone.
+
+    Returns (per_person, frame_risk):
+      per_person: {person_id: (HazardEntry, smoothed_distance, zone)} - each
+        live person's nearest hazard by smoothed distance.
+      frame_risk: the single highest-ranked zone this frame across every
+        pair, for the corner-text readout.
+    """
+    per_person: dict[int, tuple] = {}
+    frame_risk = {"zone": RISK_ZONE_NONE, "value": None, "person_id": None, "hazard_label": None}
+
+    for person in live_persons:
+        best = None
+        for hazard in hazard_entries:
+            raw_distance = normalized_center_distance(person.bbox, hazard.bbox, frame_diagonal)
+            key = (person.id, hazard.id)
+            window = rolling_windows[key]
+            window.append(raw_distance)
+            smoothed = sum(window) / len(window)
+            zone = classify_zone(smoothed)
+
+            if best is None or smoothed < best[1]:
+                best = (hazard, smoothed, zone)
+            if zone_rank(zone) > zone_rank(frame_risk["zone"]):
+                frame_risk = {"zone": zone, "value": smoothed, "person_id": person.id, "hazard_label": hazard.label}
+
+        if best is not None:
+            per_person[person.id] = best
+
+    return per_person, frame_risk
+
+
+# --- CLI parsing -------------------------------------------------------------
+
+
+def parse_seed_hazard(raw: str) -> tuple[float, float, float, float, str]:
+    """Parse one `--seed-hazard x,y,w,h,label` value into an (x1, y1, x2,
+    y2, label) tuple in pixel coordinates of the capture resolution. `label`
+    is everything after the fourth comma, taken verbatim.
+    """
+    parts = raw.split(",", 4)
+    if len(parts) != 5:
+        raise argparse.ArgumentTypeError(
+            f"--seed-hazard must be 'x,y,w,h,label' (5 comma-separated values), got {raw!r}"
+        )
+    x_str, y_str, w_str, h_str, label = parts
+    try:
+        x, y, w, h = (float(x_str), float(y_str), float(w_str), float(h_str))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"--seed-hazard x,y,w,h must all be numbers, got {raw!r} ({exc})")
+    label = label.strip()
+    if not label:
+        raise argparse.ArgumentTypeError(f"--seed-hazard label is empty in {raw!r}")
+    if w <= 0 or h <= 0:
+        raise argparse.ArgumentTypeError(f"--seed-hazard w,h must both be positive, got {raw!r}")
+    return (x, y, x + w, y + h, label)
+
+
+# --- overlay drawing ---------------------------------------------------------
+
+
+def draw_label(image, text: str, origin: tuple[int, int], color) -> None:
+    for c, thickness in ((OVERLAY_OUTLINE, 3), (color, 1)):
+        cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, thickness)
+
+
+def hazard_box_color(entry: HazardEntry):
+    if entry.state == HAZARD_STATE_PENDING:
+        return PENDING_FIRST_SCAN_BOX_COLOR if entry.is_first_scan else PENDING_ARRIVED_BOX_COLOR
+    return HAZARD_STATE_BOX_COLOR[entry.state]
+
+
+def hazard_state_tag(entry: HazardEntry) -> str:
+    if entry.state == HAZARD_STATE_CONFIRMED:
+        return "HAZARD"
+    if entry.state == HAZARD_STATE_DISMISSED:
+        return "DISMISSED"
+    return "PENDING" if entry.is_first_scan else "NEW-UNREVIEWED"
+
+
+def draw_hazard_box(image, entry: HazardEntry, is_review_candidate: bool) -> None:
+    x1, y1, x2, y2 = (int(round(v)) for v in entry.bbox)
+    color = hazard_box_color(entry)
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+    if is_review_candidate:
+        # An extra white outline so "this is the one awaiting your h/n/s
+        # keypress right now" is unmistakable from any other pending box.
+        cv2.rectangle(image, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), REVIEW_CANDIDATE_OUTLINE_COLOR, 1)
+    draw_label(image, f"[{hazard_state_tag(entry)}] {entry.label}", (x1, max(0, y1 - 8)), color)
+
+
+def draw_person_box(image, person: PersonEntry) -> None:
+    x1, y1, x2, y2 = (int(round(v)) for v in person.bbox)
+    cv2.rectangle(image, (x1, y1), (x2, y2), PERSON_BOX_COLOR, 2)
+    draw_label(image, f"person #{person.id}", (x1, max(0, y1 - 8)), PERSON_BOX_COLOR)
+
+
+def draw_connector(image, person: PersonEntry, hazard: HazardEntry, zone: str) -> None:
+    p_center = tuple(int(round(v)) for v in bbox_center(person.bbox))
+    h_center = tuple(int(round(v)) for v in bbox_center(hazard.bbox))
+    cv2.line(image, p_center, h_center, ZONE_COLORS.get(zone, ZONE_COLORS[RISK_ZONE_NONE]), 2)
+
+
+def review_candidate_label(position: int, total: int) -> str:
+    """Text shown ON the box currently awaiting a decision - 1-based, since
+    that's how a parent would count. `total` is the current queue length
+    (the queue is live and can grow while a decision is pending, so this is
+    NOT a fixed "N of a startup batch" count).
+    """
+    return f"REVIEW {position}/{total} - h=hazard n=not s=skip queued"
+
+
+def draw_risk_readout(image, frame_risk: dict, hazard_map: HazardMap, review_queue: ReviewQueue) -> None:
+    zone = frame_risk["zone"]
+    if zone == RISK_ZONE_NONE or frame_risk["person_id"] is None:
+        risk_text = "RISK: none (no person-hazard pair in a scored zone)"
+    else:
+        risk_text = (
+            f"RISK: {zone.upper()}  person #{frame_risk['person_id']} vs "
+            f"{frame_risk['hazard_label']}  (normalized dist {frame_risk['value']:.2f})"
+        )
+    draw_overlay_line(image, risk_text, 3)
+
+    n_confirmed = sum(1 for e in hazard_map.entries if e.state == HAZARD_STATE_CONFIRMED)
+    n_pending_first = sum(
+        1 for e in hazard_map.entries if e.state == HAZARD_STATE_PENDING and e.is_first_scan
+    )
+    n_pending_new = sum(
+        1 for e in hazard_map.entries if e.state == HAZARD_STATE_PENDING and not e.is_first_scan
+    )
+    n_dismissed = sum(1 for e in hazard_map.entries if e.state == HAZARD_STATE_DISMISSED)
+    draw_overlay_line(
+        image,
+        f"Hazard map: {len(hazard_map.entries)} entries ({n_confirmed} confirmed, "
+        f"{n_pending_first} pending/first-scan, {n_pending_new} pending/NEW [alerts], "
+        f"{n_dismissed} dismissed)  |  review queue: {len(review_queue)}",
+        4,
+    )
+
+
+# --- main --------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Phase 4: live risk overlay - a per-frame YOLO pass plus a "
+        "periodic class-agnostic room scan propose hazard candidates; a human "
+        "confirms/dismisses them ('h'/'n'/'s'); Layer B scores child proximity "
+        "against confirmed hazards and unreviewed new arrivals."
+    )
+    parser.add_argument("--index", type=int, default=None, help=f"OpenCV camera device index (default: {DEFAULT_CAMERA_INDEX} if neither --index nor --name is given). Ignored if --name is also given.")
+    parser.add_argument("--name", type=str, default=None, help="Select the camera by a substring of its device name (e.g. 'Arducam') instead of a numeric index. Wins over --index if both are given.")
+    parser.add_argument("--device", type=str, default="mps", help="Inference device: 'mps' (default, Apple GPU) or 'cpu'.")
+    parser.add_argument("--conf", type=float, default=DEFAULT_CONF_THRESHOLD, help=f"Minimum detection confidence to consider a box (default: {DEFAULT_CONF_THRESHOLD}).")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help=f"YOLO26 weights to run (default: {DEFAULT_MODEL}).")
+    parser.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ, help=f"Inference resolution (default: {DEFAULT_IMGSZ}).")
+    parser.add_argument(
+        "--seed-hazard", type=parse_seed_hazard, action="append", default=[], metavar="x,y,w,h,label",
+        dest="seed_hazards",
+        help="Add a fixed, CONFIRMED hazard-map entry at startup, in pixel coordinates of the ACTUAL "
+        "capture resolution. Repeatable. E.g. '--seed-hazard 200,400,300,200,stove'. For deterministic "
+        "testing of zone escalation without a real hazard in frame.",
+    )
+    parser.add_argument(
+        "--disable-socket-detect", dest="socket_detect_enabled", action="store_false", default=True,
+        help="Turn off the open-vocabulary wall-socket pass entirely (no second model is even loaded).",
+    )
+    parser.add_argument("--socket-model", type=str, default=DEFAULT_SOCKET_MODEL, help=f"Open-vocabulary weights for wall-socket detection (default: {DEFAULT_SOCKET_MODEL}).")
+    parser.add_argument("--socket-prompts", type=str, default=",".join(DEFAULT_SOCKET_PROMPTS), help=f"Comma-separated text prompt(s) for the socket pass (default: {','.join(DEFAULT_SOCKET_PROMPTS)}).")
+    parser.add_argument("--socket-conf", type=float, default=DEFAULT_SOCKET_CONF, help=f"Minimum confidence for a socket detection (default: {DEFAULT_SOCKET_CONF}).")
+    parser.add_argument("--socket-imgsz", type=int, default=DEFAULT_SOCKET_IMGSZ, help=f"Inference resolution for the socket pass (default: {DEFAULT_SOCKET_IMGSZ}).")
+    parser.add_argument("--socket-scan-interval", type=float, default=DEFAULT_SOCKET_SCAN_INTERVAL_SECONDS, help=f"Wall-clock seconds between socket-detection passes (default: {DEFAULT_SOCKET_SCAN_INTERVAL_SECONDS}).")
+    parser.add_argument(
+        "--disable-scan", dest="scan_enabled", action="store_false", default=True,
+        help="Turn off the periodic class-agnostic room scan entirely (no segmentation model is even "
+        "loaded) - named-class/socket detection only. CLAUDE.md decision 3 expects this to run "
+        "continuously by default; this flag exists mainly for isolating the named-class path.",
+    )
+    parser.add_argument("--scan-interval", type=float, default=DEFAULT_SCAN_INTERVAL_SECONDS, help=f"Wall-clock seconds between periodic room scans (default: {DEFAULT_SCAN_INTERVAL_SECONDS}).")
+    parser.add_argument("--scan-seg-model", type=str, default=DEFAULT_SEG_MODEL, help=f"Class-agnostic segmentation weights for the room scan (default: {DEFAULT_SEG_MODEL}).")
+    parser.add_argument("--scan-imgsz", type=int, default=DEFAULT_SEG_IMGSZ, help=f"Inference resolution for the room scan (default: {DEFAULT_SEG_IMGSZ}).")
+    args = parser.parse_args()
+
+    socket_prompts = [p.strip() for p in args.socket_prompts.split(",") if p.strip()]
+    if args.socket_detect_enabled and not socket_prompts:
+        print("Error: --socket-prompts produced no usable prompts.")
+        return
+
+    device = resolve_device(args.device)
+    print(f"Using device: {device}")
+
+    print(f"Loading {args.model} (imgsz={args.imgsz}) ...")
+    model = load_model(args.model, device)
+    print("Model loaded.")
+
+    class_name_to_id = {name: idx for idx, name in model.names.items()}
+    person_class_id = class_name_to_id.get("person")
+    if person_class_id is None:
+        print(
+            "Error: the loaded model has no 'person' class - CLAUDE.md decision 2 requires person "
+            "detection to come from the same single pass as hazards. Refusing to run without it."
+        )
+        return
+
+    hazard_class_id_to_label: dict[int, str] = {}
+    for class_name, hazard_label in HAZARD_LABEL_BY_CLASS_NAME.items():
+        class_id = class_name_to_id.get(class_name)
+        if class_id is None:
+            print(f"Warning: model has no '{class_name}' class - the '{hazard_label}' hazard group will be missing that source class this run.")
+            continue
+        hazard_class_id_to_label[class_id] = hazard_label
+
+    socket_model = None
+    if args.socket_detect_enabled:
+        print(f"Loading {args.socket_model} for wall-socket detection (prompts={socket_prompts}) ...")
+        socket_model, socket_model_type = load_open_vocab_model(args.socket_model, device, socket_prompts)
+        print(f"{args.socket_model} loaded as {socket_model_type}.")
+    else:
+        print("Socket detection disabled (--disable-socket-detect).")
+
+    scan_model = None
+    if args.scan_enabled:
+        print(f"Loading {args.scan_seg_model} for the periodic room scan (imgsz={args.scan_imgsz}) ...")
+        scan_model = load_seg_weights(FastSAM, args.scan_seg_model, device)
+        print(f"{args.scan_seg_model} loaded.")
+    else:
+        print("Periodic room scan disabled (--disable-scan).")
+
+    try:
+        camera = CameraCapture(index=args.index, name=args.name)
+    except CameraSelectionError as exc:
+        print(str(exc))
+        return
+
+    ok, first_frame = camera.verify_startup()
+    if not ok:
+        print(startup_failure_message(camera.index))
+        camera.release()
+        return
+
+    height, width = first_frame.shape[:2]
+    frame_diagonal = math.hypot(width, height)
+    device_label = camera.resolved_name or f"index {camera.index}"
+    print(f"Streaming from camera {camera.index} ({device_label}) at {width}x{height}. Press 'q' to quit.")
+
+    hazard_map = HazardMap()
+    for x1, y1, x2, y2, label in args.seed_hazards:
+        if x1 < 0 or y1 < 0 or x2 > width or y2 > height:
+            print(f"Warning: --seed-hazard '{label}' bbox extends outside the {width}x{height} capture frame - added anyway.")
+        hazard_map.add_seed((x1, y1, x2, y2), label)
+        print(f"Seeded hazard '{label}' (CONFIRMED) at ({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f}).")
+
+    review_queue = ReviewQueue()
+    person_tracker = PersonTracker()
+    rolling_windows: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=ROLLING_WINDOW_SIZE))
+
+    last_socket_scan_time = time.monotonic() - args.socket_scan_interval
+    last_room_scan_time = time.monotonic() - args.scan_interval
+    room_scan_index = 0
+    # Flips True the moment the first periodic room scan completes - used to
+    # tag NAMED-origin proposals as is_first_scan (see the module docstring
+    # and HazardEntry.is_first_scan). A coarse proxy for named-class
+    # entries specifically (they're evaluated every frame, not on the scan's
+    # own cadence) - flagged explicitly, not silently assumed exact.
+    first_scan_done = not args.scan_enabled
+
+    alert_text = None
+    alert_until = 0.0
+
+    def raise_alert(text: str) -> None:
+        nonlocal alert_text, alert_until
+        print(f"ALERT: {text}")
+        alert_text = text
+        alert_until = time.monotonic() + ALERT_BANNER_SECONDS
+
+    def enqueue_and_maybe_alert(entry: HazardEntry, alert_reason: str) -> None:
+        review_queue.enqueue(entry.id)
+        if not entry.is_first_scan:
+            raise_alert(f"New object detected ({alert_reason}): {entry.label}")
+
+    smoothed_fps = None
+    last_frame_time = time.monotonic()
+    # Used by the 'n' (dismiss) key handler below so a dismissal on a frame
+    # where the camera happened to drop a read still gets a real fingerprint
+    # crop, instead of silently no-op'ing until the next successful read.
+    last_valid_frame = first_frame
+
+    cv2.imshow(WINDOW_NAME, prepare_for_display(first_frame))
+    cv2.waitKey(1)
+
+    try:
+        for frame in camera.frames():
+            if frame is not None:
+                last_valid_frame = frame
+                now = time.monotonic()
+
+                results = model.predict(frame, conf=args.conf, imgsz=args.imgsz, device=device, verbose=False)
+
+                person_boxes: list[tuple[float, float, float, float]] = []
+                hazard_detections: list[tuple[str, tuple]] = []
+                boxes = results[0].boxes
+                if boxes is not None:
+                    for box in boxes:
+                        cls_id = int(box.cls[0])
+                        bbox = tuple(float(v) for v in box.xyxy[0])
+                        if cls_id == person_class_id:
+                            person_boxes.append(bbox)
+                        elif cls_id in hazard_class_id_to_label:
+                            hazard_detections.append((hazard_class_id_to_label[cls_id], bbox))
+
+                for label, bbox in hazard_detections:
+                    entry, created = hazard_map.propose_named(bbox, label, frame_diagonal, is_first_scan=not first_scan_done)
+                    if created:
+                        enqueue_and_maybe_alert(entry, "named detection")
+
+                if socket_model is not None and now - last_socket_scan_time >= args.socket_scan_interval:
+                    socket_results = socket_model.predict(frame, conf=args.socket_conf, imgsz=args.socket_imgsz, device=device, verbose=False)
+                    socket_boxes = socket_results[0].boxes
+                    if socket_boxes is not None:
+                        for box in socket_boxes:
+                            bbox = tuple(float(v) for v in box.xyxy[0])
+                            entry, created = hazard_map.propose_named(bbox, SOCKET_HAZARD_LABEL, frame_diagonal, is_first_scan=not first_scan_done)
+                            if created:
+                                enqueue_and_maybe_alert(entry, "wall socket")
+                    last_socket_scan_time = now
+
+                if scan_model is not None and now - last_room_scan_time >= args.scan_interval:
+                    coverage = person_coverage_frac(person_boxes, width, height)
+                    if coverage > SCAN_PERSON_COVERAGE_SKIP_FRAC:
+                        # Deferred, not skipped for good: retried on the next
+                        # regular cadence tick (this is Layer A, not
+                        # latency-critical - waiting one more interval for a
+                        # person to clear the shot is an acceptable, simpler
+                        # tradeoff over busy-polling every frame).
+                        last_room_scan_time = now
+                    else:
+                        raw_candidates = generate_scan_candidates(frame, scan_model, person_boxes, args.scan_imgsz, device)
+                        diff = hazard_map.apply_scan_candidates(
+                            raw_candidates, frame, frame_diagonal, is_first_scan_cycle=(room_scan_index == 0)
+                        )
+                        for entry in diff.arrived:
+                            enqueue_and_maybe_alert(entry, "room scan")
+                        for entry in diff.reraised:
+                            enqueue_and_maybe_alert(entry, "spot changed since dismissal")
+                        for entry in diff.removed:
+                            review_queue.discard(entry.id)
+                        room_scan_index += 1
+                        if room_scan_index == 1:
+                            first_scan_done = True
+                        last_room_scan_time = now
+
+                live_persons = person_tracker.update(person_boxes, frame_diagonal)
+
+                live_person_ids = {p.id for p in live_persons}
+                for key in list(rolling_windows.keys()):
+                    if key[0] not in live_person_ids:
+                        del rolling_windows[key]
+
+                alert_eligible_hazards = [e for e in hazard_map.entries if hazard_alerts_on_approach(e)]
+                per_person, frame_risk = score_frame(live_persons, alert_eligible_hazards, frame_diagonal, rolling_windows)
+
+                annotated = frame.copy()
+
+                review_candidate_id = review_queue.current_id()
+                for hazard in hazard_map.entries:
+                    draw_hazard_box(annotated, hazard, is_review_candidate=(hazard.id == review_candidate_id))
+                for person in live_persons:
+                    draw_person_box(annotated, person)
+                for person in live_persons:
+                    nearest = per_person.get(person.id)
+                    if nearest is not None:
+                        hazard, _smoothed, zone = nearest
+                        draw_connector(annotated, person, hazard, zone)
+
+                now = time.monotonic()
+                instantaneous_fps = 1.0 / max(now - last_frame_time, 1e-6)
+                last_frame_time = now
+                smoothed_fps = (
+                    instantaneous_fps if smoothed_fps is None
+                    else FPS_SMOOTHING_ALPHA * instantaneous_fps + (1 - FPS_SMOOTHING_ALPHA) * smoothed_fps
+                )
+
+                draw_overlay_line(annotated, f"FPS: {smoothed_fps:.1f}", 1)
+                draw_overlay_line(annotated, f"{args.model}  imgsz={args.imgsz}  conf={args.conf}  {device}", 2)
+                draw_risk_readout(annotated, frame_risk, hazard_map, review_queue)
+
+                if review_candidate_id is not None:
+                    candidate_entry = hazard_map.get(review_candidate_id)
+                    if candidate_entry is not None:
+                        cx1, cy1, cx2, cy2 = (int(round(v)) for v in candidate_entry.bbox)
+                        draw_label(
+                            annotated, review_candidate_label(1, len(review_queue)),
+                            (cx1, max(0, cy1 - 24)), REVIEW_CANDIDATE_OUTLINE_COLOR,
+                        )
+
+                if alert_text is not None and now < alert_until:
+                    draw_overlay_line(annotated, f"ALERT: {alert_text}", 5)
+
+                cv2.imshow(WINDOW_NAME, prepare_for_display(annotated))
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("h"):
+                entry_id = review_queue.current_id()
+                if entry_id is not None:
+                    hazard_map.confirm(entry_id)
+                    review_queue.advance()
+                    print(f"Confirmed hazard entry #{entry_id}.")
+            elif key == ord("n"):
+                entry_id = review_queue.current_id()
+                if entry_id is not None:
+                    hazard_map.dismiss(entry_id, last_valid_frame)
+                    review_queue.advance()
+                    print(f"Dismissed entry #{entry_id} (not a hazard).")
+            elif key == ord("s"):
+                if len(review_queue) > 0:
+                    print(f"Skipping {len(review_queue)} currently-queued candidate(s).")
+                review_queue.skip_remaining()
+
+            if key == ord("q"):
+                print("Quit key pressed - exiting.")
+                break
+
+            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                print("Window closed - exiting.")
+                break
+
+    except KeyboardInterrupt:
+        print("Interrupted (Ctrl+C) - exiting.")
+
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

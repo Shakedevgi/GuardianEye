@@ -3,6 +3,10 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+# Throwaway venv for the Phase 3 Open Images download tooling (boto3/pandas/
+# cvdata) - deliberately NOT the pinned cv/.venv (torch/torchvision/
+# ultralytics), see data/openimages_public/README.md.
+.venv-oid/
 
 # OS
 .DS_Store
@@ -19,6 +23,28 @@ cv/models/
 # Captured frames from detect_stream.py (dataset material, not source)
 cv/captures/
 
+# Phase 3 Step 0 measurement output (measure_detection.py). Derived from the
+# gitignored captures above - regeneratable from source images, not itself
+# source, and CSV rows embed bbox coordinates traceable back to photos of a
+# real home, so treat it the same way as the captures it's measured from.
+cv/measurements/
+
+# Phase 3 prepare_dataset.py output - symlinks (or, on fallback, copies) of
+# cv/captures/ images plus their label .txt files, rebuildable at any time
+# from cv/captures/. Not source of record, and the same privacy reasoning as
+# cv/captures/ applies to it.
+cv/datasets/
+
+# Fine-tuned training runs (Ultralytics' default `runs/` output dir) -
+# weights, checkpoints and training-run images, all regeneratable, all large.
+cv/runs/
+# Same, but landed at the repo root instead of cv/runs/ - a known artifact of
+# a relative project= path bug in an earlier training script (see
+# cv/train_mixed.sh's header comment and docs/decision-log.md, 2026-08-11
+# Phase 3 close). Flagged twice by docs-agent audits as untracked clutter
+# before actually being fixed here.
+runs/
+
 # Belt-and-braces: ANY image captured under cv/, wherever it lands. These are
 # photographs of a real home and the people in it - including, in Phase 3, a
 # child. They must never reach a public repo, so this is deliberately broader
@@ -29,3 +55,11 @@ cv/**/*.jpeg
 cv/**/*.png
 cv/**/*.mp4
 cv/**/*.mov
+
+# Public dataset pulls (e.g. Open Images) for Phase 3 fine-tuning - large
+# (hundreds of MB of third-party images), regeneratable from the URLs
+# documented in data/openimages_public/README.md, and deliberately kept out
+# of git rather than committed like source. Does NOT contain anything of
+# ours - see that README for why this is still worth gitignoring anyway
+# (repo hygiene, not privacy - cv/**/*.jpg above is the privacy rule).
+data/

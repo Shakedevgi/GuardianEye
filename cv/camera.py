@@ -143,8 +143,37 @@ STARTUP_VERIFY_ATTEMPTS = 15
 STARTUP_VERIFY_RETRY_DELAY_SECONDS = 0.2
 
 
-def open_capture(index: int) -> cv2.VideoCapture:
-    return cv2.VideoCapture(index)
+def open_capture(
+    index: int,
+    request_width: int | None = None,
+    request_height: int | None = None,
+    request_fourcc: str | None = None,
+) -> cv2.VideoCapture:
+    """Open OpenCV index `index`, optionally requesting a capture resolution
+    and/or pixel format before returning.
+
+    All three request_* args default to None, matching the original
+    zero-arg behaviour byte-for-byte for every existing caller that doesn't
+    pass them (the capability probe below constructs its own VideoCapture
+    inline rather than through here, so it's unaffected either way).
+
+    FOURCC is set before width/height, mirroring probe_index_capability()
+    below and for the same reason: on this project's Arducam, requesting a
+    4K size with no pixel format negotiated first silently falls back to
+    1920x1080 (uncompressed 4K exceeds USB bandwidth) - MJPG has to be
+    requested for the large size to actually be reachable at all. Setting a
+    cv2.VideoCapture property is a REQUEST, not a guarantee - callers must
+    verify what was actually delivered by reading a real frame, never trust
+    cap.get() (see this module's docstring and CameraCapture below).
+    """
+    cap = cv2.VideoCapture(index)
+    if request_fourcc:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*request_fourcc))
+    if request_width:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, request_width)
+    if request_height:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, request_height)
+    return cap
 
 
 # How many OpenCV indices to probe when resolving a name by capability.
@@ -461,6 +490,16 @@ class CameraCapture:
     time this class reopens the device, including after a mid-stream
     reconnect - see `frames()`.
 
+    `request_width`/`request_height`/`request_fourcc` optionally request a
+    specific capture resolution/pixel format, re-applied on EVERY open
+    (initial open and every `_reopen()` - see `open_capture()`) so a
+    mid-session reconnect can't silently drop back to a lower resolution
+    unnoticed. All default to None, which is the original "negotiate
+    nothing" behaviour, unchanged. What was actually delivered is measured
+    from a REAL frame (never trusted from `cap.get()`) and recorded in
+    `delivered_width`/`delivered_height`; see `_note_delivered_resolution()`
+    for the "request vs. measured" distinction and its warning.
+
     Usage:
         camera = CameraCapture(name="Arducam")
         ok, frame = camera.verify_startup()
@@ -473,7 +512,14 @@ class CameraCapture:
         camera.release()
     """
 
-    def __init__(self, index: int | None = None, name: str | None = None):
+    def __init__(
+        self,
+        index: int | None = None,
+        name: str | None = None,
+        request_width: int | None = None,
+        request_height: int | None = None,
+        request_fourcc: str | None = None,
+    ):
         if name is not None and index is not None:
             # Both passed: name wins. Name identifies a physical device
             # regardless of which index it currently sits at, which is
@@ -494,6 +540,22 @@ class CameraCapture:
         self._selector_index = index  # only meaningful when _selector_name is None
         self._capability_detail = None  # human-readable evidence for a name match
         self.resolved_name = None
+
+        # Optional capture-resolution/format request, applied on EVERY open
+        # (initial open below and every _reopen() - see open_capture() and
+        # _reopen()). All default to None, which reproduces the original
+        # "just open the index, negotiate nothing" behaviour exactly - a
+        # caller that never passes these (e.g. the default no-flag path in
+        # detect_stream.py) gets byte-for-byte the same capture as before
+        # this feature existed. When set, a request is just that - a
+        # request; delivered_width/delivered_height below record what a
+        # REAL frame actually measured, which can be smaller (see
+        # _note_delivered_resolution).
+        self._request_width = request_width
+        self._request_height = request_height
+        self._request_fourcc = request_fourcc
+        self.delivered_width = None
+        self.delivered_height = None
         # Whether resolved_name reflects a capability match confirmed THIS
         # round (vs. a stale value kept from an earlier successful
         # resolution while a later re-resolution attempt failed - see
@@ -502,7 +564,12 @@ class CameraCapture:
         self._name_confirmed_this_round = False
 
         self.index = self._resolve_index()
-        self.cap = open_capture(self.index)
+        self.cap = open_capture(
+            self.index,
+            self._request_width,
+            self._request_height,
+            self._request_fourcc,
+        )
 
         self._print_resolved_device()
 
@@ -576,6 +643,47 @@ class CameraCapture:
                 f"meant to be a specific fixed room camera, prefer --name so "
                 f"a replug can't silently swap in the wrong physical camera "
                 f"without anyone noticing."
+            )
+
+    def _note_delivered_resolution(self, frame, context: str) -> None:
+        """Measure what a REAL frame actually is and record it, warning
+        loudly if a resolution was requested (request_width/request_height)
+        but not fully honoured.
+
+        This is the "verify, don't assume" half of the resolution-request
+        feature: cap.set(CAP_PROP_FRAME_WIDTH, ...) is a negotiation, not a
+        guarantee, and cap.get() can echo back the requested value even when
+        .read() delivers something smaller (the exact lesson this module's
+        docstring and probe_index_capability() already encode for capability
+        probing - applied here to the live capture path instead). A frame
+        smaller than requested is NOT treated as fatal: a slightly-smaller
+        capture is still a usable session, so this prints a clear warning
+        and lets the caller keep streaming rather than raising.
+        """
+        if self._request_width is None and self._request_height is None:
+            return
+
+        height, width = frame.shape[:2]
+        self.delivered_width, self.delivered_height = width, height
+
+        wants_more_width = (
+            self._request_width is not None and width < self._request_width
+        )
+        wants_more_height = (
+            self._request_height is not None and height < self._request_height
+        )
+        if wants_more_width or wants_more_height:
+            print(
+                f"WARNING ({context}): requested "
+                f"{self._request_width}x{self._request_height} capture but "
+                f"a real captured frame measured {width}x{height} instead. "
+                f"This is a MEASUREMENT (frame.shape), not a report from "
+                f"cap.get() - the camera is genuinely not delivering the "
+                f"requested resolution (commonly: the requested size needs "
+                f"MJPG and didn't get it, or exceeds this device's/USB "
+                f"bandwidth's real ceiling). Continuing to stream at "
+                f"{width}x{height} rather than failing the session - do "
+                f"NOT assume the requested resolution was achieved."
             )
 
     @staticmethod
@@ -655,7 +763,12 @@ class CameraCapture:
         if verbose:
             self._print_resolved_device()
 
-        self.cap = open_capture(self.index)
+        self.cap = open_capture(
+            self.index,
+            self._request_width,
+            self._request_height,
+            self._request_fourcc,
+        )
 
         ok, frame = False, None
         if self.cap.isOpened():
@@ -663,6 +776,12 @@ class CameraCapture:
                 read_ok, read_frame = self.cap.read()
                 if read_ok and read_frame is not None:
                     ok, frame = True, read_frame
+                    # A resolution request is re-applied on every reopen
+                    # (see open_capture() call above) precisely so a
+                    # mid-session reconnect can't silently drop back to a
+                    # lower resolution unnoticed - measure it here every
+                    # time, not just at first startup.
+                    self._note_delivered_resolution(frame, context=f"reopen attempt {attempt}")
                     break
                 time.sleep(REOPEN_VERIFY_RETRY_DELAY_SECONDS)
 
@@ -703,6 +822,7 @@ class CameraCapture:
         for _ in range(attempts):
             ok, frame = self.cap.read()
             if ok and frame is not None:
+                self._note_delivered_resolution(frame, context="startup")
                 return True, frame
             time.sleep(delay)
 
