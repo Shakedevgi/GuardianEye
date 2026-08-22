@@ -1283,3 +1283,42 @@ during it.
 **Approval:** Approved by Shaked 2026-08-22; Shaked is briefing Yahli. Recorded
 here rather than treated as a fait accompli, per CLAUDE.md's rule that decisions
 may be questioned freely but not changed without asking.
+
+## 2026-08-22 — Unreviewed-approach path live-verified; frame_risk carries hazard identity
+
+**What happened:** Shaked recorded the exact follow-up test Phase 4's write-up
+asked for (`cv/captures/Screen Recording 2026-08-22 at 13.34.16.mov`): placed
+a new object, walked toward it without confirming or dismissing anything. At
+0:20 the overlay reads `RISK: RED person #1 vs object (normalized dist 0.05)`
+against a hazard map with **0 confirmed entries** — the red connector line
+points to an orange `NEW-UNREVIEWED` box. Verified by pulling frames directly
+via ffmpeg, not from a chat summary. This closes the one gap
+`docs/phase-writeups/phase-4.md` left open: the "unreviewed means dangerous"
+rule (CLAUDE.md decision 4) was previously code-correct and unit-tested but
+had never been watched fire on real pixels. See the write-up's Addendum
+section for the full account.
+
+**Two small code changes came out of reviewing that same clip:**
+
+1. **Connector-line behavior confirmed as correct, not changed.** The debug
+   overlay draws a line only to each person's nearest hazard, even when
+   several hazards are in a scored zone at once. Checked and confirmed this
+   loses no safety information: `classify_zone` is purely distance-based and
+   monotonic, so the nearest hazard is always the highest-risk one by
+   construction, and `score_frame` scores every pair regardless of what gets
+   drawn. No code change; recorded so the reasoning doesn't need re-deriving
+   later.
+2. **`score_frame`'s `frame_risk` now includes `hazard_id` and `hazard_bbox`**
+   (`cv/risk_engine.py:887`), not just `hazard_label`. Reason: `/risk_status`
+   (Phase 7) needs to name *which* hazard is driving the current risk zone so
+   a Flet client (Phase 8) can highlight it — the debug window's drawn
+   connector line is not something the UI can inherit, since decision 1 keeps
+   Flet a pure JSON/MJPEG client. No scoring-logic change; the two existing
+   `score_frame` tests were extended with the new fields rather than
+   duplicated. All 42 tests in `cv/test_risk_engine.py` pass.
+
+**Why this is a decision-log entry and not just a commit message:** it closes
+the specific open item the Phase 4 write-up named as a precondition for
+treating decision 4's table as fully proven, and it extends the API surface
+Phase 7 will build on — worth being able to find later without re-reading the
+whole write-up.

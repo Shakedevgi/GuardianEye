@@ -1,11 +1,12 @@
 # Phase 4 — the risk engine: detect, human classifies, detect new, alert
 
-**Status: CLOSED (2026-08-22). Closed as "the logic is built, tested, and
-live-verified on real hardware for the mechanisms that matter most, with one
-specific safety-critical path still code-and-test-only, and the parent-facing
-interaction explicitly deferred to Phase 8." Read that sentence before reading
-anything else — it is more precise than "Phase 4 works," and the difference
-matters.**
+**Status: CLOSED (2026-08-22, updated same day). The one gap this write-up
+originally left open — the unreviewed-hazard-approach path watched happen on
+real pixels, not just proven in code and unit tests — was closed by a targeted
+follow-up recording the same day. See "Addendum" near the end for exactly what
+that clip showed and how it was checked. Everything else on this page is the
+original write-up, left as written rather than edited after the fact, so the
+record shows how the verification actually happened in two steps.**
 
 This write-up covers the whole Phase 4 session (2026-08-12 through
 2026-08-22), reconstructed primarily from
@@ -332,6 +333,67 @@ Phase 8's real review UI) — not things quietly left out of the record. Per
 CLAUDE.md's own preamble, this is a revisable engineering call made with the
 evidence available now, not a claim that every corner of decision 4's table
 has been watched fire on a screen.
+
+## Addendum (2026-08-22, same day): the unreviewed-approach gap closed
+
+Shaked ran the exact test this write-up asked for: put something new down,
+walk at it without pressing any key. Recording:
+`cv/captures/Screen Recording 2026-08-22 at 13.34.16.mov` (30.2s).
+
+I pulled frames directly from the clip rather than trusting the summary. At
+0:20, the on-screen readout reads:
+
+```
+RISK: RED  person #1 vs object  (normalized dist 0.05)
+Hazard map: 12 entries (0 confirmed, 8 pending/first-scan, 4 pending/NEW [alerts], 0 dismissed)
+```
+
+**Zero confirmed hazards on the map, RED still fired, red connector line drawn
+to an orange `NEW-UNREVIEWED` box.** That is exactly the composition the
+original write-up said had code and a unit test but had never been watched
+happen: an arrived-after-first-scan `PENDING` entry, never tapped, producing a
+live `red` zone as a person approached it. It now has a third form of
+evidence alongside the code reading and the unit test — a real clip, checked
+frame-by-frame, not a report about a clip.
+
+This closes decision-4 audit item (c) from the verdict section above. Phase
+4's three done-when items now stand as: (a) logic-layer only, parent
+interaction deferred to Phase 8 (unchanged, correctly not claimed done), (b)
+live-verified 2026-08-22, (c) live-verified 2026-08-22 for both the confirmed-
+and unreviewed-hazard cases.
+
+**Two follow-on changes came out of watching this clip, both small and both
+already made:**
+
+1. **The connector line only draws to the nearest hazard per person, even
+   when several are in a scored zone.** Shaked asked whether this was a
+   limitation. It is a deliberate choice, not a gap: `classify_zone` derives
+   the zone purely from distance (red < 0.15 ≤ orange < 0.30 ≤ yellow < 0.50),
+   which is monotonic — the nearest hazard to a person is *always* the
+   highest-risk one, by construction, so there is no case where a further
+   object is more urgent than the one the line already points to.
+   `score_frame` measures every person×hazard pair every frame regardless
+   (confirmed by reading the code, not assumed); only the drawn line narrows
+   to the closest. Decision: leave it as-is. It costs nothing safety-wise and
+   the debug overlay is allowed to stay this way — CLAUDE.md's telemetry
+   clarification (see the decision log, 2026-08-22) explicitly excludes the
+   local `cv2.imshow` debug window from the pixels-vs-JSON split, and Phase 8
+   is not expected to draw connector lines at all.
+2. **`frame_risk` (the dict `score_frame` returns and the thing `/risk_status`
+   will be built from in Phase 7) now carries `hazard_id` and `hazard_bbox`,
+   not just `hazard_label`.** Before this change, the highest-risk-zone
+   payload could say *"red, something's close"* but not *"...and it's that
+   one, there"* — no id, no box, nothing a client could use to highlight the
+   specific hazard. Since Flet (Phase 8) will be a pure client of FastAPI's
+   JSON per decision 1, and the debug window's drawn connector line is not
+   something Phase 8 can inherit, the API payload needed to be able to name
+   the hazard on its own. Two fields added in `score_frame` at
+   `cv/risk_engine.py:887`, no change to the scoring logic itself. Both new
+   fields are covered by extending the two existing `score_frame` tests
+   (`test_score_frame_picks_nearest_hazard_per_person`,
+   `test_score_frame_no_hazards_yields_no_pairing`) rather than adding new
+   ones — same behavior, more assertions. All 42 tests in
+   `cv/test_risk_engine.py` pass after the change.
 
 ## For the write-up's teaching purpose: check your own understanding
 

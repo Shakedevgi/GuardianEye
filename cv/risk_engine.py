@@ -866,10 +866,15 @@ def score_frame(live_persons, hazard_entries, frame_diagonal: float, rolling_win
       per_person: {person_id: (HazardEntry, smoothed_distance, zone)} - each
         live person's nearest hazard by smoothed distance.
       frame_risk: the single highest-ranked zone this frame across every
-        pair, for the corner-text readout.
+        pair, for the corner-text readout and for `/risk_status` (Phase 7) -
+        carries hazard_id/hazard_bbox so a client can identify and highlight
+        the specific hazard without drawing its own connector line.
     """
     per_person: dict[int, tuple] = {}
-    frame_risk = {"zone": RISK_ZONE_NONE, "value": None, "person_id": None, "hazard_label": None}
+    frame_risk = {
+        "zone": RISK_ZONE_NONE, "value": None, "person_id": None, "hazard_label": None,
+        "hazard_id": None, "hazard_bbox": None,
+    }
 
     for person in live_persons:
         best = None
@@ -884,7 +889,10 @@ def score_frame(live_persons, hazard_entries, frame_diagonal: float, rolling_win
             if best is None or smoothed < best[1]:
                 best = (hazard, smoothed, zone)
             if zone_rank(zone) > zone_rank(frame_risk["zone"]):
-                frame_risk = {"zone": zone, "value": smoothed, "person_id": person.id, "hazard_label": hazard.label}
+                frame_risk = {
+                    "zone": zone, "value": smoothed, "person_id": person.id, "hazard_label": hazard.label,
+                    "hazard_id": hazard.id, "hazard_bbox": hazard.bbox,
+                }
 
         if best is not None:
             per_person[person.id] = best

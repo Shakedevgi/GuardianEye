@@ -522,6 +522,8 @@ def test_score_frame_picks_nearest_hazard_per_person():
     hazard_match, _smoothed, _zone = per_person[1]
     assert hazard_match.id == near_hazard.id
     assert frame_risk["hazard_label"] == "chair"
+    assert frame_risk["hazard_id"] == near_hazard.id
+    assert frame_risk["hazard_bbox"] == near_hazard.bbox
 
 
 def test_score_frame_no_hazards_yields_no_pairing():
@@ -533,6 +535,8 @@ def test_score_frame_no_hazards_yields_no_pairing():
     assert per_person == {}
     assert frame_risk["zone"] == re.RISK_ZONE_NONE
     assert frame_risk["person_id"] is None
+    assert frame_risk["hazard_id"] is None
+    assert frame_risk["hazard_bbox"] is None
 
 
 # --- --seed-hazard parsing -----------------------------------------------------
