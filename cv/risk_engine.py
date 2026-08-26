@@ -45,11 +45,16 @@ Concretely:
     - PENDING   - proposed by a detector, no human judgment yet.
     - CONFIRMED - a human pressed 'h'. This is a hazard.
     - DISMISSED - a human pressed 'n'. Not a hazard, remembered - but a
-      dismissal is re-raised (back to PENDING) if a later scan finds that
-      exact spot looking materially changed (region_change_frac, imported
-      from measure_change_detection.py), per Shaked's "better safe than
-      sorry" ruling: a real hazard placed where something harmless was
-      dismissed must not silently inherit that dismissal.
+      dismissal is re-raised (back to PENDING) if that exact spot reads as
+      materially changed (region_change_frac, imported from
+      measure_change_detection.py) for DISMISS_REAPPEAR_CONSECUTIVE_SCANS_
+      REQUIRED scans IN A ROW, per Shaked's "better safe than sorry" ruling:
+      a real hazard placed where something harmless was dismissed must not
+      silently inherit that dismissal. The consecutive-scan requirement
+      (added 2026-08-26) is a jitter guard on the re-raise trigger itself,
+      not a loosening of it - see DISMISS_REAPPEAR_CONSECUTIVE_SCANS_
+      REQUIRED's comment for why a single noisy scan was forcing a fresh
+      dismiss every scan cycle for at least one visually ambiguous object.
 
   Every HazardEntry also carries `is_first_scan`: True if it was proposed
   before the very first periodic scan finished looking at the room (i.e. it
@@ -96,6 +101,22 @@ Usage:
     python risk_engine.py --disable-socket-detect          # skip the wall-socket pass
     python risk_engine.py --disable-scan                   # skip the periodic room scan
                                                             # (named-class detection only)
+    python risk_engine.py --disable-audio                   # visual alerts + clips, no sound
+
+Phase 5 adds the alert lifecycle, rolling video buffer, saved clips, and
+voice-clip playback (CLAUDE.md decision 6; PHASE_PLAN.md Phase 5) on top of
+everything above, unchanged. See AlertManager's docstring for the full
+design (an AlertEvent replaces the old single overwritable alert-banner
+slot, with real identity, exit-hysteresis cooldown measured against a real
+recording, and per-(person,hazard) dedup); RollingBuffer/ClipRecorder for
+the JPEG-buffered, background-thread-written clip mechanism; AudioPlayer for
+the non-blocking `afplay` playback of the three pre-recorded voice clips in
+--audio-dir (default: cv/audio/hazard_detected.wav / baby_getting_close.wav
+/ immediate_danger.wav - missing files log a warning once and are skipped,
+not a hard failure). Saved clips land in --clips-dir (default:
+cv/clips/pending/) as one file per critical (red) alert event; keep/discard
+and auto-delete of undecided clips are explicitly Phase 6's job, not this
+one's.
 
 --seed-hazard is repeatable, takes pixel coordinates of the ACTUAL capture
 resolution (not display resolution), and is added directly as a CONFIRMED
@@ -118,6 +139,8 @@ Keys (window must be focused):
 import argparse
 import math
 import os
+import subprocess
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -204,17 +227,37 @@ HAZARD_MATCH_CENTER_DIST_FRAC = 0.08
 # more than two independent detections of an already-tracked entry would.
 SCAN_DUPLICATE_IOU_THRESHOLD = 0.4
 
-# A dismissed spot is re-raised to PENDING if a later scan finds it changed
+# A dismissed spot is a re-raise CANDIDATE once a later scan finds it changed
 # by more than this fraction of pixels (region_change_frac, imported from
 # measure_change_detection.py). Deliberately LOWER (more sensitive) than
 # that module's own STABILITY_MAX_CHANGE_FRAC (0.3, tuned to ask "did this
 # stay the same" when CONFIRMING persistence) - here the goal is the
 # opposite: erring toward re-asking rather than missing a hazard placed
 # where something harmless was previously dismissed (Shaked, 2026-08-13:
-# "keep it as double and even triple mark - better safe than sorry"). Not
-# measured against a live re-raise scenario yet - a deliberate first guess
-# in the direction the task calls for, flagged as such.
+# "keep it as double and even triple mark - better safe than sorry"). This
+# sensitivity is deliberately UNCHANGED as of 2026-08-26 - live testing
+# confirmed it's sensitive enough to false-trigger on scan-to-scan noise for
+# at least one visually ambiguous object (see
+# DISMISS_REAPPEAR_CONSECUTIVE_SCANS_REQUIRED below, which is the fix that
+# was applied instead of loosening this threshold), not that it's wrong.
 DISMISS_REAPPEAR_CHANGE_FRAC = 0.15
+
+# A single scan crossing DISMISS_REAPPEAR_CHANGE_FRAC is no longer enough to
+# re-raise a dismissed entry on its own - it must read as changed this many
+# CONSECUTIVE scans in a row (reset to 0 the instant a scan reads
+# unchanged). Added 2026-08-26 after a live test: one ambiguous object kept
+# tripping the single-scan check on noise alone (lighting, a shifted
+# segmentation box, JPEG artifacts - nothing about the physical spot
+# actually changed), forcing a fresh dismiss every ~5s scan cycle. This is
+# the SAME jitter-guard shape as SCAN_CONSECUTIVE_SCANS_REQUIRED below,
+# applied to the re-raise path instead of the arrival path - deliberately
+# reusing a proven mechanism rather than loosening DISMISS_REAPPEAR_
+# CHANGE_FRAC itself, which would also make a genuinely smaller real hazard
+# swap easier to miss. Cost: a REAL hazard swapped into a dismissed spot
+# now takes one extra scan cycle (~5s) to be caught, since it must persist
+# across two scans instead of one - a deliberate, named tradeoff, not an
+# oversight.
+DISMISS_REAPPEAR_CONSECUTIVE_SCANS_REQUIRED = 2
 
 # A scan-origin spot must appear in this many CONSECUTIVE scans before it's
 # added to the map as "arrived," and a known scan-origin entry must be
@@ -358,6 +401,106 @@ ZONE_COLORS = {
 # How long a "new object" banner stays on screen after arrival/re-raise.
 ALERT_BANNER_SECONDS = 4.0
 
+# --- Phase 5: alert lifecycle, rolling buffer, clips, audio -----------------
+#
+# CLAUDE.md decision 6's ~5-7s clip and decision 4's alert behaviour need a
+# real event to hang state off - the pre-Phase-5 code had none, only a single
+# overwritable alert_text/alert_until slot with no identity, no cooldown, no
+# dedup, which would re-fire continuously for a hazard sitting in RED. See
+# AlertManager below for the replacement.
+#
+# ALERT_HOLD_SECONDS is exit hysteresis, not entry debounce: a proximity
+# event stays open (no re-alert, no re-clip) until the (person, hazard) pair
+# has gone unseen in a scored zone for this long. Measured directly against
+# the 2026-08-22 unreviewed-approach recording
+# (cv/captures/Screen Recording 2026-08-22 at 13.34.16.mov): one continuous
+# walk toward one object flickered RED->ORANGE->RED twice, with dips up to
+# 0.75s, DESPITE the existing 8-frame rolling window already smoothing the
+# raw distance - more smoothing alone would not have prevented it. 2.0s
+# gives ~2.7x margin over the worst dip actually observed. A pure
+# edge-triggered design (alert only on the none->red transition) was
+# considered and rejected: it would have re-armed after each dip and fired 3
+# separate alerts/clips for what a parent would experience as one approach.
+ALERT_HOLD_SECONDS = 2.0
+
+# Global (not per-pair) pacing on actually VOICING an alert - added
+# 2026-08-26 after a live test found two things stacking into what felt
+# like six alarms at once: (1) HazardMap's dismissal re-raise (deliberately
+# sensitive per Shaked's 2026-08-13 "better safe than sorry" ruling) flipped
+# the SAME physical spot between DISMISSED and PENDING four times in a row,
+# and every single re-raise fired its own independent, unthrottled
+# new-object alert; (2) that burst landed in the same few seconds as a real
+# proximity escalation into RED. ALERT_HOLD_SECONDS above already prevents
+# ONE (person, hazard) pair from re-alerting on its own flicker; nothing
+# previously stopped DIFFERENT signals - or repeated new-object pulses for
+# a single re-raising hazard, which have no per-pair hysteresis at all -
+# from all voicing independently. See AlertArbiter: this does not change
+# WHETHER AlertManager considers something worth an alert (that logic is
+# unchanged), only whether THIS PARTICULAR MOMENT is when the parent
+# actually gets interrupted about it.
+GLOBAL_ALERT_MIN_INTERVAL_SECONDS = 2.5
+
+# CLAUDE.md decision 6: a critical (red) alert stitches the rolling buffer's
+# preceding ~5s plus ~2 more seconds of live tail into a saved clip.
+ROLLING_BUFFER_SECONDS = 5.0
+CLIP_TAIL_SECONDS = 2.0
+
+# Nominal frame rate used to size the rolling buffer (in FRAMES, not
+# seconds) and as the fixed playback fps written into a saved clip's header.
+# NOT read from the live smoothed_fps - that fluctuates frame to frame, and
+# a clip's playback rate has to be fixed once at write time. 15.0 is the
+# steady-state FPS actually measured live post-Phase-4-reset
+# (docs/decision-log.md, 2026-08-22), not a guess.
+DEFAULT_TARGET_FPS = 15.0
+
+# Global disk-safety backstop, deliberately NOT per-hazard: a parent camped
+# at the edge of RED for minutes should not fill the disk with clips no
+# matter how the per-event hysteresis above behaves. Separate from
+# ALERT_HOLD_SECONDS on purpose - hold controls when an EVENT ends, this
+# controls how often a NEW clip file can start, even across different
+# events/hazards.
+CLIP_MIN_INTERVAL_SECONDS = 30.0
+
+# JPEG quality for the rolling buffer's frames. Measured
+# (docs/decision-log.md, 2026-08-22 Phase 5 entry): q75 at the FULL capture
+# resolution (no downscaling) averages ~200KB/frame across 10 real captures
+# from cv/captures/ (111-245KB range) - a 5s/75-frame buffer is ~15MB, a 32x
+# reduction from holding raw 1080p frames (~467MB for the same 5s), at
+# ~2.7ms/frame encode cost (~4% of one 15-FPS frame's 66.7ms budget).
+# Downscaling was considered and rejected: it saves another ~10MB against an
+# already-negligible number, in exchange for a lower-resolution saved clip.
+ROLLING_BUFFER_JPEG_QUALITY = 75
+
+# H.264 in an mp4 container, falling back to mp4v if the platform's OpenCV
+# build lacks an avc1 encoder. Measured on 105 real (non-synthetic) frames
+# at 960x540: avc1 wrote a 0.75MB file in ~194ms, mp4v wrote a 2.28MB file
+# in ~130ms - avc1 is chosen for the smaller file and because Phase 7/8 will
+# want these playable in a browser, and ~200ms either way is why clip
+# writing runs on a background thread (see ClipRecorder) rather than inline
+# in the frame loop.
+CLIP_FOURCC_PRIMARY = "avc1"
+CLIP_FOURCC_FALLBACK = "mp4v"
+
+DEFAULT_CLIPS_DIR = "clips/pending"
+# Relative to CWD (this project's own convention is to run from cv/, e.g.
+# "cd cv && python risk_engine.py" - see the module docstring's Usage
+# section) - "pending" because CLAUDE.md decision 6 says a saved clip is
+# shown to the parent to keep/discard; the keep/discard mechanism itself and
+# the auto-delete-if-undecided timeout are explicitly Phase 6's job, not
+# this one.
+
+DEFAULT_AUDIO_DIR = "audio"
+# Pre-recorded voice clips, per CLAUDE.md decision 4 ("pre-recorded audio
+# clips, not live TTS"). Someone has to actually record these; AudioPlayer
+# below logs a warning once per missing file and keeps running rather than
+# blocking Phase 5 on that dependency.
+AUDIO_HAZARD_DETECTED = "hazard_detected.wav"
+AUDIO_BABY_GETTING_CLOSE = "baby_getting_close.wav"
+AUDIO_IMMEDIATE_DANGER = "immediate_danger.wav"
+
+ALERT_KIND_PROXIMITY = "proximity"
+ALERT_KIND_NEW_OBJECT = "new_object"
+
 
 # --- geometry helpers -------------------------------------------------------
 
@@ -466,30 +609,53 @@ def crop_bbox(frame, bbox):
 
 
 def fingerprint_changed(
-    fingerprint, frame, bbox, threshold: float = DISMISS_REAPPEAR_CHANGE_FRAC
+    fingerprint, frame, bbox, threshold: float = DISMISS_REAPPEAR_CHANGE_FRAC, label: str = None
 ) -> bool:
     """Step 4: has the spot behind a DISMISSED entry changed materially
     since it was dismissed? `fingerprint` is the crop captured at dismissal
     time (see HazardMap.dismiss). Reuses region_change_frac's pixel-diff
     core (measure_change_detection.py) rather than inventing a new
-    comparison - both crops are resized to match if the bbox's own size
-    changed slightly between scans (segmentation boxes are not pixel-
-    identical run to run even for a static scene).
+    comparison.
+
+    `bbox` MUST be the entry's STABLE fingerprint_bbox (the region recorded
+    at dismiss time), NOT that scan's own fresh candidate bbox - fixed
+    2026-08-26 after live testing showed one object re-raising on nearly
+    every scan. The room scan's segmentation boundary is not pixel-
+    identical run to run even for a completely static object (worse for a
+    thin/irregular shape), so comparing against each scan's own wobbling
+    box was measuring "we sampled different pixels this time" as "the scene
+    changed" - not a real signal. Cropping the SAME region every time (this
+    function still resizes if the two crops' shapes differ slightly, since
+    crop_bbox can clip differently right at a frame edge) removes that
+    noise source without touching what counts as a real change.
 
     Missing/degenerate input (no fingerprint recorded, or the current frame
     can't produce a matching crop) returns True - err toward re-asking
     rather than silently trusting a comparison that couldn't actually run,
     per Shaked's "better safe than sorry" ruling.
+
+    `label`, if given, prints the computed change fraction - a lightweight,
+    opt-in diagnostic (added 2026-08-26 alongside this fix) so a live run's
+    terminal output shows the REAL measured numbers if this still trips
+    unexpectedly, instead of guessing at DISMISS_REAPPEAR_CHANGE_FRAC blind.
+    None (the default) prints nothing; existing callers/tests are
+    unaffected.
     """
     if fingerprint is None or fingerprint.size == 0:
+        if label:
+            print(f"  [fingerprint] {label}: no fingerprint recorded - treating as changed")
         return True
     current_crop = crop_bbox(frame, bbox)
     if current_crop is None:
+        if label:
+            print(f"  [fingerprint] {label}: current crop unavailable - treating as changed")
         return True
     if current_crop.shape != fingerprint.shape:
         current_crop = cv2.resize(current_crop, (fingerprint.shape[1], fingerprint.shape[0]))
     local_bbox = (0, 0, fingerprint.shape[1], fingerprint.shape[0])
     frac = region_change_frac(fingerprint, current_crop, local_bbox)
+    if label:
+        print(f"  [fingerprint] {label}: change_frac={frac:.3f} (threshold={threshold})")
     return frac > threshold
 
 
@@ -529,6 +695,30 @@ class HazardEntry:
     # a small crop of the frame at the moment of dismissal, compared against
     # later scans via fingerprint_changed() to decide whether to re-raise.
     fingerprint: object = None
+    # The STABLE bbox `fingerprint` was cropped from - reused for cropping
+    # every later scan's comparison frame too, instead of that scan's own
+    # fresh candidate bbox. Added 2026-08-26 after live testing showed one
+    # object re-raising on nearly every single scan even with the
+    # consecutive-scan guard above: the comparison was cropping a
+    # DIFFERENT bbox each scan (the room scan's segmentation boundary isn't
+    # pixel-identical run to run even for a completely static object -
+    # especially a thin/irregular shape), so it was measuring "different
+    # pixels sampled" as "the scene changed," not real content change. This
+    # field keeps the sampled region fixed so the comparison actually
+    # answers "does this exact patch of the frame look different," matching
+    # Shaked's own framing: "if nothing came or moved in the frame, nothing
+    # should be alarted."
+    fingerprint_bbox: tuple = None
+    # Only meaningful while state == HAZARD_STATE_DISMISSED: consecutive
+    # scans in a row fingerprint_changed() has read as "different from the
+    # dismissal-time crop." Reset to 0 the moment a scan reads unchanged -
+    # this is a jitter guard, the same shape as absent_scans/
+    # SCAN_CONSECUTIVE_SCANS_REQUIRED above, added 2026-08-26 after a live
+    # test found one visually ambiguous object re-raising and requiring a
+    # fresh dismiss every scan cycle (~5s) because a single noisy pixel-diff
+    # comparison was enough to trip DISMISS_REAPPEAR_CHANGE_FRAC. See
+    # DISMISS_REAPPEAR_CONSECUTIVE_SCANS_REQUIRED.
+    changed_scans: int = 0
 
 
 @dataclass
@@ -635,7 +825,9 @@ class HazardMap:
             return None
         entry.state = HAZARD_STATE_DISMISSED
         entry.fingerprint = crop_bbox(frame, entry.bbox)
+        entry.fingerprint_bbox = entry.bbox
         entry.absent_scans = 0
+        entry.changed_scans = 0
         return entry
 
     def apply_scan_candidates(
@@ -655,8 +847,12 @@ class HazardMap:
              (any state, including DISMISSED - a dismissed spot is still a
              "known spot" for matching purposes). A match refreshes
              position and resets the absence counter; a match against a
-             DISMISSED entry additionally checks fingerprint_changed() and
-             re-raises to PENDING if the spot looks materially different.
+             DISMISSED entry additionally checks fingerprint_changed(), and
+             re-raises to PENDING once the spot has looked materially
+             different for DISMISS_REAPPEAR_CONSECUTIVE_SCANS_REQUIRED
+             scans IN A ROW - a single noisy scan bumps the counter but
+             does not itself re-raise; a scan that reads unchanged resets
+             the counter to 0.
           3. Every known SCAN-origin entry NOT matched this cycle gets its
              absence counter bumped; once that counter reaches
              SCAN_CONSECUTIVE_SCANS_REQUIRED, the entry is removed.
@@ -683,14 +879,30 @@ class HazardMap:
             match.last_seen = time.monotonic()
             match.hits += 1
             match.absent_scans = 0
-            if match.state == HAZARD_STATE_DISMISSED and fingerprint_changed(match.fingerprint, frame, candidate):
-                match.state = HAZARD_STATE_PENDING
-                # A re-raise is, by definition, not part of the room's
-                # original starting state - the parent already judged this
-                # spot once, so it alerts like any other later arrival.
-                match.is_first_scan = False
-                match.fingerprint = None
-                reraised.append(match)
+            if match.state == HAZARD_STATE_DISMISSED:
+                # Compare against the STABLE fingerprint_bbox, NOT `candidate`
+                # (this scan's own fresh, possibly-jittering segmentation
+                # box) - see fingerprint_changed's docstring for why using
+                # the wobbling candidate box was the actual root cause of
+                # near-constant false re-raises, not just occasional noise.
+                if fingerprint_changed(match.fingerprint, frame, match.fingerprint_bbox, label=f"entry #{match.id}"):
+                    match.changed_scans += 1
+                else:
+                    # Read as unchanged this scan - whatever tripped the
+                    # comparison before (noise, a lighting blip) didn't
+                    # persist, so it's not evidence of a real swap.
+                    match.changed_scans = 0
+                if match.changed_scans >= DISMISS_REAPPEAR_CONSECUTIVE_SCANS_REQUIRED:
+                    match.state = HAZARD_STATE_PENDING
+                    # A re-raise is, by definition, not part of the room's
+                    # original starting state - the parent already judged
+                    # this spot once, so it alerts like any other later
+                    # arrival.
+                    match.is_first_scan = False
+                    match.fingerprint = None
+                    match.fingerprint_bbox = None
+                    match.changed_scans = 0
+                    reraised.append(match)
 
         removed: list[HazardEntry] = []
         for entry in scan_entries:
@@ -900,6 +1112,464 @@ def score_frame(live_persons, hazard_entries, frame_diagonal: float, rolling_win
     return per_person, frame_risk
 
 
+# --- Phase 5: alert lifecycle -----------------------------------------------
+
+
+@dataclass
+class AlertEvent:
+    """One thing a parent needs to be told about, with an identity that
+    survives across frames - the replacement for the pre-Phase-5 single
+    overwritable alert_text/alert_until slot. Two kinds share this shape:
+
+      PROXIMITY  - a (person, hazard) pair sitting in a scored zone.
+        Opened the first time a pair enters yellow/orange/red, held open by
+        ALERT_HOLD_SECONDS of hysteresis (see AlertManager.update_proximity),
+        closed after that long unseen. `person_id`/`peak_zone` are
+        meaningful; `reason` is not.
+      NEW_OBJECT - a hazard-map entry that just appeared/re-raised
+        (arrival, wall-socket, dismissal re-raise - CLAUDE.md decision 4).
+        A one-shot pulse, not held open (there is no "approaching" phase to
+        hold on to). `reason` names which mechanism raised it (e.g. "room
+        scan", "spot changed since dismissal") for the banner text;
+        `person_id`/`peak_zone` are not meaningful.
+    """
+
+    id: int
+    kind: str  # ALERT_KIND_PROXIMITY / ALERT_KIND_NEW_OBJECT
+    person_id: object  # None for NEW_OBJECT
+    hazard_id: int
+    hazard_label: str
+    hazard_bbox: tuple
+    zone: str  # current zone (PROXIMITY only; RISK_ZONE_NONE for NEW_OBJECT)
+    peak_zone: str  # highest zone rank reached during this event's life
+    started_at: float
+    last_seen_at: float
+    ended_at: float = None
+    clip_triggered: bool = False
+    reason: str = ""  # only meaningful for NEW_OBJECT
+
+
+@dataclass
+class AlertSignal:
+    """One state transition an AlertEvent just made, for the caller to react
+    to (play a sound, show a banner, maybe start a clip). "opened" and
+    "escalated" both mean "tell the parent, right now"; "closed" means the
+    event's hysteresis window has elapsed with no re-sighting - it exists so
+    a caller COULD react to it (e.g. clearing a banner early) but nothing
+    currently does, since the banner already times out on its own via
+    ALERT_BANNER_SECONDS.
+    """
+
+    event: AlertEvent
+    kind: str  # "opened" / "escalated" / "closed"
+
+
+class AlertManager:
+    """Turns score_frame's per-frame per_person dict, plus one-shot
+    new-object proposals from HazardMap, into AlertEvents with real
+    identity, cooldown, and dedup - see the ALERT_HOLD_SECONDS comment above
+    for why a naive "alert every frame a pair is in a zone" or "alert only
+    on the none->red edge" design were both rejected, with the measured
+    evidence.
+
+    Pure state machine: no I/O, no camera, no audio, no file writes - the
+    caller (main()) is responsible for turning returned AlertSignals into an
+    actual sound/banner/clip. This split is what makes it testable the same
+    way HazardMap is (synthetic in-memory objects, no camera required).
+    """
+
+    def __init__(self):
+        self._proximity_events: dict[tuple, AlertEvent] = {}
+        self._next_id = 1
+        self._last_clip_time = float("-inf")
+
+    def update_proximity(self, per_person: dict, now: float) -> list[AlertSignal]:
+        """Call once per frame with score_frame's per_person dict
+        ({person_id: (HazardEntry, smoothed_distance, zone)} - already
+        narrowed to each live person's NEAREST hazard, same simplification
+        the debug connector line already relies on, per the 2026-08-22
+        decision log entry: the nearest hazard is always the highest-risk
+        one by construction, so no signal is lost by only tracking pairs
+        that appear here).
+
+        Returns every AlertSignal this frame produced, in no particular
+        order: "opened" for a pair entering a scored zone for the first
+        time, "escalated" for a pair reaching a HIGHER zone than it has
+        reached so far this event (yellow->orange, orange->red, or opening
+        straight into a high zone), "closed" for any event whose pair has
+        gone unseen in a scored zone for more than ALERT_HOLD_SECONDS.
+        De-escalation (red->orange while still within the hold window) and
+        an unchanged/lower re-sighting update the event's bookkeeping
+        (last_seen_at, current bbox/zone) silently, with no signal - this is
+        the hysteresis itself, not a missing case.
+        """
+        signals: list[AlertSignal] = []
+
+        for person_id, (hazard, _smoothed, zone) in per_person.items():
+            if zone == RISK_ZONE_NONE:
+                continue
+            key = (person_id, hazard.id)
+            event = self._proximity_events.get(key)
+            if event is None:
+                event = AlertEvent(
+                    id=self._next_id, kind=ALERT_KIND_PROXIMITY, person_id=person_id,
+                    hazard_id=hazard.id, hazard_label=hazard.label, hazard_bbox=hazard.bbox,
+                    zone=zone, peak_zone=zone, started_at=now, last_seen_at=now,
+                )
+                self._next_id += 1
+                self._proximity_events[key] = event
+                signals.append(AlertSignal(event=event, kind="opened"))
+            else:
+                event.hazard_bbox = hazard.bbox
+                event.last_seen_at = now
+                event.zone = zone
+                if zone_rank(zone) > zone_rank(event.peak_zone):
+                    event.peak_zone = zone
+                    signals.append(AlertSignal(event=event, kind="escalated"))
+
+        for key in list(self._proximity_events.keys()):
+            event = self._proximity_events[key]
+            if now - event.last_seen_at > ALERT_HOLD_SECONDS:
+                event.ended_at = now
+                del self._proximity_events[key]
+                signals.append(AlertSignal(event=event, kind="closed"))
+
+        return signals
+
+    def open_new_object(self, hazard_entry: HazardEntry, reason: str, now: float) -> AlertSignal:
+        """A hazard-map arrival/re-raise - always a fresh, one-shot event
+        (never matched against a previous one; there is nothing to
+        de-duplicate against since HazardMap itself is the source of truth
+        for "is this the same physical object").
+        """
+        event = AlertEvent(
+            id=self._next_id, kind=ALERT_KIND_NEW_OBJECT, person_id=None,
+            hazard_id=hazard_entry.id, hazard_label=hazard_entry.label, hazard_bbox=hazard_entry.bbox,
+            zone=RISK_ZONE_NONE, peak_zone=RISK_ZONE_NONE, reason=reason,
+            started_at=now, last_seen_at=now, ended_at=now,
+        )
+        self._next_id += 1
+        return AlertSignal(event=event, kind="opened")
+
+    def should_trigger_clip(self, signal: AlertSignal, now: float) -> bool:
+        """CLAUDE.md decision 6: ONLY critical (red) alerts trigger a clip
+        save, and only once per event (an event that flickers red/orange
+        within its hold window - the exact behaviour ALERT_HOLD_SECONDS was
+        measured against - must not produce a second clip). Decide-and-
+        commit, like HazardMap.confirm(): calling this marks the event as
+        having used its one clip attempt, whether or not
+        CLIP_MIN_INTERVAL_SECONDS' global cooldown actually allows the save
+        this time. A blocked attempt is deliberately not retried later in
+        the same event - the cooldown is a disk-safety backstop, not a
+        queue, and an event already sitting in RED has already been
+        clip-recorded by definition once this method has run for it.
+
+        `now` is an explicit parameter, like every other method on this
+        class and on HazardMap/PersonTracker - kept out of the wall clock so
+        the cooldown is exercisable with synthetic time in a test.
+        """
+        event = signal.event
+        if event.kind != ALERT_KIND_PROXIMITY:
+            return False
+        if signal.kind not in ("opened", "escalated"):
+            return False
+        if event.peak_zone != "red":
+            return False
+        if event.clip_triggered:
+            return False
+        event.clip_triggered = True
+        if now - self._last_clip_time < CLIP_MIN_INTERVAL_SECONDS:
+            return False
+        self._last_clip_time = now
+        return True
+
+
+# Cross-signal severity ranking used by AlertArbiter to pick the most
+# important of several signals competing inside one pacing window (Shaked,
+# 2026-08-26). Higher number = more urgent. Exactly the three tiers from
+# CLAUDE.md decision 4/6's own alert vocabulary - immediate danger, getting
+# close, a newly noticed hazard - not a made-up scale.
+ALERT_PRIORITY_RED = 3
+ALERT_PRIORITY_GETTING_CLOSE = 2
+ALERT_PRIORITY_NEW_OBJECT = 1
+
+
+def alert_priority(signal: AlertSignal) -> int:
+    event = signal.event
+    if event.kind == ALERT_KIND_PROXIMITY:
+        return ALERT_PRIORITY_RED if event.zone == "red" else ALERT_PRIORITY_GETTING_CLOSE
+    return ALERT_PRIORITY_NEW_OBJECT
+
+
+class AlertArbiter:
+    """Global pacing gate in front of the actual voice/banner output -
+    AlertManager still decides WHETHER a (person, hazard) pair's state
+    genuinely changed (opened/escalated/closed, with its own per-pair
+    hysteresis); this decides whether THIS PARTICULAR MOMENT is when the
+    parent should actually be interrupted about it. See
+    GLOBAL_ALERT_MIN_INTERVAL_SECONDS' comment for the live-test evidence
+    this was built from.
+
+    RED is exempt from the pacing entirely (Shaked, 2026-08-26: immediate
+    danger must never wait its turn, and it also always clears out anything
+    currently held - a stale "getting close" is not worth surprise-firing
+    right after a RED interrupt). Everything else is capped at one spoken
+    alert per GLOBAL_ALERT_MIN_INTERVAL_SECONDS: whichever candidate is
+    HIGHEST PRIORITY (ties broken toward the most recent) during a blocked
+    window wins once the window reopens, rather than whichever happened to
+    arrive first chronologically - lower-priority alternatives seen during
+    that window are dropped, not queued for later.
+
+    Pure state, no I/O - testable the same way AlertManager is.
+    """
+
+    def __init__(self):
+        self._last_voiced_at = float("-inf")
+        self._held: AlertSignal = None
+
+    def offer(self, signal: AlertSignal, now: float):
+        """Call for every 'opened'/'escalated' signal ('closed' signals
+        never reach here - callers already skip those before voicing
+        anything). Returns the AlertSignal to voice right now (which may be
+        THIS signal, or a higher-priority one that was already being held),
+        or None if this signal was held back to respect the pacing window -
+        in which case the caller must still call poll() every frame so a
+        held signal isn't lost forever if nothing newer arrives to trigger
+        this method again.
+        """
+        if alert_priority(signal) == ALERT_PRIORITY_RED:
+            self._held = None
+            self._last_voiced_at = now
+            return signal
+
+        if now - self._last_voiced_at >= GLOBAL_ALERT_MIN_INTERVAL_SECONDS:
+            winner = signal
+            if self._held is not None and alert_priority(self._held) > alert_priority(signal):
+                winner = self._held
+            self._held = None
+            self._last_voiced_at = now
+            return winner
+
+        if self._held is None or alert_priority(signal) >= alert_priority(self._held):
+            self._held = signal
+        return None
+
+    def poll(self, now: float):
+        """Call once per frame. Releases a held-back signal once the pacing
+        window has elapsed, if nothing has already claimed it via offer().
+        """
+        if self._held is not None and now - self._last_voiced_at >= GLOBAL_ALERT_MIN_INTERVAL_SECONDS:
+            winner = self._held
+            self._held = None
+            self._last_voiced_at = now
+            return winner
+        return None
+
+
+def audio_for_signal(signal: AlertSignal):
+    """Which pre-recorded voice clip (if any) a signal should play, per
+    CLAUDE.md decision 4's three-clip set. "closed" signals never speak -
+    hysteresis ending is bookkeeping, not something worth interrupting a
+    parent for.
+    """
+    event = signal.event
+    if signal.kind == "closed":
+        return None
+    if event.kind == ALERT_KIND_NEW_OBJECT:
+        return AUDIO_HAZARD_DETECTED
+    if event.zone == "red":
+        return AUDIO_IMMEDIATE_DANGER
+    if event.zone in ("yellow", "orange"):
+        return AUDIO_BABY_GETTING_CLOSE
+    return None
+
+
+def banner_text_for_signal(signal: AlertSignal) -> str:
+    event = signal.event
+    if event.kind == ALERT_KIND_NEW_OBJECT:
+        return f"New object detected ({event.reason}): {event.hazard_label}"
+    return f"RISK {event.zone.upper()}: {event.hazard_label} approaching (person #{event.person_id})"
+
+
+class RollingBuffer:
+    """CLAUDE.md decision 6's "last ~5 seconds always in memory," JPEG-
+    encoded rather than raw - see ROLLING_BUFFER_JPEG_QUALITY's comment for
+    the measured memory tradeoff (~15MB vs. ~467MB for 5s at full 1080p).
+    Frames are appended AFTER hazard/person boxes are drawn but BEFORE any
+    diagnostic overlay (FPS, model config, risk readout, connector line) -
+    CLAUDE.md decision 1: boxes are product, diagnostics are pixels that
+    must never reach a served frame. main() enforces the ordering; this
+    class just stores whatever numpy array it's given.
+    """
+
+    def __init__(self, fps: float, seconds: float = ROLLING_BUFFER_SECONDS, quality: int = ROLLING_BUFFER_JPEG_QUALITY):
+        maxlen = max(1, round(fps * seconds))
+        self._frames: deque[tuple[float, "np.ndarray"]] = deque(maxlen=maxlen)
+        self._quality = quality
+
+    def __len__(self) -> int:
+        return len(self._frames)
+
+    def append(self, frame, timestamp: float):
+        """Encode and store `frame`. Returns the encoded JPEG bytes (so the
+        caller can hand the same encoding straight to ClipRecorder's live
+        tail instead of re-encoding), or None if encoding failed.
+        """
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self._quality])
+        if not ok:
+            return None
+        self._frames.append((timestamp, encoded))
+        return encoded
+
+    def snapshot(self) -> list[tuple[float, "np.ndarray"]]:
+        """A plain-list copy of what's currently buffered. A copy, not a
+        live view, because ClipRecorder keeps appending its own post-trigger
+        tail onto the snapshot while this deque keeps rolling forward for
+        the NEXT possible trigger - the two must not alias.
+        """
+        return list(self._frames)
+
+
+class ClipRecorder:
+    """CLAUDE.md decision 6: on a critical alert, stitch the rolling
+    buffer's preceding ~5s plus ~2s of live tail into a saved clip file.
+
+    Encoding+writing measured at ~130-200ms for a 7s clip
+    (docs/decision-log.md, 2026-08-22 Phase 5 entry) - done inline in the
+    frame loop that is 2-3 whole frame budgets at 15 FPS, a visible hitch
+    exactly like the thing Phase 4's crisis was about. Writing therefore
+    runs on a background thread (see poll()); this class's own bookkeeping
+    (which clips are mid-tail, when their tail completes) is plain
+    synchronous state, deliberately kept separate from the threaded part so
+    it stays testable without spawning real threads.
+    """
+
+    def __init__(self, output_dir: str, fps: float, tail_seconds: float = CLIP_TAIL_SECONDS):
+        self._output_dir = output_dir
+        self._fps = fps
+        self._tail_seconds = tail_seconds
+        self._pending: list[dict] = []
+        os.makedirs(output_dir, exist_ok=True)
+
+    def trigger(self, buffer_snapshot: list, event: AlertEvent, now: float) -> None:
+        """Start a tail capture: `buffer_snapshot` is the pre-trigger ~5s
+        already pulled from RollingBuffer.snapshot(). The caller keeps
+        calling add_tail_frame() every subsequent frame until poll() reports
+        the tail window has elapsed.
+        """
+        self._pending.append({
+            "frames": list(buffer_snapshot),
+            "event": event,
+            "deadline": now + self._tail_seconds,
+        })
+
+    def add_tail_frame(self, encoded_jpeg, timestamp: float) -> None:
+        for record in self._pending:
+            if timestamp <= record["deadline"]:
+                record["frames"].append((timestamp, encoded_jpeg))
+
+    def poll(self, now: float) -> list[str]:
+        """Call once per frame. Finalizes (spawns a background write thread
+        for) any pending recording whose tail window has elapsed. Returns
+        the destination paths of clips just started this call - the path is
+        known immediately even though the file itself is written
+        asynchronously.
+        """
+        ready = [r for r in self._pending if now >= r["deadline"]]
+        self._pending = [r for r in self._pending if now < r["deadline"]]
+        paths = []
+        for record in ready:
+            paths.append(self._start_write(record))
+        return paths
+
+    def _start_write(self, record: dict) -> str:
+        event = record["event"]
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = f"{timestamp}_event{event.id}_{event.hazard_label}.mp4"
+        path = os.path.join(self._output_dir, filename)
+        jpeg_frames = [buf for _, buf in record["frames"]]
+        thread = threading.Thread(target=write_clip, args=(path, jpeg_frames, self._fps), daemon=True)
+        thread.start()
+        return path
+
+
+def write_clip(path: str, jpeg_frames: list, fps: float) -> bool:
+    """Decode a list of JPEG-encoded frames and write them out as one mp4.
+    A module-level function (not a ClipRecorder method) specifically so it
+    can be called directly and synchronously in a test - ClipRecorder always
+    calls it on a background thread, but the encode/decode/write logic
+    itself has no thread-only behaviour worth hiding from a test.
+
+    Tries CLIP_FOURCC_PRIMARY (avc1/H.264) first, falls back to
+    CLIP_FOURCC_FALLBACK (mp4v) if the platform's OpenCV build can't open an
+    avc1 writer - see CLIP_FOURCC_PRIMARY's comment for the measured
+    size/cost tradeoff. Returns True if a clip was actually written.
+    """
+    if not jpeg_frames:
+        print(f"Warning: no frames to write for {path} - skipping.")
+        return False
+    first = cv2.imdecode(jpeg_frames[0], cv2.IMREAD_COLOR)
+    if first is None:
+        print(f"Warning: could not decode first frame for {path} - skipping.")
+        return False
+    height, width = first.shape[:2]
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*CLIP_FOURCC_PRIMARY), fps, (width, height))
+    if not writer.isOpened():
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*CLIP_FOURCC_FALLBACK), fps, (width, height))
+    if not writer.isOpened():
+        print(f"Warning: VideoWriter failed to open for {path} (tried {CLIP_FOURCC_PRIMARY} and {CLIP_FOURCC_FALLBACK}).")
+        return False
+    written = 0
+    for buf in jpeg_frames:
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is not None:
+            writer.write(img)
+            written += 1
+    writer.release()
+    print(f"Clip saved: {path} ({written}/{len(jpeg_frames)} frames)")
+    return True
+
+
+class AudioPlayer:
+    """Fire-and-forget voice-clip playback via macOS's built-in `afplay`,
+    launched with subprocess.Popen (NOT subprocess.run/.call - measured,
+    docs/decision-log.md 2026-08-22 Phase 5 entry: run() blocked for ~1.9s
+    on a 1.0s clip, which at 15 FPS is ~29 dropped frames and would
+    reproduce Phase 4's FPS-collapse crisis for every single alert. Popen's
+    OWN call cost was measured at 2-5ms, ~4-7% of one frame's 66.7ms budget,
+    with zero frames over budget in a simulated loop firing sounds
+    mid-frame). AppKit's NSSound was also measured and rejected: its
+    .play() call itself cost up to 112ms, over one full frame budget on its
+    own.
+
+    This class's non-blocking property was verified by direct measurement
+    (a real, reproducible script), not by an automated regression test in
+    test_risk_engine.py - deliberately, so the test suite stays fast and
+    silent rather than launching real audio playback on every run. This
+    mirrors how ROLLING_WINDOW_SIZE/SCAN_CONSECUTIVE_SCANS_REQUIRED are
+    flagged in-code as measured-or-not-yet rather than silently assumed;
+    what IS unit-tested here is the missing-file path, which is pure logic.
+    """
+
+    def __init__(self, audio_dir: str):
+        self._audio_dir = audio_dir
+        self._warned: set[str] = set()
+
+    def play(self, filename: str) -> None:
+        path = os.path.join(self._audio_dir, filename)
+        if not os.path.isfile(path):
+            if filename not in self._warned:
+                print(f"Warning: audio clip not found, skipping playback: {path}")
+                self._warned.add(filename)
+            return
+        try:
+            subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            if filename not in self._warned:
+                print(f"Warning: could not launch afplay for {path}: {exc}")
+                self._warned.add(filename)
+
+
 # --- CLI parsing -------------------------------------------------------------
 
 
@@ -934,6 +1604,33 @@ def draw_label(image, text: str, origin: tuple[int, int], color) -> None:
         cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, thickness)
 
 
+# cv2.putText's origin is the text BASELINE, not a bounding-box corner -
+# glyphs are drawn extending UPWARD from it. A label positioned "N px above"
+# an anchor near the top of the frame (e.g. a hazard box's top edge, or a
+# person box's) therefore has an origin - and so nearly all of its own
+# pixels - off-canvas, making it invisible. Reported live, 2026-08-26 (a
+# follow-up to the same day's white-outline fix): "still can't see some of
+# the white marks... make sure it doesn't disappear above or below the
+# screen." Confirmed directly against the recording: multiple hazard boxes
+# near the top of frame had visibly missing top borders AND missing state
+# labels in the same frame.
+LABEL_TOP_CLEARANCE = 14
+
+
+def label_anchor_y(anchor_y: int, frame_height: int, above_offset: int, below_offset: int) -> int:
+    """Pick a y-coordinate for a label normally drawn `above_offset` px
+    above `anchor_y`, flipped to `below_offset` px below it instead if
+    there isn't enough room above (see LABEL_TOP_CLEARANCE) - rather than
+    clamping to y=0, which is where the invisible-label bug came from in
+    the first place. The flipped position is also clamped against the
+    frame's bottom edge, so a label is never placed off-canvas on either
+    side.
+    """
+    if anchor_y - above_offset >= LABEL_TOP_CLEARANCE:
+        return anchor_y - above_offset
+    return min(frame_height - 1, anchor_y + below_offset)
+
+
 def hazard_box_color(entry: HazardEntry):
     if entry.state == HAZARD_STATE_PENDING:
         return PENDING_FIRST_SCAN_BOX_COLOR if entry.is_first_scan else PENDING_ARRIVED_BOX_COLOR
@@ -950,19 +1647,39 @@ def hazard_state_tag(entry: HazardEntry) -> str:
 
 def draw_hazard_box(image, entry: HazardEntry, is_review_candidate: bool) -> None:
     x1, y1, x2, y2 = (int(round(v)) for v in entry.bbox)
+    frame_height, frame_width = image.shape[:2]
     color = hazard_box_color(entry)
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
     if is_review_candidate:
         # An extra white outline so "this is the one awaiting your h/n/s
         # keypress right now" is unmistakable from any other pending box.
-        cv2.rectangle(image, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), REVIEW_CANDIDATE_OUTLINE_COLOR, 1)
-    draw_label(image, f"[{hazard_state_tag(entry)}] {entry.label}", (x1, max(0, y1 - 8)), color)
+        # Drawn with a dark halo first (same two-pass technique draw_label
+        # already uses for text) - a bare 1px white line with nothing behind
+        # it disappears against a light background (the water heater, the
+        # tile floor) and against video compression, which was reported
+        # live 2026-08-22 ("couldn't see the white lines") and confirmed by
+        # reading this exact code: unlike every text label in this file,
+        # this rectangle had no halo.
+        #
+        # Coordinates are clamped to the frame's own bounds (not just
+        # offset by -2/+2) - a box near any edge would otherwise have this
+        # OUTWARD-expanding outline push part of itself off-canvas, drawing
+        # nothing for that side (reported live 2026-08-26: boxes near the
+        # top of frame had visibly missing top borders).
+        ox1, oy1 = max(0, x1 - 2), max(0, y1 - 2)
+        ox2, oy2 = min(frame_width - 1, x2 + 2), min(frame_height - 1, y2 + 2)
+        cv2.rectangle(image, (ox1, oy1), (ox2, oy2), OVERLAY_OUTLINE, 3)
+        cv2.rectangle(image, (ox1, oy1), (ox2, oy2), REVIEW_CANDIDATE_OUTLINE_COLOR, 1)
+    label_y = label_anchor_y(y1, frame_height, above_offset=8, below_offset=16)
+    draw_label(image, f"[{hazard_state_tag(entry)}] {entry.label}", (x1, label_y), color)
 
 
 def draw_person_box(image, person: PersonEntry) -> None:
     x1, y1, x2, y2 = (int(round(v)) for v in person.bbox)
+    frame_height = image.shape[0]
     cv2.rectangle(image, (x1, y1), (x2, y2), PERSON_BOX_COLOR, 2)
-    draw_label(image, f"person #{person.id}", (x1, max(0, y1 - 8)), PERSON_BOX_COLOR)
+    label_y = label_anchor_y(y1, frame_height, above_offset=8, below_offset=16)
+    draw_label(image, f"person #{person.id}", (x1, label_y), PERSON_BOX_COLOR)
 
 
 def draw_connector(image, person: PersonEntry, hazard: HazardEntry, zone: str) -> None:
@@ -1049,6 +1766,12 @@ def main() -> None:
     parser.add_argument("--scan-interval", type=float, default=DEFAULT_SCAN_INTERVAL_SECONDS, help=f"Wall-clock seconds between periodic room scans (default: {DEFAULT_SCAN_INTERVAL_SECONDS}).")
     parser.add_argument("--scan-seg-model", type=str, default=DEFAULT_SEG_MODEL, help=f"Class-agnostic segmentation weights for the room scan (default: {DEFAULT_SEG_MODEL}).")
     parser.add_argument("--scan-imgsz", type=int, default=DEFAULT_SEG_IMGSZ, help=f"Inference resolution for the room scan (default: {DEFAULT_SEG_IMGSZ}).")
+    parser.add_argument("--clips-dir", type=str, default=DEFAULT_CLIPS_DIR, help=f"Directory saved critical-alert clips are written to, relative to CWD unless absolute (default: {DEFAULT_CLIPS_DIR}).")
+    parser.add_argument("--audio-dir", type=str, default=DEFAULT_AUDIO_DIR, help=f"Directory containing the pre-recorded alert voice clips (default: {DEFAULT_AUDIO_DIR}).")
+    parser.add_argument(
+        "--disable-audio", dest="audio_enabled", action="store_false", default=True,
+        help="Turn off voice-clip playback entirely (visual alerts and clip-saving still run).",
+    )
     args = parser.parse_args()
 
     socket_prompts = [p.strip() for p in args.socket_prompts.split(",") if p.strip()]
@@ -1143,10 +1866,43 @@ def main() -> None:
         alert_text = text
         alert_until = time.monotonic() + ALERT_BANNER_SECONDS
 
+    # Phase 5: alert lifecycle, rolling buffer, clips, audio - see the
+    # AlertManager/RollingBuffer/ClipRecorder/AudioPlayer docstrings for the
+    # measured reasoning behind each. rolling_buffer/clip_recorder use
+    # DEFAULT_TARGET_FPS (a fixed, measured steady-state number), not the
+    # live smoothed_fps, for the reason given on that constant.
+    alert_manager = AlertManager()
+    alert_arbiter = AlertArbiter()
+    audio_player = AudioPlayer(args.audio_dir) if args.audio_enabled else None
+    rolling_buffer = RollingBuffer(fps=DEFAULT_TARGET_FPS)
+    clip_recorder = ClipRecorder(args.clips_dir, fps=DEFAULT_TARGET_FPS)
+
+    def speak(signal: AlertSignal) -> None:
+        audio_name = audio_for_signal(signal)
+        if audio_name is not None and audio_player is not None:
+            audio_player.play(audio_name)
+        raise_alert(banner_text_for_signal(signal))
+
+    def handle_alert_signal(signal: AlertSignal, now: float) -> None:
+        if signal.kind == "closed":
+            return
+        # Clip-saving is intentionally NOT gated by the arbiter below: a
+        # critical moment is worth recording even on a frame where we chose
+        # not to re-announce it audibly because something else just spoke
+        # (GLOBAL_ALERT_MIN_INTERVAL_SECONDS) - should_trigger_clip has its
+        # own independent once-per-event/30s-cooldown gate already.
+        if alert_manager.should_trigger_clip(signal, now):
+            clip_recorder.trigger(rolling_buffer.snapshot(), signal.event, now)
+            print(f"Critical alert - recording clip for event #{signal.event.id} ({signal.event.hazard_label}).")
+        voiced = alert_arbiter.offer(signal, now)
+        if voiced is not None:
+            speak(voiced)
+
     def enqueue_and_maybe_alert(entry: HazardEntry, alert_reason: str) -> None:
         review_queue.enqueue(entry.id)
         if not entry.is_first_scan:
-            raise_alert(f"New object detected ({alert_reason}): {entry.label}")
+            now = time.monotonic()
+            handle_alert_signal(alert_manager.open_new_object(entry, alert_reason, now), now)
 
     smoothed_fps = None
     last_frame_time = time.monotonic()
@@ -1229,6 +1985,9 @@ def main() -> None:
                 alert_eligible_hazards = [e for e in hazard_map.entries if hazard_alerts_on_approach(e)]
                 per_person, frame_risk = score_frame(live_persons, alert_eligible_hazards, frame_diagonal, rolling_windows)
 
+                for signal in alert_manager.update_proximity(per_person, now):
+                    handle_alert_signal(signal, now)
+
                 annotated = frame.copy()
 
                 review_candidate_id = review_queue.current_id()
@@ -1236,6 +1995,26 @@ def main() -> None:
                     draw_hazard_box(annotated, hazard, is_review_candidate=(hazard.id == review_candidate_id))
                 for person in live_persons:
                     draw_person_box(annotated, person)
+
+                # Phase 5 buffer/clip capture point: boxes only, no
+                # diagnostics, no connector line yet - CLAUDE.md decision 1
+                # (boxes are product, everything drawn below this point is
+                # developer-only debug overlay that must never reach a
+                # served frame). This is also exactly the "clean annotated
+                # frame" Phase 7's /video_feed is meant to be built from,
+                # one phase early, for free.
+                encoded = rolling_buffer.append(annotated, now)
+                if encoded is not None:
+                    clip_recorder.add_tail_frame(encoded, now)
+                for path in clip_recorder.poll(now):
+                    print(f"Clip write started: {path}")
+                held = alert_arbiter.poll(now)
+                if held is not None:
+                    speak(held)
+
+                # --- everything below is the LOCAL cv2.imshow debug window
+                # only (connector line + diagnostics) - exempt from decision
+                # 1's pixels-vs-JSON split; see CLAUDE.md decision 1.
                 for person in live_persons:
                     nearest = per_person.get(person.id)
                     if nearest is not None:
@@ -1258,9 +2037,14 @@ def main() -> None:
                     candidate_entry = hazard_map.get(review_candidate_id)
                     if candidate_entry is not None:
                         cx1, cy1, cx2, cy2 = (int(round(v)) for v in candidate_entry.bbox)
+                        # above_offset=24 clears the state label (drawn 8px
+                        # above the same box top); below_offset=40 keeps the
+                        # same clearance when both flip below near the top
+                        # edge, so the two labels never land on each other.
+                        review_label_y = label_anchor_y(cy1, height, above_offset=24, below_offset=40)
                         draw_label(
                             annotated, review_candidate_label(1, len(review_queue)),
-                            (cx1, max(0, cy1 - 24)), REVIEW_CANDIDATE_OUTLINE_COLOR,
+                            (cx1, review_label_y), REVIEW_CANDIDATE_OUTLINE_COLOR,
                         )
 
                 if alert_text is not None and now < alert_until:

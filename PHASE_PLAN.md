@@ -180,7 +180,47 @@ blanket pass:
 that saves 5–7s clips on critical alerts only.
 **Done when:** a simulated critical event produces a correct saved clip file
 and the right alert fires — visually and audibly.
-`[ ]`
+
+`[x]` — closed 2026-08-26 by docs-agent. Built entirely inside cv-agent's
+scope, as expected this early (no `backend/` directory exists yet; clip
+storage hookup/SQLite/auto-delete stay Phase 6's job per this file's own
+division of labor). Full reasoning in `docs/phase-writeups/phase-5.md`; read
+"done when" here precisely, not as a blanket pass:
+- **Visual alerts and saved clips** are both backed by real evidence: two
+  live-camera recordings confirmed to exist on disk, a real saved clip file
+  at the agreed `cv/clips/pending/<timestamp>_event<id>_<label>.mp4` path,
+  and terminal-log text quoted in `docs/decision-log.md` that docs-agent
+  cross-checked character-for-character against the actual banner-text
+  format strings in `cv/risk_engine.py` — strong evidence the logged
+  sessions are genuine runs of this code, not a paraphrase.
+- **Audibility — the other half of this phase's own "visually and audibly"
+  bar — is NOT confirmed on the record.** `AudioPlayer` is verified, by
+  code reading, to launch `afplay` non-blockingly and to fail closed on a
+  missing file; nobody has yet confirmed a parent can actually hear the
+  result. Flagged as the first thing to check next, the same way Phase 4
+  closed with its own one named, safety-relevant gap rather than hiding it.
+- **Two fix-then-fail-then-fix-again cycles this session** (the alert
+  cooldown, and especially the dismissal-re-raise fix, which failed once
+  before the real root cause — comparing against a scan's own jittering
+  bbox instead of a stable fingerprint bbox — was found) are read by
+  docs-agent as the project's established "measure, don't assume"
+  discipline working correctly across iterations, not a process failure —
+  see the write-up for the reasoning.
+- **A documentation gap, not an engineering one:** `docs/decision-log.md`'s
+  own most recent Phase 5 entry ends with the dismissal-re-raise fix "not
+  yet live-verified" against the object that had been failing — but no
+  sixth decision-log entry exists recording that re-test happening. A
+  clip file matching a successful outcome exists on disk, but docs-agent
+  had no shell access this session to independently confirm the specific
+  frame-count/duration/codec claims made about it. Recorded as an open
+  item, not smoothed into "verified."
+- **Two smaller forward pointers, not blockers:** `PersonTracker` ID churn
+  observed in one live-test log (`PERSON_STALE_SECONDS = 1.0` is a
+  candidate but unconfirmed explanation), and the 89-test suite was
+  verified by direct code/test reading rather than actually executed this
+  session (no Bash tool available) — someone should run
+  `cd cv && python test_risk_engine.py` and confirm the pass count before
+  fully trusting it.
 
 ### Phase 6 — Persistence
 **Owner:** backend-agent

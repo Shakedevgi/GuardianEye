@@ -1322,3 +1322,447 @@ the specific open item the Phase 4 write-up named as a precondition for
 treating decision 4's table as fully proven, and it extends the API surface
 Phase 7 will build on — worth being able to find later without re-reading the
 whole write-up.
+
+## 2026-08-22 — Phase 5 kickoff: three measurements, then the alert lifecycle built on top
+
+**Per CLAUDE.md's measure-before-build culture, three things were measured
+before any code was written, all with real data (real captures from
+cv/captures/, the real 2026-08-22 recordings, real subprocess/afplay calls),
+not synthetic estimates:**
+
+1. **Rolling buffer memory.** Raw 1920x1080 frames would cost ~467MB for a
+   5s/75-frame buffer (6.22MB/frame). JPEG-encoding into the deque at q75,
+   at FULL capture resolution (no downscaling), measured across 10 real
+   captures from cv/captures/, averages ~200KB/frame (111-245KB range) - a
+   5s buffer is ~15MB, a 32x reduction with no resolution loss, at ~2.7ms
+   encode cost/frame (~4% of one 15-FPS frame's 66.7ms budget). Downscaling
+   to 960x540 was considered and rejected: it saves another ~10MB against an
+   already-negligible number, in exchange for a visibly lower-resolution
+   saved clip - a bad trade. **Decision (Shaked, 2026-08-22): JPEG q75, full
+   capture resolution, no downscaling.**
+
+2. **Audio playback must not block the frame loop - verified, not assumed.**
+   `subprocess.run(["afplay", ...])` (blocking) measured at ~1.9s wall time
+   for a 1.0s clip - at 15 FPS that's ~29 dropped frames, and would have
+   reproduced Phase 4's FPS-collapse crisis for every single alert.
+   `subprocess.Popen(["afplay", ...])` (fire-and-forget) measured at 2-5ms
+   call cost (~4-7% of one frame budget), with zero frames over budget in a
+   90-frame simulated loop that fired sounds mid-loop three times.
+   `AppKit.NSSound.play()` was also measured and rejected: its own `.play()`
+   call cost up to 112ms, over one full frame budget by itself.
+   **Decision: `subprocess.Popen(["afplay", path])`, no new dependency.**
+   Caveat logged rather than hidden: afplay carries ~0.4-0.9s of fixed
+   process/CoreAudio startup latency before sound is actually audible (a
+   0.05s clip still took 0.72s wall via a blocking call) - this cost is paid
+   by the OS process, not the Python caller, so it does NOT block the frame
+   loop, but a parent may perceive a brief lag between the visual alert and
+   the voice. Not yet judged against real perception on hardware.
+
+3. **Alert cooldown/debounce policy - measured against a real recording, not
+   guessed.** Pulled the risk-zone readout at 4Hz from the actual
+   2026-08-22 unreviewed-approach clip (cv/captures/Screen Recording
+   2026-08-22 at 13.34.16.mov) and found one continuous walk toward one
+   object produced ~8.5s of RED that flickered RED->ORANGE->RED twice, with
+   dips up to 0.75s - DESPITE the existing 8-frame rolling window already
+   smoothing the raw distance. A pure edge-triggered design (alert only on
+   the none->red transition) was considered and rejected on this same
+   evidence: it would have re-armed after each dip and produced 3 separate
+   alerts/clips for what a parent would experience as one approach.
+   **Decision: exit hysteresis, not entry debounce - `ALERT_HOLD_SECONDS =
+   2.0` (~2.7x margin over the worst dip observed), keyed per
+   (person_id, hazard_id) so a second, different hazard is never silenced by
+   the first's cooldown, with escalation (yellow->orange->red) re-signaling
+   but de-escalation staying silent within the hold window.** A separate,
+   global `CLIP_MIN_INTERVAL_SECONDS = 30.0` backstop caps how often a NEW
+   clip file can start across different events, independent of the per-event
+   hold logic - a disk-safety floor, not a replacement for it.
+
+**What got built on top of these three decisions** (`cv/risk_engine.py`,
+`cv/test_risk_engine.py`, both cv-agent-owned per PHASE_PLAN.md):
+
+- **`AlertEvent`/`AlertSignal`/`AlertManager`** replace the pre-Phase-5
+  single overwritable `alert_text`/`alert_until` slot with real event
+  identity, the hysteresis state machine above, and a decide-and-commit
+  `should_trigger_clip()` gate (CLAUDE.md decision 6: red-only, once per
+  event). Pure state machine, no I/O - unit-tested the same way HazardMap
+  is, with a direct regression test modeling the measured 0.75s dip.
+- **`RollingBuffer`/`ClipRecorder`/`write_clip()`** implement decision 6's
+  ~5s-buffer + ~2s-tail clip, JPEG-buffered per measurement 1, written on a
+  background thread because encode+write of a 7s clip measured at
+  ~130-200ms (2-3 frame budgets) - a real hitch if done inline, the same
+  class of problem Phase 4's crisis was about. H.264 (`avc1`, falling back
+  to `mp4v`) chosen for file size (~0.75MB vs ~2.28MB for a 7s clip,
+  measured on real footage) and because Phase 7/8 will want these playable
+  in a browser.
+- **`AudioPlayer`** wraps the non-blocking Popen call from measurement 2;
+  missing audio files log a warning once and are skipped rather than
+  crashing, since recording them was a parallel human dependency.
+- **A drawing-order change, not a new mechanism**: buffer/clip frames are
+  captured immediately after hazard/person boxes are drawn but BEFORE the
+  connector line and any diagnostic overlay (FPS, model config, risk
+  readout) - the same "boxes are product, diagnostics are pixels" split
+  from the 2026-08-22 decision-1 clarification, now enforced by construction
+  rather than left as a Phase 7 TODO. This also means the buffered frame is
+  already the "clean annotated frame" Phase 7's `/video_feed` needs to be
+  built from, one phase early, at zero extra cost. **Decision (Shaked,
+  2026-08-22): the connector line is excluded from saved clips** - Phase 8
+  is not expected to draw one, so a clip should look like what the product
+  actually shows; boxes stay in.
+- **Clip path convention (Shaked, 2026-08-22): `cv/clips/pending/
+  <timestamp>_event<id>_<hazard_label>.mp4`**, agreed now so Phase 6
+  (backend-agent, SQLite + clip lifecycle) inherits the convention rather
+  than renaming it later.
+- **Voice clips**: `cv/audio/hazard_detected.wav` / `baby_getting_close.wav`
+  / `immediate_danger.wav`, per CLAUDE.md decision 4's three-clip set.
+  Recorded by Shaked same-day; delivered as mono PCM16 at 24kHz (not the
+  44.1kHz originally suggested - afplay handles this format transparently,
+  confirmed by direct playback through the real `AudioPlayer` class) and
+  1.39-2.34s each (two slightly over the 2.0s target flagged when the spec
+  was written - not re-litigated, since the target was a latency judgment
+  call, not a hard requirement, and no live evidence yet says 2.3s is too
+  long in practice).
+
+**Not yet live-verified on camera**: the buffer/clip/alert pipeline has been
+exercised by the unit suite (72 tests, all pass - 30 new for Phase 5) and by
+a standalone synthetic wiring smoke test (no camera - simulated per_person
+dicts driving the exact call sequence main() makes), but not yet by an actual live
+`risk_engine.py --name Arducam` run with a real critical event. That is the
+next step before Phase 5 can be marked closed, per PHASE_PLAN.md's own
+done-when bar ("a simulated critical event produces a correct saved clip
+file and the right alert fires - visually and audibly").
+
+## 2026-08-26 — Phase 5 live test found a real alert-storm + a visibility bug; both fixed
+
+Shaked ran `risk_engine.py --name Arducam` live (recording:
+`cv/captures/Screen Recording 2026-08-26 at 19.26.36.mov`, 130s). Watched
+the clip directly rather than taking the report on faith - pulled the
+terminal log visible in the last ~10s of the recording and read the overlay
+drawing code against it. Two real, code-confirmed problems, one visual
+fix, both closed same day:
+
+**1. Alert storm - one physical spot re-alerted repeatedly, landing on top
+of a real proximity escalation.** The terminal log showed hazard entry
+**#15 dismissed and re-raised four times in a row** in a few seconds:
+
+```
+ALERT: New object detected (spot changed since dismissal): object
+Dismissed entry #15 (not a hazard).
+ALERT: New object detected (spot changed since dismissal): object
+Dismissed entry #15 (not a hazard).
+[...] x4, then:
+ALERT: RISK ORANGE: object approaching (person #1)
+ALERT: RISK RED: object approaching (person #1)
+```
+
+Root cause, confirmed by reading `HazardMap.apply_scan_candidates`: the SAME
+`HazardEntry` (same id) flips DISMISSED->PENDING every time
+`fingerprint_changed` trips against `DISMISS_REAPPEAR_CHANGE_FRAC = 0.15` -
+deliberately sensitive per Shaked's 2026-08-13 "better safe than sorry"
+ruling, so one ambiguous/hard-to-segment object can cycle repeatedly. **That
+sensitivity was NOT changed** - the actual bug was one layer up:
+`AlertManager.open_new_object()` had zero memory across re-raises, so every
+single one fired its own independent, unthrottled alert. This burst then
+coincided with a real ORANGE->RED escalation, and felt like six alarms at
+once.
+
+**Decision (Shaked, 2026-08-26): a global alert-pacing arbiter, separate
+from AlertManager's per-pair hysteresis.**
+- `GLOBAL_ALERT_MIN_INTERVAL_SECONDS = 2.5` - at most one alert is actually
+  voiced/bannered per this many seconds, GLOBALLY (not per-hazard,
+  not per-pair).
+- Priority order when several signals compete inside one window: **RED
+  (immediate danger) > yellow/orange (getting close) > new object** -
+  exactly Shaked's stated order. The highest-priority candidate seen during
+  a blocked window wins once it reopens; lower-priority alternatives are
+  dropped, not queued for later.
+- **RED always bypasses the pacing entirely** (Shaked, explicit call,
+  recommended by docs/cv-agent and confirmed rather than assumed):
+  immediate-danger alerts must never wait their turn. A RED interrupt also
+  clears anything currently held, on the reasoning that a stale
+  lower-priority alert isn't worth surprise-firing right after a RED.
+
+Implemented as a new `AlertArbiter` class (`cv/risk_engine.py`), sitting
+between `AlertManager` (unchanged - still decides WHETHER a pair's state
+genuinely changed) and the actual `speak()` call. Clip-saving was
+deliberately left OUT of the arbiter - `should_trigger_clip`'s own
+once-per-event/30s-cooldown gate is independent, since a critical moment is
+worth recording even on a frame where the audio/banner was suppressed
+because something else just spoke. 9 new tests, including a direct
+regression test reproducing the four-re-raise-plus-RED scenario end to end
+and asserting it collapses to the correct 2 spoken alerts (not 6-7).
+81/81 tests pass total.
+
+**2. Review-candidate white outline was genuinely invisible against light
+backgrounds.** Shaked reported "couldn't see some of the white lines of the
+hazard number and marking." Confirmed directly in `draw_hazard_box`: the
+white outline marking which hazard is currently awaiting an h/n/s decision
+was a bare 1px `cv2.rectangle` call with no dark halo behind it - unlike
+every text label in this file (`draw_label`), which already draws a black
+outline pass first specifically for this reason. Against the water heater,
+the light tile floor, or ordinary video compression, a 1px pure-white line
+with nothing behind it disappears. **Fix: the same two-pass halo technique
+`draw_label` already uses** - a thicker `OVERLAY_OUTLINE` (black) rectangle
+drawn first, the white rectangle on top. No behavior change, no new
+constant, verified by rendering the fixed box against a synthetic light
+background before/after.
+
+**Not changed, flagged rather than silently left alone:**
+`DISMISS_REAPPEAR_CHANGE_FRAC` (the actual reason hazard #15 kept
+flip-flopping) - the arbiter fix solves Shaked's stated complaint (the
+alerting behavior) without touching Layer A's detection sensitivity, which
+was a deliberate safety-first call. Worth a dedicated measurement later if
+this keeps happening on other ambiguous objects, but out of scope for this
+fix.
+
+## 2026-08-26 — Follow-up: the white marking still disappeared - edge clipping, not just missing contrast
+
+Same-day follow-up. Shaked confirmed the alert-storm and contrast fixes
+above worked, but reported one thing left: "still can't see some of the
+white marks of hazard number and which one i need to confirm and deny...
+make sure it doesn't disappear above or below the screen." Watched the new
+recording (`cv/captures/Screen Recording 2026-08-26 at 19.58.26.mov`)
+before touching anything - a single frame at t=8s showed **multiple hazard
+boxes near the top of frame with visibly missing top borders**, confirmed
+directly against `draw_hazard_box`'s code rather than guessed at.
+
+**Two distinct, compounding bugs, both purely geometric (no scoring/logic
+change):**
+
+1. **The review-outline rectangle expands OUTWARD by 2px** (`x1-2, y1-2` to
+   `x2+2, y2+2`) before the previous fix's halo is drawn. For a box near any
+   frame edge, that outward offset pushes part of the rectangle off-canvas -
+   the affected side (e.g. the top border, for a box near y=0) simply isn't
+   drawn at all, since it has no on-canvas pixels to render. **Fix**: clamp
+   all four outline coordinates to `[0, frame_width-1] x [0, frame_height-1]`
+   before drawing, instead of using the raw ±2 offsets directly.
+2. **`cv2.putText`'s origin is the text BASELINE, not a bounding-box
+   corner** - glyphs are drawn extending UPWARD from it. Every label in this
+   file that sits "above" a box (`max(0, y1 - 8)` for the state tag,
+   `max(0, cy1 - 24)` for the REVIEW candidate text) was clamping to y=0 when
+   the box was near the top - but y=0 is not a valid position for text meant
+   to appear ABOVE that point; nearly the entire glyph ends up off-canvas
+   regardless of the clamp. This is why labels "disappeared," not a contrast
+   problem this time. **Fix**: `label_anchor_y()` - a shared helper that
+   flips the label to sit BELOW its anchor point instead of clamping to an
+   invalid position, when there isn't enough clearance above
+   (`LABEL_TOP_CLEARANCE = 14`). Applied to `draw_hazard_box`'s state label,
+   `draw_person_box`'s "person #N" label (same bug, same fix, not
+   separately reported but confirmed identical by reading the code), and
+   the REVIEW-candidate label in `main()`. The two labels use different
+   above/below offsets (8/16 for the state tag, 24/40 for REVIEW) so they
+   don't land on top of each other when both flip below near the top edge.
+
+Verified by rendering synthetic boxes at the exact edge position seen in
+the recording, before/after, and by re-deriving the actual glyph height via
+`cv2.getTextSize` rather than guessing the offset constants. 4 new tests
+(`test_label_anchor_y_*`, `test_draw_hazard_box_review_outline_does_not_
+crash_near_frame_edges`), all pass; 85/85 total. Left/right-edge label
+clipping (same origin-is-left-edge mechanism, just horizontal) was noticed
+while reading this code but not reported live and not fixed here - flagged
+for later if it turns out to matter in practice.
+
+## 2026-08-26 — Follow-up #2: dismissed spots re-raising repeatedly on single-scan noise
+
+Shaked, after confirming the arbiter and visibility fixes worked: "we still
+have like the same thing i've marked as hazard or no hazard showing up as a
+hazard detected 5 times every few seconds and each time i say no... what CAN
+we do to avoid quadruple detection to the same thing." This is the same
+underlying cause named (but deliberately not touched) in the first
+2026-08-26 entry: `HazardMap.apply_scan_candidates`'s dismissal re-raise
+runs `fingerprint_changed()` fresh on every scan and re-raises on a SINGLE
+positive - for one visually ambiguous object, scan-to-scan noise (lighting,
+a shifted segmentation box, compression) was enough to trip
+`DISMISS_REAPPEAR_CHANGE_FRAC = 0.15` repeatedly, forcing a fresh 'n' every
+~5s scan cycle. The alert-arbiter fix quieted the VOICED alert but did
+nothing to the underlying re-raise/re-enqueue rate, which is the actual
+review burden Shaked is describing here.
+
+**Three options presented, with tradeoffs, before writing any code:**
+- **A - require 2 consecutive scans of "changed" before re-raising**,
+  reusing the exact jitter-guard shape already proven for brand-new
+  arrivals (`SCAN_CONSECUTIVE_SCANS_REQUIRED`). Doesn't change what counts
+  as "changed" at all - only requires it to persist. Cost: a REAL hazard
+  swap now takes one extra scan cycle (~5s) to be caught.
+- **B - grace period right after a dismissal** (skip the check entirely for
+  a short window post-dismiss).
+- **C - raise `DISMISS_REAPPEAR_CHANGE_FRAC` itself** (0.15 -> ~0.25) - most
+  direct, but also makes a smaller real hazard swap easier to miss
+  entirely, not just slower to catch.
+
+**Decision (Shaked, 2026-08-26): Option A.**
+
+**Implemented**: `HazardEntry` gained `changed_scans: int = 0` (meaningful
+only while `state == DISMISSED`, same shape as `absent_scans`), and a new
+constant `DISMISS_REAPPEAR_CONSECUTIVE_SCANS_REQUIRED = 2`.
+`apply_scan_candidates`'s dismissed-match branch now increments
+`changed_scans` on a positive `fingerprint_changed()` read, resets it to 0
+on a negative read (the change didn't persist - not evidence of a real
+swap), and only re-raises once the counter reaches the threshold, clearing
+it back to 0 on re-raise. `HazardMap.dismiss()` resets the counter on every
+fresh dismissal so a stale count can never carry over. `DISMISS_REAPPEAR_
+CHANGE_FRAC` itself (the sensitivity of what counts as "changed") was left
+exactly as it was - the fix targets how easily one noisy scan can act
+alone, not what counts as evidence.
+
+6 new/updated tests, including one modeling the exact live failure mode
+(changed/unchanged/changed/unchanged - never two in a row - must never
+re-raise regardless of the total count) and one confirming a fresh dismiss
+resets any leftover counter. 87/87 tests pass total. Not yet live-verified
+against the specific object that was flagging repeatedly - next live test
+should specifically watch that spot rather than only trusting the unit
+suite.
+
+## 2026-08-26 — Follow-up #3: the 2-consecutive-scan fix didn't work; found and fixed the real cause
+
+Shaked ran a fresh live test (no recording - the exact terminal output was
+pasted directly) and hazard entry #13 was dismissed **5 times** in a short
+span, with "ALERT: New object detected (spot changed since dismissal)"
+firing on almost every scan in between. This is the exact object from the
+first 2026-08-26 entry, now tested again WITH that entry's fix
+(`DISMISS_REAPPEAR_CONSECUTIVE_SCANS_REQUIRED = 2`) already in place - and
+it still happened.
+
+**Honest diagnosis: the previous fix targeted the wrong failure mode.**
+Requiring "2 consecutive scans of changed" only helps if the noise is
+occasional. This log shows it firing on very close to *every* scan - which
+means the underlying `fingerprint_changed()` comparison itself was
+unreliable, not just noisy, and "2 in a row" is trivially satisfied every
+time by a comparison that is failing consistently.
+
+**Root cause, found by re-reading the code with Shaked's own framing in
+mind ("if nothing came or moved in the frame, nothing should be alarted -
+it should be as simple as that"):** `fingerprint_changed(match.fingerprint,
+frame, candidate)` was cropping the comparison region using `candidate` -
+**that scan's own fresh segmentation box**, not a fixed reference. FastSAM's
+segmentation boundary is not pixel-identical run to run even for a
+completely static scene, especially for a visually irregular/thin shape (a
+cable, a ribbed surface). So the check was comparing *different pixels*
+scan to scan - measuring "we sampled a slightly different patch of the
+image this time" as "the scene changed," which is not a real signal at all.
+
+**Reproduced and verified directly, not assumed:** built a synthetic
+fine-striped test frame (a flat color and a smooth gradient both turned out
+too shift-tolerant, after `region_change_frac`'s Gaussian blur, to
+reproduce this - a striped/textured pattern was needed to match a real
+ribbed/textured object). Confirmed the OLD candidate-bbox comparison flags
+"changed" on every single 2-4px horizontal shift tried; confirmed the fix
+below reads "unchanged" on every one of the same shifts.
+
+**Fix:** `HazardEntry` gained `fingerprint_bbox` - the STABLE bbox recorded
+at dismiss time, reused for cropping every later scan's comparison frame
+too, instead of that scan's own wobbling candidate bbox. `fingerprint_changed()`
+now always compares the SAME patch of the frame across scans; what counts
+as "changed" (`DISMISS_REAPPEAR_CHANGE_FRAC`) and the 2-consecutive-scan
+requirement from the previous entry are both unchanged and now layered on
+top of a comparison that's actually measuring the right thing. Also added
+an opt-in diagnostic (`fingerprint_changed(..., label=...)`) that prints
+the real computed change fraction during a live run, so if this still
+misfires the next debugging pass has real numbers instead of another guess.
+
+2 new regression tests (one confirming box jitter alone never re-raises
+across 6 different shift amounts on a real adversarial pattern, one
+confirming a genuine change still re-raises correctly even with jittering
+boxes) plus updated `fingerprint_bbox` assertions on the existing tests.
+89/89 tests pass total. Not yet live-verified against entry #13's actual
+object - that object is the next thing to specifically re-test.
+
+### 2026-08-26 — Phase 5 reviewed and closed (docs-agent audit)
+
+- **`PHASE_PLAN.md`'s Phase 5 status set to `[x]`.** Full reasoning in
+  `docs/phase-writeups/phase-5.md`. Short version: the code in
+  `cv/risk_engine.py` (`AlertEvent`/`AlertManager`/`AlertArbiter`,
+  `RollingBuffer`/`ClipRecorder`/`write_clip`, `AudioPlayer`,
+  `label_anchor_y`, `HazardEntry.fingerprint_bbox`) matches every claim in
+  this session's five decision-log entries above, checked directly against
+  the file rather than the entries alone - including a character-for-
+  character cross-check of `banner_text_for_signal`'s output against the
+  exact terminal-log text quoted in the 2026-08-26 entries, which confirms
+  those logs are genuine output from this code, not paraphrase. Real
+  artifacts on disk were confirmed to exist (both 2026-08-26 recordings,
+  the three audio files, the saved clip at
+  `cv/clips/pending/20260826-204245_event8_object.mp4`) via the `Read`
+  tool's binary-file existence check.
+- **Two things this audit could NOT do, stated plainly rather than
+  papered over:** no shell/Bash access was available this session (`Grep`/
+  `Glob` both failed with `rg not found` on every call), so docs-agent
+  could not execute `cv/test_risk_engine.py` (89 tests counted directly by
+  reading the file, matching this session's own final count, with several
+  of the newest tests - `label_anchor_y`, the `AlertArbiter` priority
+  logic - hand-traced against the real function arithmetic rather than
+  just read) or re-run `ffprobe`/frame-extraction against the saved clip
+  the way Phase 4's audit did. This is a materially weaker form of
+  verification than Phase 4 got for the equivalent claims, named
+  explicitly in the write-up rather than presented as equal rigor.
+- **Audibility is the one piece of this phase's own done-when bar
+  ("visually and audibly") that is not confirmed on the record anywhere.**
+  `AudioPlayer` is code-verified to launch `afplay` non-blockingly and to
+  fail closed on a missing file; nobody has logged actually hearing a
+  voice clip play. Named as the first thing to check next, the same
+  pattern Phase 4 closed under with its own one named safety-relevant gap.
+- **A documentation-discipline gap, distinct from the engineering:** the
+  most recent of this session's five entries (Follow-up #3, the
+  `fingerprint_bbox` fix) ends "not yet live-verified against entry #13's
+  actual object" - but no sixth entry exists recording that re-test
+  happening, even though the task briefing that produced this write-up
+  describes a "Live test 5" with a successful outcome and an independently
+  ffprobe'd clip. Docs-agent confirmed the referenced clip file exists but,
+  per the tooling gap above, could not independently confirm its claimed
+  frame-count/duration/codec details this session, and could not confirm
+  from the repo alone whether the missing entry is an oversight or
+  evidence the retest hasn't actually been logged yet. Recommend closing
+  this specific gap in the same turn this write-up is reviewed, per
+  CLAUDE.md's own "log a decision in the same turn it's made" rule.
+- **Read as a genuine instance of this project's "measure, don't assume"
+  culture, not a process failure:** the dismissal-re-raise bug was fixed
+  twice in this session, and the first fix's failure is logged plainly
+  (Follow-up #2 vs. Follow-up #3) rather than folded into a single clean
+  narrative. The second fix's diagnosis came from re-reading the code
+  against the literal live symptom rather than guessing at a second
+  plausible cause, and was reproduced with a purpose-built synthetic test
+  pattern after two simpler patterns failed to trigger the bug at all -
+  the same disciplined-debugging shape as Phase 3's fine-tuning rounds and
+  Phase 4's five-models reset, applied one layer down (one function's
+  implicit assumption, not a whole subsystem).
+
+## 2026-08-26 — Missing entry, added late: the fingerprint_bbox fix re-tested live and confirmed
+
+Filling the exact gap docs-agent flagged in its Phase 5 close-out audit
+(see the entry immediately above and `docs/phase-writeups/phase-5.md`):
+Follow-up #3 shipped the `fingerprint_bbox` fix and ended "not yet live-
+verified against entry #13's actual object." That re-test happened the
+same day, in the same working session, but the confirming entry was never
+written at the time - a real process miss, not a fabricated result. Adding
+it now, later than CLAUDE.md's own "log it the same turn" rule asks for,
+rather than leaving the record inconsistent with what actually happened.
+
+**What was checked, by whom:** Shaked ran `python risk_engine.py --name
+Arducam` live and pasted the full terminal output directly into the
+session (not a recording - no video artifact exists for this specific run).
+That output showed hazard entries #4, #6, #9, #10, #11, and #13 - #13 being
+the entry that had re-raised repeatedly in both prior failed-fix rounds -
+with `fingerprint_changed`'s new opt-in diagnostic printing real
+`change_frac` values throughout: entry #13 ranged 0.000-0.049 across many
+scans, entry #10 similarly low, every other dismissed entry read 0.000
+almost the whole session. **Zero** "ALERT: New object detected (spot
+changed since dismissal)" lines appear anywhere in the pasted log - the
+fix held for the full session, not just briefly. The same log also shows a
+real RISK ORANGE -> RISK RED escalation firing correctly and triggering a
+saved clip.
+
+**Independently checked in the orchestrator session, not taken on the
+log's word alone:** the referenced clip file,
+`cv/clips/pending/20260826-204245_event8_object.mp4`, was inspected
+directly with `ffprobe` (codec h264, 1920x1080, exactly 105 frames,
+duration 7.000000s - matching decision 6's 5s-buffer + 2s-tail spec
+exactly) and by extracting frames from it with `ffmpeg` (showed real,
+clean hazard boxes on the floor with no diagnostic overlay or connector
+line baked in - confirming the decision-1 drawing-order claim against the
+actual saved artifact, not just the source code).
+
+**This closes the specific gap docs-agent's audit correctly identified as
+unconfirmed** - the clip and the change_frac numbers were real and already
+checked before this session's docs-agent review ran, but never logged
+here, which is exactly the discrepancy the audit flagged rather than
+guessed at. Recorded now for the same reason the rest of this log exists:
+so the next person doesn't have to take an orchestrator's chat summary on
+faith.

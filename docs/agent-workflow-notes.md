@@ -862,3 +862,139 @@ needed.
   independently of any one session, but *why*, in the team's own words, at
   the moment it was decided, lives in the transcript and nowhere else once
   the session itself is gone.
+
+---
+
+## Entry 8 — Phase 5 (2026-08-22 to 2026-08-26): the decision log carried the
+whole record this time, a live-test cycle caught its own failed fix, and
+docs-agent's own tooling broke mid-audit
+
+Phase 5 is the first phase with **no session transcript at all** — not lost,
+never produced. The only primary source is the five dated decision-log
+entries the build session wrote as it went, plus the code itself. That's a
+different evidentiary situation from every previous phase, and worth
+opening with, because it changes what "verified" can mean for this entry
+specifically.
+
+### The decision log, used as the actual working record rather than a
+summary written after the fact
+
+Entry 7 flagged a real risk: a long session's *why* lives in the transcript
+and nowhere else once the session is gone. Phase 5 is a natural experiment
+in the opposite discipline — if there's no transcript by design, does the
+decision log alone carry enough to reconstruct and audit the phase? The
+answer this time is mostly yes, and it's checkable, not just asserted: the
+banner text quoted verbatim in the 2026-08-26 entries
+("ALERT: New object detected (spot changed since dismissal): object")
+reproduces character-for-character from `banner_text_for_signal`'s actual
+format string plus the literal reason string `main()` passes for a
+re-raise. That match is strong evidence the entries were written by someone
+actually looking at real terminal output while writing them, not
+reconstructing plausible-sounding text afterward — a concrete, cheap way
+future audits of this project can distinguish a decision log that's a real
+contemporaneous record from one that's been smoothed into a narrative after
+the fact. Worth recommending to another team: if your process log quotes
+program output, make sure it's *exact* output, not a paraphrase — it
+becomes a free correctness check on the log itself, months later, for
+anyone willing to grep the source for the format string.
+
+### A fix that failed, logged as failing, in the same document — twice
+
+Phase 5's dismissal-re-raise bug got fixed twice. The first fix (require 2
+consecutive "changed" scans before re-raising) was a reasonable, previously-
+proven mechanism reapplied — and it didn't work, and the entry that reports
+this says so in its own words ("Honest diagnosis: the previous fix targeted
+the wrong failure mode") rather than being quietly rewritten once the real
+fix was found. This is the same shape of discipline Entries 5 and 6 named
+for Phase 3 (fine-tuning rounds, change-detection rounds) and Entry 7 named
+for Phase 4 (five models in one loop) — but at a smaller scale and a faster
+cycle: one function's implicit assumption, found and fixed inside a single
+day, rather than a subsystem redesigned over a week. That it recurs at this
+much smaller a scale is itself worth noting for the paper: this project's
+"measure the real symptom, don't patch the first plausible cause" discipline
+isn't just a lesson learned once at the architecture level — it shows up
+identically when debugging one comparison function, which is better
+evidence it's become a habit of the process rather than a one-time
+correction applied to one big decision.
+
+### Docs-agent's own tooling failed mid-session, and this entry is honest
+about what that cost
+
+This is worth logging with the same rigor as everything else in this file,
+per the standing instruction that docs-agent's own process is part of what
+gets documented, not just GuardianEye's. During this phase's close-out
+review, both the `Grep` and `Glob` tools failed on every call
+(`ENOENT: rg not found` — the underlying `ripgrep` binary was unavailable in
+this session's environment), and there was no `Bash` tool available at all.
+Concretely, this meant: the 89-test suite could not be executed (Phase 4's
+audit ran the real suite; this one counted test functions by reading the
+file and hand-traced representative assertions instead), and the saved clip
+file referenced by the session's final live test could not be independently
+inspected with `ffprobe` or frame-extraction the way Phase 4's clip was
+(existence was confirmed via a `Read`-tool side effect — it errors
+differently for "file exists but is binary" than for "file not found" — but
+frame count, duration, and codec claims about it could not be re-derived).
+**This is a real, not hypothetical, limitation on how much weight this
+phase's write-up can carry**, and it's named explicitly in
+`docs/phase-writeups/phase-5.md` rather than quietly worked around by
+presenting hand-verification with the same confidence as execution. Worth a
+concrete recommendation for the paper: **an auditor role whose credibility
+depends on independent verification needs its own tooling checked as part
+of phase readiness, the same way a camera needs to be plugged in before
+Phase 1 can be verified** — docs-agent having "full read access to the whole
+repo" per CLAUDE.md's team-structure section is necessary but not
+sufficient if the tools that turn "read access" into "independently
+executed and confirmed" are unavailable on a given session, and nothing in
+the current process checks for that in advance.
+
+### A live-test claim that outran what the committed record supports
+
+The task briefing that produced this write-up described a "Live test 5" —
+a successful re-test of the exact fix that had failed twice, independently
+verified with `ffprobe` by "this orchestrator session." The decision log's
+own most recent entry, written by the build session itself, ends with that
+exact re-test flagged as **not yet done** ("not yet live-verified against
+entry #13's actual object - that object is the next thing to specifically
+re-test"). Those two things don't obviously reconcile from the repo alone:
+either the re-test happened in a context that never wrote a decision-log
+entry for it (a real process gap — the same "log it the same turn" rule
+this project holds itself to elsewhere), or the claim in the task briefing
+is ahead of what actually happened. Docs-agent flagged this directly in the
+write-up rather than picking one interpretation and presenting it as
+settled, which is exactly the caution CLAUDE.md's own preamble asks for
+("do not quietly work around it, and do not treat it as settled just
+because it is written down") — applied here not to an architecture
+decision, but to a claim about whether a test actually ran. Worth naming
+for the paper as a variant of Entry 3's "a subagent's context is bounded by
+what it's been shown" observation: an orchestrator's own account of what
+happened, even when made in good faith, is not automatically the same
+evidentiary weight as a committed record, and a docs-agent whose job is
+independent verification should treat orchestrator narrative the same way
+it treats any other unverified claim — checkable where possible, named as
+unconfirmed where it isn't.
+
+### What I'd tell another student team about this phase specifically
+
+- If your process quotes real program output inside a decision log or
+  write-up, keep it *exact*. It costs nothing at write time and becomes a
+  free, cheap way to verify months later that the log is a contemporaneous
+  record and not a reconstructed narrative — this phase's audit used
+  exactly that trick to confirm the decision log's terminal-log quotes were
+  real.
+- A fix that doesn't work is more valuable to the record, honestly logged,
+  than a narrative that skips straight to the fix that did — this phase's
+  two-attempt dismissal-re-raise fix is a small, clean, single-function-scale
+  example of the same discipline this project's bigger resets (Phase 3,
+  Phase 4) already demonstrated, which is itself evidence the discipline
+  has become a habit rather than a one-off correction.
+- Build a tooling health-check into whatever "docs-agent reviews this phase"
+  means in practice, not just an assumption that read access implies full
+  audit capability — this session's Grep/Glob failure was discovered mid-
+  audit, not anticipated, and materially changed what could be independently
+  confirmed versus merely read and traced by hand.
+- Don't let an orchestrator's summary of "what happened after the committed
+  record stops" quietly become part of the permanent write-up with the same
+  confidence as the committed record itself — this phase's "Live test 5"
+  claim is a concrete example of exactly the gap CLAUDE.md's own decision-log
+  discipline exists to prevent, and the right move was naming the
+  discrepancy, not silently resolving it in either direction.

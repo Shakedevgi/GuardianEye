@@ -12,6 +12,19 @@ two-consecutive-scans jitter guard and duplicate-candidate dedup), the
 dismissal re-raise check, the live ReviewQueue, and CLAUDE.md decision 4's
 proximity-alert eligibility table.
 
+Phase 5 additions (same no-camera-required style): AlertManager's
+exit-hysteresis state machine (open/escalate/close, per-(person,hazard)
+dedup), should_trigger_clip's red-only/once-per-event/global-cooldown gate,
+audio_for_signal/banner_text_for_signal's pure mapping, RollingBuffer's
+bounded length and snapshot-is-a-copy behaviour, and ClipRecorder's tail-
+window timing. write_clip() and AudioPlayer's actual afplay/VideoWriter I/O
+are exercised for real (real cv2, real temp files, no mocking, matching this
+suite's existing style) EXCEPT for a real audio device play - that would
+make the suite noisy/slow on every run, so AudioPlayer's non-blocking
+property is covered by direct measurement instead (see
+docs/decision-log.md's 2026-08-22 Phase 5 entry), and only its pure
+missing-file-handling logic is unit-tested here.
+
 Plain asserts, no pytest dependency - run directly:
 
     python cv/test_risk_engine.py
@@ -21,8 +34,11 @@ Exits non-zero (via AssertionError propagating) on first failure, prints
 """
 
 import math
+import os
+import tempfile
 from collections import defaultdict, deque
 
+import cv2
 import numpy as np
 
 import risk_engine as re
@@ -326,7 +342,9 @@ def test_apply_scan_candidates_duplicate_within_one_pass_is_deduped():
     assert len(hm.entries) == 1
 
 
-def test_apply_scan_candidates_dismissed_entry_reraised_on_material_change():
+def test_apply_scan_candidates_dismissed_entry_reraised_after_two_consecutive_changed_scans():
+    # Updated 2026-08-26: a single changed scan is no longer sufficient -
+    # see DISMISS_REAPPEAR_CONSECUTIVE_SCANS_REQUIRED.
     frame_diagonal = math.hypot(1920, 1080)
     quiet_frame = _solid_frame((100, 100, 100))
     hm = re.HazardMap()
@@ -340,10 +358,18 @@ def test_apply_scan_candidates_dismissed_entry_reraised_on_material_change():
 
     # A later scan finds the SAME spot still occupied but visually
     # different (e.g. a new object placed where the dismissed one was).
+    # First changed scan: bumps the counter, does NOT re-raise yet.
     changed_frame = _solid_frame((250, 250, 250))
+    diff = hm.apply_scan_candidates([(0, 0, 60, 60)], changed_frame, frame_diagonal, is_first_scan_cycle=False)
+    assert diff.reraised == []
+    assert entry.state == re.HAZARD_STATE_DISMISSED
+    assert entry.changed_scans == 1
+
+    # Second CONSECUTIVE changed scan: now it re-raises.
     diff = hm.apply_scan_candidates([(0, 0, 60, 60)], changed_frame, frame_diagonal, is_first_scan_cycle=False)
     assert len(diff.reraised) == 1
     assert entry.state == re.HAZARD_STATE_PENDING
+    assert entry.changed_scans == 0
     # A re-raise is never treated as part of the original room state, even
     # if the FIRST dismissal happened to be from the first scan.
     assert entry.is_first_scan is False
@@ -362,6 +388,107 @@ def test_apply_scan_candidates_dismissed_entry_stays_dismissed_if_unchanged():
     diff = hm.apply_scan_candidates([(0, 0, 60, 60)], quiet_frame, frame_diagonal, is_first_scan_cycle=False)
     assert diff.reraised == []
     assert entry.state == re.HAZARD_STATE_DISMISSED
+    assert entry.changed_scans == 0
+
+
+def test_apply_scan_candidates_dismissed_entry_non_consecutive_changes_never_reraise():
+    # The exact live scenario this fix targets: scan-to-scan noise, not a
+    # real persistent change. changed, unchanged, changed - never two IN A
+    # ROW - must never re-raise, no matter how many total "changed" scans
+    # accumulate over time.
+    frame_diagonal = math.hypot(1920, 1080)
+    quiet_frame = _solid_frame((100, 100, 100))
+    changed_frame = _solid_frame((250, 250, 250))
+    hm = re.HazardMap()
+
+    hm.apply_scan_candidates([(0, 0, 60, 60)], quiet_frame, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([(0, 0, 60, 60)], quiet_frame, frame_diagonal, is_first_scan_cycle=False)
+    entry = hm.entries[0]
+    hm.dismiss(entry.id, quiet_frame)
+
+    for frame in (changed_frame, quiet_frame, changed_frame, quiet_frame):
+        diff = hm.apply_scan_candidates([(0, 0, 60, 60)], frame, frame_diagonal, is_first_scan_cycle=False)
+        assert diff.reraised == []
+        assert entry.state == re.HAZARD_STATE_DISMISSED
+
+
+def test_dismiss_resets_changed_scans_counter():
+    frame_diagonal = math.hypot(1920, 1080)
+    quiet_frame = _solid_frame((100, 100, 100))
+    changed_frame = _solid_frame((250, 250, 250))
+    hm = re.HazardMap()
+
+    hm.apply_scan_candidates([(0, 0, 60, 60)], quiet_frame, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([(0, 0, 60, 60)], quiet_frame, frame_diagonal, is_first_scan_cycle=False)
+    entry = hm.entries[0]
+    hm.dismiss(entry.id, quiet_frame)
+    hm.apply_scan_candidates([(0, 0, 60, 60)], changed_frame, frame_diagonal, is_first_scan_cycle=False)
+    assert entry.changed_scans == 1
+
+    hm.confirm(entry.id)  # e.g. a human re-decides via some other path
+    hm.dismiss(entry.id, quiet_frame)  # fresh dismiss - must not inherit the old counter
+    assert entry.changed_scans == 0
+
+
+def _stripe_frame(size=200, stripe_width=4):
+    # Fine, high-contrast vertical stripes - not a flat color or a smooth
+    # gradient, either of which turn out too shift-tolerant after
+    # region_change_frac's Gaussian blur to actually reproduce the bug.
+    # Stripes stand in for a real fine-textured object (a ribbed surface, a
+    # cable) - directly verified (2026-08-26) that a 2-4px horizontal shift
+    # of the crop region trips fingerprint_changed's OLD candidate-bbox
+    # comparison on EVERY shift tried, matching the live evidence (a
+    # dismissed entry re-raising on nearly every single scan, not
+    # occasionally) - this is a faithful reproduction, not a guess.
+    frame = np.zeros((size, size, 3), dtype=np.uint8)
+    for i in range(size):
+        val = 255 if (i // stripe_width) % 2 == 0 else 0
+        frame[:, i] = (val, val, val)
+    return frame
+
+
+def test_apply_scan_candidates_dismissed_entry_box_jitter_alone_does_not_false_trigger():
+    frame_diagonal = math.hypot(1920, 1080)
+    stripes = _stripe_frame()
+    hm = re.HazardMap()
+
+    hm.apply_scan_candidates([(50, 50, 110, 110)], stripes, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([(50, 50, 110, 110)], stripes, frame_diagonal, is_first_scan_cycle=False)
+    entry = hm.entries[0]
+    hm.dismiss(entry.id, stripes)
+    assert entry.fingerprint_bbox == (50, 50, 110, 110)
+
+    # Later scans propose a slightly SHIFTED box each time (segmentation
+    # jitter) over the SAME static, unmoved scene - nothing actually
+    # changed. Comparing against each scan's own shifted box reads
+    # "changed" every time on this pattern (verified directly); pinning to
+    # fingerprint_bbox must not.
+    for dx in (2, -3, 4, -2, 3, -4):
+        jittered_bbox = (50 + dx, 50, 110 + dx, 110)
+        diff = hm.apply_scan_candidates([jittered_bbox], stripes, frame_diagonal, is_first_scan_cycle=False)
+        assert diff.reraised == [], f"false re-raise from box jitter alone (dx={dx})"
+    assert entry.state == re.HAZARD_STATE_DISMISSED
+
+
+def test_apply_scan_candidates_dismissed_entry_still_reraises_on_real_change_with_jittering_boxes():
+    # The fix must not weaken true-positive detection: a GENUINE change
+    # (not just box jitter) must still re-raise, even while the candidate
+    # box also jitters scan to scan.
+    frame_diagonal = math.hypot(1920, 1080)
+    stripes = _stripe_frame()
+    solid = _solid_frame((250, 250, 250), shape=(200, 200, 3))
+    hm = re.HazardMap()
+
+    hm.apply_scan_candidates([(50, 50, 110, 110)], stripes, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([(50, 50, 110, 110)], stripes, frame_diagonal, is_first_scan_cycle=False)
+    entry = hm.entries[0]
+    hm.dismiss(entry.id, stripes)
+
+    diff = hm.apply_scan_candidates([(52, 50, 112, 110)], solid, frame_diagonal, is_first_scan_cycle=False)
+    assert diff.reraised == []  # first changed scan - not yet 2 consecutive
+    diff = hm.apply_scan_candidates([(48, 50, 108, 110)], solid, frame_diagonal, is_first_scan_cycle=False)
+    assert len(diff.reraised) == 1
+    assert entry.state == re.HAZARD_STATE_PENDING
 
 
 # --- proximity-alert eligibility (Step 5 / CLAUDE.md decision 4) ------------
@@ -590,9 +717,505 @@ def test_hazard_state_tag_pending_reflects_alert_eligibility():
     assert re.hazard_state_tag(_entry(re.HAZARD_STATE_DISMISSED, is_first_scan=True)) == "DISMISSED"
 
 
+# --- Phase 5 (2026-08-26 addendum #2): label/outline edge clipping ------------
+#
+# A live test found hazard boxes near the TOP of the frame had visibly
+# missing top borders (the review-outline's -2px offset pushed it off-
+# canvas) and invisible state/REVIEW labels (cv2.putText's origin is the
+# text BASELINE, so a label positioned "above" a box near y=0 has its own
+# origin, and therefore its glyphs, off-canvas). See label_anchor_y and
+# draw_hazard_box's clamped outline coordinates.
+
+
+def test_label_anchor_y_places_label_above_when_room_exists():
+    # Anchor comfortably far from the top edge - normal "above" placement.
+    assert re.label_anchor_y(100, frame_height=480, above_offset=8, below_offset=16) == 92
+
+
+def test_label_anchor_y_flips_below_when_too_close_to_top():
+    # Anchor at y=5: "above" (5-8=-3) is invalid - must flip below.
+    result = re.label_anchor_y(5, frame_height=480, above_offset=8, below_offset=16)
+    assert result == 21  # 5 + 16, not clamped to some invalid position like 0
+    assert result > 5  # actually below the anchor, on-canvas
+
+
+def test_label_anchor_y_flipped_position_clamped_to_frame_bottom():
+    # Anchor near the very bottom AND too close to the top simultaneously
+    # can't happen for a real box, but the flip target itself must still
+    # never exceed the frame - guards the arithmetic, not a real scenario.
+    result = re.label_anchor_y(2, frame_height=10, above_offset=8, below_offset=50)
+    assert result == 9  # frame_height - 1, not 52
+
+
+def test_draw_hazard_box_review_outline_does_not_crash_near_frame_edges():
+    # Regression test for the exact live bug (2026-08-26): a review-
+    # candidate box whose top-left corner sits at the very edge of the
+    # frame must not raise, and the outline must actually be drawn -
+    # NOT silently vanish because -2/+2 pushed every coordinate off-canvas.
+    frame = np.zeros((60, 80, 3), dtype=np.uint8)
+    entry = re.HazardEntry(
+        id=1, label="object", bbox=(0, 0, 30, 40), origin=re.HAZARD_ORIGIN_SCAN,
+        state=re.HAZARD_STATE_PENDING, is_first_scan=False,
+    )
+    re.draw_hazard_box(frame, entry, is_review_candidate=True)
+    assert frame.max() > 0  # something was actually drawn, not an all-black no-op
+    # The top row of the frame must contain outline pixels (the black halo,
+    # OVERLAY_OUTLINE) - the exact symptom reported live was a missing top
+    # border because the unclamped rectangle was drawn at y=-2, off-canvas.
+    assert frame[0].max() > 0
+
+
 def test_review_candidate_label_includes_position_and_total():
     assert re.review_candidate_label(1, 3) == "REVIEW 1/3 - h=hazard n=not s=skip queued"
     assert "REVIEW 0/" not in re.review_candidate_label(1, 5)
+
+
+# --- Phase 5: AlertManager (proximity hysteresis) ----------------------------
+
+
+def _hazard(id=1, label="object", bbox=(0, 0, 10, 10)):
+    return re.HazardEntry(id=id, label=label, bbox=bbox, origin=re.HAZARD_ORIGIN_SCAN, state=re.HAZARD_STATE_CONFIRMED)
+
+
+def test_alert_manager_opens_event_on_first_scored_zone():
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    signals = mgr.update_proximity({1: (hazard, 0.4, "yellow")}, now=0.0)
+    assert len(signals) == 1
+    assert signals[0].kind == "opened"
+    assert signals[0].event.zone == "yellow"
+    assert signals[0].event.peak_zone == "yellow"
+    assert signals[0].event.person_id == 1
+    assert signals[0].event.hazard_id == hazard.id
+
+
+def test_alert_manager_no_signal_on_unchanged_or_lower_zone_resight():
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    mgr.update_proximity({1: (hazard, 0.4, "yellow")}, now=0.0)
+    same = mgr.update_proximity({1: (hazard, 0.4, "yellow")}, now=0.1)
+    assert same == []
+    lower = mgr.update_proximity({1: (hazard, 0.45, "yellow")}, now=0.2)
+    assert lower == []
+
+
+def test_alert_manager_escalation_signals_again():
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    mgr.update_proximity({1: (hazard, 0.4, "yellow")}, now=0.0)
+    signals = mgr.update_proximity({1: (hazard, 0.2, "orange")}, now=0.1)
+    assert len(signals) == 1
+    assert signals[0].kind == "escalated"
+    assert signals[0].event.peak_zone == "orange"
+
+    signals = mgr.update_proximity({1: (hazard, 0.1, "red")}, now=0.2)
+    assert len(signals) == 1
+    assert signals[0].kind == "escalated"
+    assert signals[0].event.peak_zone == "red"
+
+
+def test_alert_manager_deescalation_within_hold_does_not_signal():
+    # De-escalating (red -> orange) while the pair is still being seen every
+    # frame must NOT re-signal - only an escalation past the event's own
+    # peak, or a fresh open after the hold window elapses, should.
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    mgr.update_proximity({1: (hazard, 0.1, "red")}, now=0.0)
+    signals = mgr.update_proximity({1: (hazard, 0.25, "orange")}, now=0.1)
+    assert signals == []
+
+
+def test_alert_manager_holds_open_through_brief_dip():
+    # Regression test modeling the real flicker measured in
+    # cv/captures/Screen Recording 2026-08-22 at 13.34.16.mov (see
+    # ALERT_HOLD_SECONDS' comment): RED dipping to ORANGE for well under
+    # ALERT_HOLD_SECONDS must not close the event or open a second one.
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    mgr.update_proximity({1: (hazard, 0.1, "red")}, now=0.0)
+    mgr.update_proximity({}, now=0.5)  # brief gap, e.g. a missed detection
+    signals = mgr.update_proximity({1: (hazard, 0.12, "red")}, now=1.0)
+    assert signals == []  # same event, no re-open, no re-escalate
+    assert len(mgr._proximity_events) == 1
+
+
+def test_alert_manager_closes_after_hold_timeout():
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    mgr.update_proximity({1: (hazard, 0.1, "red")}, now=0.0)
+    signals = mgr.update_proximity({}, now=0.0 + re.ALERT_HOLD_SECONDS + 0.01)
+    assert len(signals) == 1
+    assert signals[0].kind == "closed"
+    assert len(mgr._proximity_events) == 0
+
+
+def test_alert_manager_reopens_as_new_event_after_close():
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    mgr.update_proximity({1: (hazard, 0.1, "red")}, now=0.0)
+    mgr.update_proximity({}, now=re.ALERT_HOLD_SECONDS + 0.01)  # closes
+    signals = mgr.update_proximity({1: (hazard, 0.1, "red")}, now=re.ALERT_HOLD_SECONDS + 0.5)
+    assert len(signals) == 1
+    assert signals[0].kind == "opened"
+
+
+def test_alert_manager_separate_events_per_person_hazard_pair():
+    mgr = re.AlertManager()
+    hazard_a, hazard_b = _hazard(id=1, label="a"), _hazard(id=2, label="b")
+    signals = mgr.update_proximity(
+        {1: (hazard_a, 0.1, "red"), 2: (hazard_b, 0.1, "red")}, now=0.0
+    )
+    assert len(signals) == 2
+    assert {s.event.hazard_id for s in signals} == {1, 2}
+    assert len(mgr._proximity_events) == 2
+
+
+def test_alert_manager_zone_none_never_opens_an_event():
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    signals = mgr.update_proximity({1: (hazard, 0.9, re.RISK_ZONE_NONE)}, now=0.0)
+    assert signals == []
+    assert len(mgr._proximity_events) == 0
+
+
+def test_open_new_object_creates_one_shot_opened_signal():
+    mgr = re.AlertManager()
+    entry = _hazard(label="knife")
+    signal = mgr.open_new_object(entry, "room scan", now=5.0)
+    assert signal.kind == "opened"
+    assert signal.event.kind == re.ALERT_KIND_NEW_OBJECT
+    assert signal.event.reason == "room scan"
+    assert signal.event.person_id is None
+    assert signal.event.hazard_label == "knife"
+
+
+# --- Phase 5: should_trigger_clip (decision 6 gate) ---------------------------
+
+
+def test_should_trigger_clip_true_on_red_peak_once():
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    signals = mgr.update_proximity({1: (hazard, 0.1, "red")}, now=0.0)
+    assert mgr.should_trigger_clip(signals[0], now=0.0) is True
+    # A second call for the SAME signal object must not re-trigger.
+    assert mgr.should_trigger_clip(signals[0], now=0.0) is False
+
+
+def test_should_trigger_clip_false_for_yellow_or_orange():
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    signals = mgr.update_proximity({1: (hazard, 0.4, "yellow")}, now=0.0)
+    assert mgr.should_trigger_clip(signals[0], now=0.0) is False
+
+
+def test_should_trigger_clip_false_after_first_red_in_same_event():
+    # RED -> ORANGE -> RED within one event (the exact flicker
+    # ALERT_HOLD_SECONDS was measured against) must produce only one clip,
+    # not one per RED escalation.
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    opened = mgr.update_proximity({1: (hazard, 0.1, "red")}, now=0.0)
+    assert mgr.should_trigger_clip(opened[0], now=0.0) is True
+    mgr.update_proximity({1: (hazard, 0.25, "orange")}, now=0.1)
+    escalated = mgr.update_proximity({1: (hazard, 0.1, "red")}, now=0.2)
+    # peak_zone was already "red" so this re-sighting doesn't even escalate
+    # (no rank increase past the existing peak) - no signal, nothing to gate.
+    assert escalated == []
+
+
+def test_should_trigger_clip_never_for_new_object():
+    mgr = re.AlertManager()
+    entry = _hazard()
+    signal = mgr.open_new_object(entry, "room scan", now=0.0)
+    assert mgr.should_trigger_clip(signal, now=0.0) is False
+
+
+def test_should_trigger_clip_respects_global_cooldown_across_events():
+    mgr = re.AlertManager()
+    hazard_a, hazard_b = _hazard(id=1), _hazard(id=2)
+    signals_a = mgr.update_proximity({1: (hazard_a, 0.1, "red")}, now=0.0)
+    assert mgr.should_trigger_clip(signals_a[0], now=0.0) is True
+    # A DIFFERENT hazard reaching red 0.5s later must still be blocked by
+    # the global disk-safety cooldown (CLIP_MIN_INTERVAL_SECONDS = 30s).
+    signals_b = mgr.update_proximity({2: (hazard_b, 0.1, "red")}, now=0.5)
+    assert mgr.should_trigger_clip(signals_b[0], now=0.5) is False
+
+
+def test_should_trigger_clip_allows_new_event_after_cooldown_elapses():
+    mgr = re.AlertManager()
+    hazard_a, hazard_b = _hazard(id=1), _hazard(id=2)
+    signals_a = mgr.update_proximity({1: (hazard_a, 0.1, "red")}, now=0.0)
+    assert mgr.should_trigger_clip(signals_a[0], now=0.0) is True
+    later = re.CLIP_MIN_INTERVAL_SECONDS + 1.0
+    signals_b = mgr.update_proximity({2: (hazard_b, 0.1, "red")}, now=later)
+    assert mgr.should_trigger_clip(signals_b[0], now=later) is True
+
+
+# --- Phase 5 (2026-08-26 addendum): alert_priority / AlertArbiter -------------
+#
+# Added after a live test (Shaked, 2026-08-26): a dismissed hazard-map spot
+# re-raised four times in a row (same hazard_id, HazardMap's own "better
+# safe than sorry" fingerprint re-raise being deliberately sensitive), each
+# re-raise firing its own unthrottled new-object alert, landing in the same
+# few seconds as a real proximity escalation into RED - six alarms at once.
+# AlertManager's per-pair hysteresis (tested above) was never the gap; there
+# was simply no global pacing across DIFFERENT signals at all.
+
+
+def _proximity_signal(zone, kind="opened", hazard_id=1, person_id=1):
+    event = re.AlertEvent(
+        id=hazard_id, kind=re.ALERT_KIND_PROXIMITY, person_id=person_id, hazard_id=hazard_id,
+        hazard_label="object", hazard_bbox=(0, 0, 10, 10), zone=zone, peak_zone=zone,
+        started_at=0.0, last_seen_at=0.0,
+    )
+    return re.AlertSignal(event=event, kind=kind)
+
+
+def _new_object_signal(hazard_id=1, reason="room scan"):
+    event = re.AlertEvent(
+        id=hazard_id, kind=re.ALERT_KIND_NEW_OBJECT, person_id=None, hazard_id=hazard_id,
+        hazard_label="object", hazard_bbox=(0, 0, 10, 10), zone=re.RISK_ZONE_NONE,
+        peak_zone=re.RISK_ZONE_NONE, started_at=0.0, last_seen_at=0.0, reason=reason,
+    )
+    return re.AlertSignal(event=event, kind="opened")
+
+
+def test_alert_priority_ranks_red_above_getting_close_above_new_object():
+    assert re.alert_priority(_proximity_signal("red")) == re.ALERT_PRIORITY_RED
+    assert re.alert_priority(_proximity_signal("orange")) == re.ALERT_PRIORITY_GETTING_CLOSE
+    assert re.alert_priority(_proximity_signal("yellow")) == re.ALERT_PRIORITY_GETTING_CLOSE
+    assert re.alert_priority(_new_object_signal()) == re.ALERT_PRIORITY_NEW_OBJECT
+    assert re.ALERT_PRIORITY_RED > re.ALERT_PRIORITY_GETTING_CLOSE > re.ALERT_PRIORITY_NEW_OBJECT
+
+
+def test_alert_arbiter_first_signal_voices_immediately():
+    arb = re.AlertArbiter()
+    signal = _new_object_signal()
+    assert arb.offer(signal, now=0.0) is signal
+
+
+def test_alert_arbiter_second_signal_within_window_is_held_not_voiced():
+    arb = re.AlertArbiter()
+    arb.offer(_new_object_signal(hazard_id=1), now=0.0)
+    second = _new_object_signal(hazard_id=2)
+    assert arb.offer(second, now=0.5) is None
+
+
+def test_alert_arbiter_held_signal_released_by_poll_after_window():
+    arb = re.AlertArbiter()
+    arb.offer(_new_object_signal(hazard_id=1), now=0.0)
+    held = _new_object_signal(hazard_id=2)
+    arb.offer(held, now=0.5)
+    assert arb.poll(now=1.0) is None  # window (2.5s) not elapsed yet
+    released = arb.poll(now=re.GLOBAL_ALERT_MIN_INTERVAL_SECONDS + 0.1)
+    assert released is held
+
+
+def test_alert_arbiter_higher_priority_signal_wins_while_held():
+    # Regression test for the exact 2026-08-26 scenario: several low-
+    # priority new-object pulses arrive, then a real getting-close signal -
+    # the more important one must be what eventually gets voiced.
+    arb = re.AlertArbiter()
+    arb.offer(_new_object_signal(hazard_id=1), now=0.0)  # voiced immediately
+    arb.offer(_new_object_signal(hazard_id=2), now=0.3)  # held
+    getting_close = _proximity_signal("orange", hazard_id=3)
+    arb.offer(getting_close, now=0.6)  # higher priority - should replace held
+    released = arb.poll(now=re.GLOBAL_ALERT_MIN_INTERVAL_SECONDS + 0.1)
+    assert released is getting_close
+
+
+def test_alert_arbiter_lower_priority_signal_does_not_replace_held():
+    arb = re.AlertArbiter()
+    arb.offer(_proximity_signal("orange", hazard_id=1), now=0.0)  # voiced
+    getting_close = _proximity_signal("orange", hazard_id=2)
+    arb.offer(getting_close, now=0.3)  # held
+    arb.offer(_new_object_signal(hazard_id=3), now=0.6)  # lower priority - must not replace
+    released = arb.poll(now=re.GLOBAL_ALERT_MIN_INTERVAL_SECONDS + 0.1)
+    assert released is getting_close
+
+
+def test_alert_arbiter_red_always_bypasses_the_window():
+    arb = re.AlertArbiter()
+    arb.offer(_new_object_signal(hazard_id=1), now=0.0)  # voiced, starts the window
+    red = _proximity_signal("red", hazard_id=2)
+    assert arb.offer(red, now=0.2) is red  # bypasses immediately, well inside the window
+
+
+def test_alert_arbiter_red_clears_anything_being_held():
+    arb = re.AlertArbiter()
+    arb.offer(_new_object_signal(hazard_id=1), now=0.0)
+    arb.offer(_new_object_signal(hazard_id=2), now=0.3)  # held
+    arb.offer(_proximity_signal("red", hazard_id=3), now=0.6)  # bypasses AND clears held
+    assert arb.poll(now=re.GLOBAL_ALERT_MIN_INTERVAL_SECONDS + 1.0) is None
+
+
+def test_alert_arbiter_repeated_same_hazard_bursts_collapse_to_one_voiced():
+    # The literal scenario from the 2026-08-26 recording: hazard #15
+    # dismissed and re-raised four times in a handful of seconds. Only the
+    # first should be voiced; the rest are held/superseded, never all four.
+    arb = re.AlertArbiter()
+    voiced = []
+    v = arb.offer(_new_object_signal(hazard_id=15), now=0.0)
+    if v is not None:
+        voiced.append(v)
+    for t in (0.4, 0.9, 1.6):
+        v = arb.offer(_new_object_signal(hazard_id=15), now=t)
+        if v is not None:
+            voiced.append(v)
+    assert len(voiced) == 1
+
+
+# --- Phase 5: audio_for_signal / banner_text_for_signal -----------------------
+
+
+def test_audio_for_signal_new_object_is_hazard_detected():
+    mgr = re.AlertManager()
+    signal = mgr.open_new_object(_hazard(), "room scan", now=0.0)
+    assert re.audio_for_signal(signal) == re.AUDIO_HAZARD_DETECTED
+
+
+def test_audio_for_signal_yellow_and_orange_are_baby_getting_close():
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    for zone in ("yellow", "orange"):
+        signals = mgr.update_proximity({1: (hazard, 0.3, zone)}, now=0.0)
+        if signals:
+            assert re.audio_for_signal(signals[0]) == re.AUDIO_BABY_GETTING_CLOSE
+        mgr = re.AlertManager()  # reset between zones
+
+
+def test_audio_for_signal_red_is_immediate_danger():
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    signals = mgr.update_proximity({1: (hazard, 0.1, "red")}, now=0.0)
+    assert re.audio_for_signal(signals[0]) == re.AUDIO_IMMEDIATE_DANGER
+
+
+def test_audio_for_signal_closed_is_silent():
+    mgr = re.AlertManager()
+    hazard = _hazard()
+    mgr.update_proximity({1: (hazard, 0.1, "red")}, now=0.0)
+    closed = mgr.update_proximity({}, now=re.ALERT_HOLD_SECONDS + 0.01)
+    assert closed[0].kind == "closed"
+    assert re.audio_for_signal(closed[0]) is None
+
+
+def test_banner_text_for_signal_new_object_names_reason_and_label():
+    mgr = re.AlertManager()
+    signal = mgr.open_new_object(_hazard(label="lighter"), "wall socket", now=0.0)
+    text = re.banner_text_for_signal(signal)
+    assert "wall socket" in text
+    assert "lighter" in text
+
+
+def test_banner_text_for_signal_proximity_names_zone_and_person():
+    mgr = re.AlertManager()
+    signals = mgr.update_proximity({7: (_hazard(label="stove"), 0.1, "red")}, now=0.0)
+    text = re.banner_text_for_signal(signals[0])
+    assert "RED" in text
+    assert "stove" in text
+    assert "#7" in text
+
+
+# --- Phase 5: RollingBuffer ----------------------------------------------------
+
+
+def _tiny_frame(color=(10, 10, 10)):
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+    frame[:, :] = color
+    return frame
+
+
+def test_rolling_buffer_bounded_length():
+    buf = re.RollingBuffer(fps=10.0, seconds=2.0)  # maxlen = 20
+    for i in range(30):
+        buf.append(_tiny_frame(), timestamp=float(i))
+    assert len(buf) == 20
+
+
+def test_rolling_buffer_append_returns_encoded_bytes():
+    buf = re.RollingBuffer(fps=10.0, seconds=1.0)
+    encoded = buf.append(_tiny_frame(), timestamp=0.0)
+    assert encoded is not None
+    assert encoded.size > 0
+
+
+def test_rolling_buffer_snapshot_is_a_copy_not_a_live_view():
+    buf = re.RollingBuffer(fps=10.0, seconds=1.0)  # maxlen = 10
+    buf.append(_tiny_frame(), timestamp=0.0)
+    snapshot = buf.snapshot()
+    assert len(snapshot) == 1
+    for i in range(1, 15):
+        buf.append(_tiny_frame(), timestamp=float(i))
+    assert len(snapshot) == 1  # unaffected by further appends after the fact
+
+
+# --- Phase 5: ClipRecorder (tail-window timing, no real thread) ---------------
+
+
+def test_clip_recorder_add_tail_frame_ignores_after_deadline():
+    with tempfile.TemporaryDirectory() as tmp:
+        recorder = re.ClipRecorder(tmp, fps=10.0, tail_seconds=2.0)
+        event = re.AlertEvent(
+            id=1, kind=re.ALERT_KIND_PROXIMITY, person_id=1, hazard_id=1, hazard_label="object",
+            hazard_bbox=(0, 0, 10, 10), zone="red", peak_zone="red", started_at=0.0, last_seen_at=0.0,
+        )
+        recorder.trigger(buffer_snapshot=[], event=event, now=0.0)  # deadline = 2.0
+        recorder.add_tail_frame(b"in-window", timestamp=1.5)
+        recorder.add_tail_frame(b"too-late", timestamp=2.5)
+        assert recorder._pending[0]["frames"] == [(1.5, b"in-window")]
+
+
+def test_clip_recorder_poll_only_finalizes_after_deadline():
+    with tempfile.TemporaryDirectory() as tmp:
+        recorder = re.ClipRecorder(tmp, fps=10.0, tail_seconds=2.0)
+        event = re.AlertEvent(
+            id=1, kind=re.ALERT_KIND_PROXIMITY, person_id=1, hazard_id=1, hazard_label="object",
+            hazard_bbox=(0, 0, 10, 10), zone="red", peak_zone="red", started_at=0.0, last_seen_at=0.0,
+        )
+        ok, jpeg = cv2.imencode(".jpg", _tiny_frame())
+        assert ok
+        recorder.trigger(buffer_snapshot=[(0.0, jpeg)], event=event, now=0.0)
+        assert recorder.poll(now=1.0) == []  # tail not elapsed yet
+        paths = recorder.poll(now=2.1)  # tail elapsed - spawns a write thread
+        assert len(paths) == 1
+        assert paths[0].endswith("_event1_object.mp4")
+        assert recorder._pending == []
+
+
+def test_write_clip_produces_a_real_playable_file():
+    # Called directly and synchronously (not via a thread) - see write_clip's
+    # docstring for why it's a free function rather than hidden inside
+    # ClipRecorder. Real cv2 VideoWriter, real temp file, matching this
+    # suite's no-mocking style.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "clip.mp4")
+        frames = []
+        for color in ((10, 10, 10), (200, 200, 200), (50, 100, 150)):
+            ok, jpeg = cv2.imencode(".jpg", _tiny_frame(color))
+            assert ok
+            frames.append(jpeg)
+        result = re.write_clip(path, frames, fps=10.0)
+        assert result is True
+        assert os.path.isfile(path)
+        assert os.path.getsize(path) > 0
+
+
+def test_write_clip_returns_false_for_empty_frame_list():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "clip.mp4")
+        assert re.write_clip(path, [], fps=10.0) is False
+        assert not os.path.isfile(path)
+
+
+# --- Phase 5: AudioPlayer (pure missing-file logic only - see module docstring) --
+
+
+def test_audio_player_missing_file_does_not_raise_and_warns_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        player = re.AudioPlayer(tmp)
+        player.play("does_not_exist.wav")  # must not raise
+        assert "does_not_exist.wav" in player._warned
 
 
 def run_all():
