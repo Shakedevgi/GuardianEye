@@ -998,3 +998,120 @@ unconfirmed where it isn't.
   claim is a concrete example of exactly the gap CLAUDE.md's own decision-log
   discipline exists to prevent, and the right move was naming the
   discrepancy, not silently resolving it in either direction.
+
+## Entry 9 — Phase 6 (2026-08-28): a wrong date propagated through two
+agents unquestioned, and the bug that only a database query — not a clean
+terminal log — could find
+
+Phase 6 is the first phase with a fourth kind of contributor showing up
+directly in the record: backend-agent, working from a same-day task
+briefing the orchestrator wrote. Two things about how that specific
+handoff went are worth documenting on their own, separately from whether
+the persistence code itself is any good (it is — see
+`docs/phase-writeups/phase-6.md`).
+
+### An orchestrator's own dating error, copied faithfully by the subagent it briefed
+
+Both of Phase 6's first two decision-log entries were originally dated
+2026-08-26 — Phase 5's own closing date, and *not* the actual date those
+entries were written (2026-08-28). The orchestrator's own account of why
+is refreshingly specific rather than hand-waved: it had just finished
+reading through Phase 5's dated entries in sequence and anchored on the
+date its own attention was sitting on, rather than the calendar. That's a
+plausible, very human failure mode, and it's worth naming as exactly that —
+not a hallucination, not a made-up date, but a real date that was simply
+*stale by two sessions* and got carried forward out of habit.
+
+The more interesting part is what happened next: **backend-agent, briefed
+by the orchestrator for the same-day implementation task, inherited the
+wrong date into its own new files** — `backend/db.py`'s and
+`backend/persistence.py`'s module docstrings both originally cited "the
+2026-08-26 Phase 6 kickoff entry" as their reasoning source, because that's
+the date the task briefing itself used. Backend-agent had no independent way
+to know the date was wrong; it was told, in good faith, by the agent
+coordinating it, and it correctly cited what it was told. **This is the
+first clean example in this project's own record of an error propagating
+*downstream* through the orchestrator→subagent relationship**, as opposed
+to every previous multi-agent finding in this file, which has mostly been
+about an orchestrator failing to carry forward context a subagent's session
+already had (Entry 3, Entry 7) or a subagent's own reasoning drifting scope
+without being asked (Entry 5's classification→anomaly-detection reframe).
+This one runs the other direction: the coordinator was the source of the
+mistake, and the specialist correctly, faithfully executed on bad input.
+
+That distinction matters for how a team should think about verifying
+multi-agent work. The instinct "check whether the subagent did its job
+correctly" is necessary but insufficient — the subagent here *did* do its
+job correctly, by every internal measure (it wrote what it was told, cited
+its source accurately, and its code was correct). The defect was entirely
+upstream, in what it was told to begin with. A review process that only
+audits subagent output against subagent instructions would have missed
+this cleanly; it was only caught because someone (the orchestrator itself,
+this session, per its own account) separately noticed the date was wrong
+relative to the actual calendar — a check against ground truth, not
+against the task briefing.
+
+### The correction itself wasn't fully applied, and nobody had checked until this audit
+
+Worth stating plainly, because it's a small but real second layer of the
+same lesson: the decision log's own entry describing the fix states the
+correction "landed everywhere," naming four files. A repo-wide grep during
+this phase's docs-agent review found one of the four (`backend/API.md`) had
+not actually been touched — it still read 2026-08-26 at review time. This
+is not a big deal on its own (a one-line date reference, fixed in the same
+turn it was found), but it's a clean, small illustration of a pattern worth
+naming for the paper: **a claim that a fix "landed everywhere" is itself a
+claim, made by whichever agent applied the fix, and it should be checked
+the same way any other claim in this project's process is checked** — not
+trusted more just because it's phrased as a correction rather than as new
+work. The team's own standing discipline ("measure, don't assume") already
+applies to code; this is a small data point that it needs to apply equally
+to the team's own bookkeeping about itself.
+
+### The bug that a clean terminal log could not reveal, and why the verification instinct that found it is worth calling out explicitly
+
+Phase 6's actual engineering bug — roughly half of all voiced alerts never
+reaching the database — is a strong example of a failure mode this
+project's docs-agent role exists specifically to catch, and it's worth
+being explicit about *why* it was findable at all. The live session that
+exposed it produced a terminal log with no errors, no warnings, no crash,
+and a plausible-looking sequence of `ALERT:` lines — "it ran without
+errors" would have been a completely reasonable, and completely wrong,
+conclusion to stop at. **The bug was only found because someone queried the
+database directly and counted rows against the terminal log's own alert
+count, rather than accepting a clean run as success.** That is a
+qualitatively different check than "did the program crash," and it's the
+same category of check this project has used before to good effect (the
+Phase 5 fingerprint_bbox bug was found by watching real pixels against a
+diagnosed symptom, not by trusting a passing test suite) — but this is the
+first time in the project's record that the check specifically took the
+form of "cross-reference two independent logs of the same event against
+each other" (terminal output vs. database rows) rather than "watch the
+system directly." That's a cheap, repeatable, and generalizable technique
+worth naming for another team building anything with a persistence layer:
+if two systems are supposed to agree about how many things happened, count
+both and diff them — don't just check that neither one errored.
+
+### What I'd tell another student team about this phase specifically
+
+- An orchestrator briefing a subagent is not a neutral pass-through — a
+  wrong fact in the briefing (here, a date, but it could just as easily be
+  a wrong file path, a wrong prior decision, or a wrong assumption about
+  what an earlier phase actually built) becomes a wrong fact in the
+  subagent's own output, faithfully and correctly executed. Auditing
+  subagent output against subagent instructions catches subagent mistakes;
+  it does not catch this class of error at all. Someone still has to check
+  the instructions against ground truth.
+- A logged claim that something was "fixed everywhere" or "corrected
+  throughout" is exactly the kind of claim worth grepping for rather than
+  trusting, precisely because it sounds complete and confident — this
+  project found its own such claim was one file short of true, on the very
+  next phase after making it.
+- When a persistence layer is added to a system that previously only had to
+  "run without crashing" to look successful, the bar for what counts as
+  verification has to rise with it — a clean terminal log is no longer
+  sufficient evidence that the system worked correctly, because the failure
+  mode that matters most (data quietly not being saved) produces no visible
+  symptom at all. Cross-referencing two independent counts of the same
+  thing (what was said vs. what was stored) is the cheapest version of the
+  right check, and it's the one that actually found this phase's bug.

@@ -221,6 +221,15 @@ division of labor). Full reasoning in `docs/phase-writeups/phase-5.md`; read
   session (no Bash tool available) — someone should run
   `cd cv && python test_risk_engine.py` and confirm the pass count before
   fully trusting it.
+- **Amendment, 2026-08-28 (docs-agent, at Phase 6 close):** the audibility
+  gap named above is now closed. During Phase 6's live test, the
+  orchestrator played `cv/audio/hazard_detected.wav` and asked Shaked
+  directly; Shaked confirmed hearing it ("yes i did heard it works." —
+  `docs/decision-log.md`, 2026-08-28 "Phase 6 live test" entry). This
+  closes Phase 5's own done-when bar ("visually **and audibly**") on both
+  halves. Phase 5's status and `[x]` above are not rewritten — this is a
+  same-day-as-Phase-6 confirmation of a gap Phase 5 closed with, not a
+  correction to Phase 5's own history.
 
 ### Phase 6 — Persistence
 **Owner:** backend-agent
@@ -228,7 +237,55 @@ division of labor). Full reasoning in `docs/phase-writeups/phase-5.md`; read
 auto-delete of undecided pending clips.
 **Done when:** events and clip references are correctly stored, queryable, and
 old undecided clips actually get cleaned up.
-`[ ]`
+
+`[x]` — closed 2026-08-28 by docs-agent, after a live hardware test found and
+fixed a real bug the same day. Full reasoning in
+`docs/phase-writeups/phase-6.md`; read "done when" here precisely, not as a
+blanket pass:
+- **"Queryable" and "old undecided clips actually get cleaned up"** are both
+  backed by tests that do real file I/O (real files created, backdated,
+  deleted; real `kept`/`discarded`/`expired` status transitions checked
+  against the actual filesystem, not mocked) — traced by docs-agent against
+  the implementation, not just counted.
+- **"Correctly stored" — the fix is now live-verified, closing this
+  phase's one real asterisk.** A live session found that roughly half of
+  all alerts actually voiced to the parent were never reaching the
+  database — `speak()` had two call sites, and Phase 6 originally
+  persisted at only one of them. Fixed by moving the persistence call
+  inside `speak()` itself. A second live session (2026-08-28,
+  `docs/decision-log.md`'s "Phase 6's top open item closed" entry) confirmed
+  it holds: every voiced alert's underlying event is present in the
+  database, either as its own row or correctly folded into an update of an
+  already-open one (verified via `started_at`/`last_seen_at` per row, not a
+  bare count — a bare row-count diff against the log's `ALERT:` lines is
+  NOT the right test, since a legitimately re-voiced event collapses
+  multiple alert lines into one updated row by design).
+- **`PersonTracker` ID churn (a forward pointer since Phase 5) now visibly
+  corrupts the persisted event log**: one continuous approach to a hazard
+  was recorded as three unrelated event rows in this session's real data,
+  because `AlertManager` keys events on `(person_id, hazard_id)` and a
+  re-acquired person id starts a new event. Not Phase 6's mechanism to fix,
+  but flagged as a precondition worth resolving before Phase 8 builds a
+  parent-facing event history on top of this data.
+- **No `ended_at` column on `events`, by design** (decision 3: only voiced
+  signals are persisted, and `AlertManager`'s "closed" signal is never
+  voiced) — well documented in `backend/db.py` and `backend/API.md`, but its
+  Phase 8 consequence (a parent can't be told precisely when an event ended,
+  only approximately) hasn't been explicitly weighed against what Phase 8
+  needs to show.
+- **`main()`'s alert wiring — exactly where this phase's bug lived — has no
+  unit test coverage**, and the stated reason (a test mirroring `main()`'s
+  own call sequence would duplicate the wiring, not test it) is judged
+  correct but incomplete: an invariant-level test (every signal that reaches
+  `speak()` also reaches `record()`, using the real classes) is possible and
+  doesn't exist yet. The proposed fix — extract `main()`'s alert wiring into
+  an injectable object in Phase 7 — is a credible plan (Phase 7 needs that
+  extraction anyway to drive these paths from FastAPI) rather than empty
+  deferral, but it's a plan, not yet a fact.
+- **One process finding, not a code finding:** the decision log's own claim
+  that a same-day date-typo correction (2026-08-26 → 2026-08-28) "landed
+  everywhere" was checked directly and was not quite true — `backend/API.md`
+  still had one stale reference, found and fixed during this close-out.
 
 ### Phase 7 — Serving layer
 **Owner:** backend-agent

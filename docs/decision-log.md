@@ -1766,3 +1766,422 @@ here, which is exactly the discrepancy the audit flagged rather than
 guessed at. Recorded now for the same reason the rest of this log exists:
 so the next person doesn't have to take an orchestrator's chat summary on
 faith.
+
+### 2026-08-28 — Phase 6 kickoff: schema shape and four decisions (Shaked)
+
+Before writing any migration/schema code, the orchestrator re-verified two
+things left open at Phase 5 close and proposed a schema + four decisions
+for Shaked to make, per this project's measure/decide-before-build culture.
+
+**Re-verified, closing two Phase 5 gaps:**
+- `cd cv && python test_risk_engine.py` actually run this session (Phase
+  5's docs-agent audit couldn't - no shell access that session): **89/89
+  tests pass**, for real, not just counted by reading the file.
+- `afplay cv/audio/hazard_detected.wav` run directly - no error, so the
+  file is valid, playable audio and `afplay` launches correctly outside
+  the risk_engine.py process too. **Still not independently confirmed
+  audible by a human** - Shaked was asked directly in this same turn;
+  answer not yet on the record. Carried forward as the same open item
+  Phase 5 flagged, one step closer.
+
+**The core design problem and its resolution.** `AlertEvent.id` and
+`HazardEntry.id` are session-local by design (decision 3 - Layer A/B carry
+no state across process restarts), so they cannot be a database primary
+key on their own - two different camera runs both produce an "event #8."
+Resolution: the `events` table gets its own `INTEGER PRIMARY KEY
+AUTOINCREMENT`; the session-local id is kept as an informational column
+alongside `run_started_at` (this process's real start time). No separate
+`sessions` table - an in-process dict (`session_local_id -> db_id`),
+scoped to the lifetime of the running `risk_engine.py` process, is
+sufficient to route "escalated" signals to the right existing row, and
+that dict's lifetime already matches exactly how long the session-local id
+stays meaningful. A related, easy-to-miss issue: `AlertManager` times
+everything in `time.monotonic()`, which has no fixed relationship to a
+wall-clock date across process restarts - so persisted timestamps are a
+fresh `time.time()` read taken at the moment persistence actually writes
+the row, not a conversion of the monotonic `now` passed around internally.
+
+**Four decisions (Shaked, this session):**
+1. **Undecided-pending-clip auto-delete timeout: 24 hours.** (Proposed
+   24h/48h/72h with reasoning; 24h chosen.)
+2. **New `backend/` directory**, not inside `cv/`. Matches CLAUDE.md's team
+   split - backend-agent already owns "SQLite schema and queries" as its
+   own domain, separate from cv-agent's pipeline code - and gives Phase 7's
+   FastAPI app a home waiting for it instead of a later move. SQLite file:
+   `backend/guardianeye.db`, gitignored (same privacy reasoning as
+   `cv/captures/`/`cv/clips/` - this is runtime data from a real home, not
+   source).
+3. **The events table persists only alert signals that were actually
+   voiced/bannered to the parent - not every AlertManager state
+   transition.** The orchestrator's recommendation (log everything plus an
+   `ever_voiced` flag) was NOT taken; Shaked chose the narrower "what the
+   parent was told" scope instead. **Consequence, worth being explicit
+   about:** `AlertManager`'s "closed" signal (a proximity pair's hysteresis
+   window elapsing) is never voiced by design (`audio_for_signal` returns
+   None for it), so under this policy it is never persisted either - the
+   `events` table has no `ended_at`/closing record at all. `last_seen_at`
+   on the most recent voiced row is the closest available signal for "how
+   recent was this," not a precise close time. This is a direct, accepted
+   consequence of the decision, not an oversight - the table is a record of
+   what the parent was actually told, not a mirror of the full in-memory
+   state machine.
+4. **Two small additive changes to Phase 5's `ClipRecorder`/`write_clip`,
+   approved** (trigger/tail timing unchanged): `ClipRecorder.poll(now)`
+   returns `(path, event)` pairs instead of bare paths, so a clip row can
+   be linked to the `AlertEvent` that triggered it; `write_clip()` gains an
+   optional `on_complete` callback so a clip's DB row can learn
+   success/frame-count once the background write thread actually finishes,
+   instead of the row staying permanently "writing."
+
+**Schema (events, clips) and the `cv/clips/kept/` convention** (parent
+"keep" moves the file out of `pending/`, mirroring the existing
+`pending/` naming) are specified in full in the same-turn implementation
+task handed to backend-agent. `clips.status` gets a fourth value,
+`expired` (an automatic timeout), kept distinct from `discarded` (an
+explicit parent "no") - the DB row survives either way as an audit trail
+even after the underlying file is deleted.
+
+**Scope boundary held deliberately**: no FastAPI, no HTTP, no UI - Phase
+6 is the data layer only, per `PHASE_PLAN.md`'s own division of labor.
+`PHASE_PLAN.md` status set to `[~]`.
+
+### 2026-08-28 — Phase 6 implemented: `backend/` persistence layer, both
+Phase 5 hook-ins wired (backend-agent)
+
+Implements the schema and four decisions from the same-day "Phase 6
+kickoff" entry above. New files: `backend/db.py` (schema + connection
+handling), `backend/persistence.py` (EventWriter, clip lifecycle, queries),
+`backend/test_persistence.py` (16 tests, plain-assert style matching
+`cv/test_risk_engine.py`), `backend/API.md` (function-surface reference for
+Phase 7). Both `cd cv && ../.venv/bin/python3 test_risk_engine.py` (93/93 -
+89 original + 4 new covering the two Phase 5 changes below) and `cd backend
+&& ../.venv/bin/python3 test_persistence.py` (16/16) actually run this
+session, not just read.
+
+**Judgment calls made along the way, not already pinned down by the
+kickoff entry:**
+
+- **Module layout is flat** (`backend/db.py`, `backend/persistence.py`,
+  no `__init__.py`, no `backend` treated as an importable package) -
+  matches this repo's own Phase 1 precedent ("flat cv/ directory, no src/
+  nesting, no package ceremony until there's enough code to justify it").
+  `cv/risk_engine.py` adds `backend/` to `sys.path` explicitly (not
+  relying on CWD, which differs depending on whether the script is
+  launched from `cv/` or the repo root) and does `from persistence import
+  ...` / `from db import ...` - flat module imports, exactly like its
+  existing `from camera import ...` / `from detect_stream import ...`.
+- **Every function opens its own short-lived `sqlite3.Connection`** (via
+  `db.get_connection`), never a connection shared across calls or threads -
+  the task's own threading note made this the only safe default, and at
+  this write volume (alerts/clips, not per-frame) the overhead is a
+  non-issue, matching the task's own framing.
+- **`EventWriter` is a small class, not a bare function + external dict.**
+  It owns the `session_local_id -> events.id` map itself (one instance per
+  `risk_engine.py` process, constructed once in `main()`) rather than
+  making the caller thread a dict through every call - the map's lifetime
+  and the writer's lifetime are identical by construction, which was the
+  kickoff entry's own reasoning for why an in-process dict suffices.
+- **A verified, not assumed, reason the clip/event id-linking race is safe
+  in practice**: `ClipRecorder.poll()` returns `(path, event)` pairs, and
+  the clip DB row is inserted in `main()` right after, resolving
+  `event.id` to `events.id` via `EventWriter.db_id_for()`. This only works
+  if the triggering event's row already exists by then.
+  `AlertManager.should_trigger_clip()` only fires for PROXIMITY events at
+  `peak_zone == "red"`, and `alert_priority()` gives RED the top tier,
+  which `AlertArbiter.offer()` (read in full for this reason) returns
+  *immediately, never held* - RED is explicitly exempt from the pacing
+  window. So the same call to `handle_alert_signal()` that triggers the
+  clip always also gets `voiced is not None` on the same frame, and the
+  event row is persisted before `poll()` ever returns that clip's path.
+  Guarded anyway (skip the clip insert + print a warning if `db_id_for`
+  somehow returns `None`) rather than trusting this silently, since
+  `clips.event_id` is `NOT NULL` and a crash here would be worse than a
+  skipped clip row.
+- **`write_clip()`'s `on_complete` fires on every exit path, including
+  every failure path** (empty frame list, undecodable first frame,
+  `VideoWriter` failing to open), with `frame_count=0` for all of them -
+  not just on success. `clips.write_status` has an explicit `'failed'`
+  value in the schema; a callback that only ever fired on success would
+  leave a failed write's row stuck at `'writing'` forever.
+- **`ClipRecorder._start_write()` builds a per-clip closure** (capturing
+  `path`/`event`) around the single `on_write_complete` hook given at
+  construction, rather than requiring a second "on-started" hook - matches
+  the task's literal code sketch (`_start_write` "passes your callback
+  into the `threading.Thread(...)` call") rather than inventing a third
+  hook point not in that sketch.
+- **`update_clip_write_result` matches by `path` (UNIQUE), not by a clip id
+  passed back across the thread boundary** - simpler than trying to hand a
+  freshly-inserted id into a closure built before the insert has
+  necessarily run, and `path` is known at closure-construction time either
+  way. A small bounded retry (`_CLIP_ROW_RETRY_ATTEMPTS = 5`, 0.05s apart)
+  guards the theoretical (not expected, per the reasoning above) race where
+  the write finishes before the row exists.
+- **`keep_clip` also updates `clips.path`** to the new `cv/clips/kept/`
+  location (not specified explicitly in the task, but implied by "keep
+  moves the file" - a `path` column that stops pointing at a real file
+  after "keep" would make `get_clip`/future Phase 7 downloads silently
+  broken). `_kept_dir_for()` derives the sibling `kept/` directory from the
+  clip's own stored path rather than a hardcoded constant, so it's correct
+  regardless of `--clips-dir`/CWD.
+- **New CLI flags on `risk_engine.py`**: `--db-path` (default
+  `backend/guardianeye.db`, resolved via `backend.db.DEFAULT_DB_PATH`),
+  `--disable-persistence` (isolates the persistence layer for debugging,
+  mirrors the existing `--disable-scan`/`--disable-audio` pattern),
+  `--sweep-interval` (default 60s, `DEFAULT_SWEEP_INTERVAL_SECONDS` -
+  polling cadence for checking the 24h timeout, not the timeout itself).
+- **The auto-delete sweep runs inline in the frame loop**, not on its own
+  thread - it's a handful of DB rows at most per call at this write volume,
+  and it's Layer-A-adjacent housekeeping, not on Layer B's latency-critical
+  path, so the task's own "not latency-critical" framing for periodic scans
+  applies here too.
+- **Verified end-to-end, not just per-function**: a manual smoke test
+  (event insert -> clip trigger -> background write -> on_complete DB
+  update -> status query -> auto-delete sweep) run against real
+  `risk_engine.py` classes (`AlertEvent`, `AlertSignal`, `ClipRecorder`,
+  real `cv2`-encoded frames) and a temp SQLite DB, confirming the full
+  round trip actually works end to end, not just that each piece's own
+  unit tests pass in isolation.
+
+**Not done, flagged rather than silently skipped**: this session did not
+run `risk_engine.py` against a real camera with `--db-path` pointed at a
+real DB - the smoke test above exercises the same classes/functions but
+constructs its own synthetic `AlertEvent`s rather than driving them through
+a live `main()` loop. Someone with camera access should run a real session
+and confirm `backend/guardianeye.db` actually accumulates rows and a real
+RED escalation produces both a clip file and a linked clip row, before this
+is trusted the way Phase 5's live-camera confirmations were.
+
+## 2026-08-28 — Phase 6 live test: persistence works, and found a real bug
+that only live data could find (half of all voiced alerts were never saved)
+
+Shaked ran `python risk_engine.py --name Arducam` with persistence enabled
+(`run_started_at=2026-08-28T09:24:52`), pasted the full terminal output, and
+the orchestrator queried the resulting `backend/guardianeye.db` directly
+rather than taking "it ran without errors" as success. **Doing that
+comparison is what found the bug below** - the run looked completely healthy
+from the terminal alone.
+
+**First, a correction to this log's own record.** The two Phase 6 entries
+above were originally dated **2026-08-26**; the actual date was
+**2026-08-28**. The orchestrator anchored on the Phase 5 dates it had just
+been reading instead of the current date, and backend-agent inherited the
+wrong date from the task briefing it was given. Both headings and every
+cross-reference to them (in `backend/db.py`, `backend/persistence.py`,
+`backend/API.md`, `cv/risk_engine.py`) were corrected. Recorded here rather
+than silently fixed, because a dated log whose dates are wrong is worse than
+one that admits it got them wrong - and because "the orchestrator misdated
+it and the subagent copied that" is a real, repeatable multi-agent failure
+mode worth having on the record for the workflow write-up.
+
+**Audio audibility CONFIRMED - closes an item open since Phase 5.** The
+orchestrator played `cv/audio/hazard_detected.wav` via `afplay` and asked
+Shaked directly; Shaked confirmed: "yes i did heard it works."
+`PHASE_PLAN.md`'s Phase 5 done-when bar ("the right alert fires - visually
+**and audibly**") is now met on both halves. This had been carried as the
+single named gap through Phase 5's close-out write-up and both Phase 6
+entries above. It cost one command and one question, having sat open for
+two phases.
+
+**Persistence confirmed working on real hardware.** `backend/guardianeye.db`
+accumulated 5 event rows from the live session - both `new_object` (reason
+`room scan`) and `proximity` kinds, correct zones/peak_zones, correct
+`run_started_at`, `hazard_bbox` round-tripping through JSON. This closes the
+"not yet live-verified" gap backend-agent flagged in the entry immediately
+above. No clips: no RED escalation occurred this run (the session peaked at
+ORANGE), so `clips` is legitimately empty - not a failure, and the clip path
+was already live-proven in Phase 5.
+
+**THE BUG: only ~5 of ~10 voiced alerts were persisted.** Cross-checking the
+terminal log's `ALERT:` lines against the DB rows showed the persisted
+`session_local_id` values were **1, 3, 6, 7, 9** - gaps at 2, 4, 5, 8. Those
+gaps are `AlertEvent`s that `AlertManager` really created and that the
+parent really was told about (they appear as `ALERT:` lines in the log),
+but which never reached the database. Specifically missing: the
+`named detection: refrigerator` new-object alert, person #1's
+YELLOW->ORANGE escalation, and two of the ORANGE alerts.
+
+**Root cause**: `speak()` is reached from **two** call sites, and Phase 6's
+wiring only persisted at one of them. `AlertArbiter.offer()` returning a
+winner goes through `handle_alert_signal()`, which recorded correctly. But
+`AlertArbiter.poll()` - which releases a signal that was *held back* by the
+2.5s pacing window, and is called separately in the main frame loop - called
+`speak(held)` with no `record()` beside it. So every alert that lost its
+pacing race and was released a moment later was voiced and bannered to the
+parent while silently never being saved. Given
+`GLOBAL_ALERT_MIN_INTERVAL_SECONDS = 2.5`, that is a large fraction of any
+busy session, which matches the roughly-half loss observed.
+
+**Fix: move the persistence call INSIDE `speak()`**, rather than adding a
+second `record()` beside the second call site. Decision 3's requirement is
+"persist exactly what the parent was actually told," and `speak()` *is* the
+function that tells them - so putting the write there makes the invariant
+structural instead of something every present and future call site has to
+remember. The narrower patch (record at both call sites) would have fixed
+this instance and left the same trap armed for the next one.
+
+**Why the 93-test suite passed the whole time, stated plainly rather than
+glossed:** this is a *wiring* bug living in `main()`'s local closures, not a
+logic bug inside any class. `AlertArbiter.poll()` is correct and unit-tested;
+`EventWriter.record()` is correct and unit-tested; the defect was only in how
+`main()` connected them, and `main()` has no test coverage (it needs a
+camera). This is the same shape as Entry 6 in `docs/agent-workflow-notes.md`
+(individually-correct components composing badly) and the same shape as
+Phase 5's `fingerprint_bbox` bug - both found by live data, neither findable
+by the unit suite. **No new unit test was added for this**, deliberately and
+with the tradeoff named: a test that mirrors `main()`'s call sequence would
+duplicate the wiring rather than test it, and would pass even if `main()`
+later drifted. Making this genuinely testable means extracting `main()`'s
+alert wiring into an injectable object - a real refactor, logged here as a
+candidate for Phase 7 (which will need to drive these same paths from a
+FastAPI process anyway), not something to improvise during a phase close.
+
+**The fix is NOT itself live-verified yet.** It is a three-line structural
+change whose correctness is readable, and the full suite still passes
+(93/93 cv, 16/16 backend), but nobody has re-run the camera and confirmed
+the previously-missing alerts now appear. **That re-run is the next thing to
+do**, and it should specifically compare `ALERT:` line count against row
+count the way this entry did - the check that found the bug is the check
+that confirms the fix.
+
+**A second finding, not fixed, flagged with new evidence: `PersonTracker` ID
+churn is now visibly polluting the persisted event log.** Rows 2, 3 and 4
+are three *separate* event rows against the **same hazard #3**, with
+`person_id` 1, 4 and 5 - one continuous approach by (almost certainly) one
+person, recorded as three unrelated events, because `AlertManager` keys
+proximity events on `(person_id, hazard_id)` and a new person id starts a
+brand-new event. This was flagged as a forward pointer in Phase 5's write-up
+(`PERSON_STALE_SECONDS = 1.0` suspected but unconfirmed) on the basis of one
+terminal log; it has now recurred and, more importantly, has a *consequence*
+it didn't visibly have before - it corrupts the event history a parent will
+eventually read in Phase 8, and inflates event counts. Still not fixed here
+(it is cv-agent's Layer B territory, not persistence), but it has graduated
+from "cosmetic log noise" to "wrong data in the database," which is a
+stronger reason to schedule it.
+
+**One question asked and deliberately answered with no change** (Shaked):
+whether events/clips should be batched on a 3-5s cadence rather than
+"logging every millimetre of movement," since two clips of a child at 2.0m
+and 1.9m from the same object would be wasteful. Answered: that case cannot
+occur, because neither writes are per-movement. An event is written once per
+*zone crossing*, not per frame - a child moving 2.0m->1.9m inside the same
+zone produces zero database activity, and the whole yellow->orange->red
+ladder is at most 1 insert plus 2 updates for an entire episode. Clips are
+already hard-capped at one per event by `should_trigger_clip`'s
+decide-and-commit gate plus a 30s global cooldown (CLAUDE.md decision 6,
+Phase 5). A fixed 3-5s batch would in fact be *worse* on both ends: it would
+still write during a long unchanging approach that currently writes nothing,
+and it would blur the exact moment of the red crossing - the one timestamp
+that matters - into an arbitrary time bucket. No change made; recorded
+because the question is a reasonable one that will recur, and the reasoning
+should not have to be reconstructed next time.
+
+## 2026-08-28 — Phase 6's top open item closed: the persistence fix
+re-verified live, and a correction to how it was verified
+
+Shaked ran a second live session (`run_started_at=2026-08-28T09:46:47`)
+specifically to re-check the `speak()` persistence fix from the entry
+above. The orchestrator's first attempt at checking it - "diff the
+`ALERT:` line count against the DB row count" - turned out to be the wrong
+test: the log had 10 `ALERT:` lines, the DB had 9 rows, and a raw
+mismatch would read as the bug recurring. It doesn't - it's exactly what
+`EventWriter.record()`'s insert-on-open/update-on-escalate design is
+supposed to produce once an event is voiced more than once before closing.
+
+**Correct verification, and the actual evidence:** queried
+`started_at`/`last_seen_at` per row rather than just counting rows. One
+row (person #4, hazard "object") has `started_at=09:47:56` and
+`last_seen_at=09:47:59` - three seconds apart, proving that row was
+inserted once (at YELLOW) and updated once (to ORANGE), i.e. the YELLOW
+and ORANGE `ALERT:` lines for person #4 correctly collapsed into a single
+row reflecting current state. Every other row's `started_at`/`last_seen_at`
+are identical (single insert, never escalated further). Full accounting:
+5 new-object inserts + person #1 YELLOW (insert) + person #1 ORANGE
+(insert, as a **separate** event - see below) + person #3 ORANGE (insert)
++ person #4's insert-then-update = 9 rows, 10 record() calls, matching all
+10 `ALERT:` lines with nothing missing. **The fix holds** - this closes the
+single highest-priority open item from `docs/phase-writeups/phase-6.md`.
+
+**A correction to the verification method itself, for the record**: "count
+ALERT lines vs. count DB rows" is not the right test once an event can be
+voiced across more than one zone crossing before closing - the right test
+is "does every voiced signal's underlying event appear in the DB, either
+as its own row or folded into an update of an already-open one." Anyone
+re-running this check in the future should use the started_at/last_seen_at
+comparison above, not a bare count.
+
+**Not a new bug, flagged as a loose thread**: person #1's YELLOW (09:47:46)
+and ORANGE (09:47:48) landed as two *separate* event rows (session-local
+ids 6 and 9), 2 seconds apart - right at the `ALERT_HOLD_SECONDS = 2.0`
+boundary, meaning the (person, hazard) pair most likely dropped out of a
+scored zone for a moment and the event genuinely closed and reopened. This
+is plausibly an ordinary real-world blip and plausibly connected to the
+already-flagged `PersonTracker` ID churn - not distinguishable from this
+log alone, not claimed as a new finding, left for whoever picks up the
+churn issue.
+
+### 2026-08-28 — Phase 6 reviewed and closed (docs-agent audit)
+
+`PHASE_PLAN.md`'s Phase 6 status set to `[x]`. Full reasoning in
+`docs/phase-writeups/phase-6.md`; summary here, not a substitute for it.
+
+- **Schema, `EventWriter`'s insert/update dedup, timestamp handling
+  (fresh wall-clock reads, never a converted `time.monotonic()` value), and
+  the sweep's real file I/O were all read directly against the three Phase 6
+  decision-log entries above and matched**, including hand-tracing
+  `EventWriter.record()` and `sweep_expired_clips()` against their own tests'
+  actual assertions, not just confirming the functions exist.
+- **The `speak()` fix for the persistence-drop bug was independently traced,
+  not taken on the log's word.** Confirmed: `speak()` is now the single
+  choke point for both voicing and persisting an alert; its two call sites
+  (`handle_alert_signal()`, and the main loop's `AlertArbiter.poll()`
+  release) are mutually exclusive per signal, so no double-record path
+  exists; and even a hypothetical duplicate call would be masked as a
+  harmless idempotent `UPDATE` by `EventWriter.record()`'s own
+  insert-vs-update branching rather than surfaced - a real, if narrow, blind
+  spot worth naming on its own. **The fix itself remains code-verified, not
+  live-re-verified** - nobody has re-run the camera and diffed `ALERT:` line
+  count against DB row count a second time. This is named as the single
+  most important open item from this phase, ahead of everything below,
+  because it's a path that was tried, found broken, and patched - not a path
+  that simply hasn't been tried yet (the shape of Phase 4's and Phase 5's
+  named gaps).
+- **A self-correction claim was checked, not trusted, and found
+  incomplete.** The entry immediately above states the 2026-08-26→2026-08-28
+  date-typo fix "landed everywhere" (`backend/db.py`, `backend/persistence.py`,
+  `backend/API.md`, `cv/risk_engine.py`). A repo-wide grep found
+  `backend/API.md` line 6 still read 2026-08-26 at review time. Fixed
+  directly during this audit (mechanical, no judgment call) rather than only
+  flagged - but the miss itself is the finding: a log entry asserting "I
+  checked everywhere and fixed it" is a claim like any other, and this is a
+  concrete instance of that claim being wrong by one file. Filed in
+  `docs/agent-workflow-notes.md` as its own multi-agent-process entry.
+- **`PersonTracker` ID churn graduated from a suspected cause (Phase 5,
+  based on one unverified log) to confirmed against real persisted rows**:
+  three DB rows this session, same hazard, three different `person_id`s,
+  almost certainly one continuous approach. Not Phase 6's mechanism to fix
+  (it's cv-agent's Layer B), but flagged as a precondition for Phase 8's
+  event-history view specifically, since it now corrupts exactly the data
+  that view will display.
+- **The missing `ended_at` column is honestly documented in the three files
+  most likely to be read first** (`db.py`, `persistence.py`, `API.md`) but
+  its specific Phase 8 consequence - a parent can be told approximately when
+  an event stopped (`last_seen_at` + `ALERT_HOLD_SECONDS`), never precisely
+  - doesn't appear to have been weighed against what Phase 8's UI actually
+  needs to show. Not a blocker for Phase 6; worth a short explicit
+  conversation before Phase 8's event-log view is designed around this
+  schema.
+- **The "no unit test for the wiring bug" reasoning was assessed as correct
+  but incomplete**, not simply accepted or simply rejected: duplicating
+  `main()`'s exact call sequence in a test genuinely wouldn't catch a future
+  drift, but an invariant-level test (every signal reaching `speak()` also
+  reaches `record()`, exercised with the real `AlertArbiter`/`EventWriter`
+  classes rather than `main()`'s closures) is possible and doesn't exist.
+  The named Phase 7 plan (extract `main()`'s alert wiring into an injectable
+  object) is judged a credible plan rather than deferral-in-name-only,
+  because Phase 7 needs that same extraction independently of this bug (to
+  drive these paths from FastAPI instead of a frame loop) - but it remains a
+  plan, not yet a fact, and worth re-checking specifically at Phase 7 close.
+- **Phase 5's audibility gap is now closed on the record**: Shaked confirmed
+  hearing `hazard_detected.wav` during this session ("yes i did heard it
+  works"). `PHASE_PLAN.md`'s Phase 5 section amended in place (not
+  rewritten) to note this; Phase 5's own `[x]` and history are untouched.

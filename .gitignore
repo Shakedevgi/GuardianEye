@@ -56,6 +56,15 @@ cv/**/*.png
 cv/**/*.mp4
 cv/**/*.mov
 
+# Phase 6: SQLite event/clip-metadata DB (backend/guardianeye.db) - runtime
+# data from a real home, not source, same reasoning as cv/captures/ and
+# cv/clips/ above (CLAUDE.md decision 8: no cloud, ever, for this data - and
+# by extension, no committing it to a shared repo either).
+backend/*.db
+backend/*.db-journal
+backend/*.db-wal
+backend/*.db-shm
+
 # Public dataset pulls (e.g. Open Images) for Phase 3 fine-tuning - large
 # (hundreds of MB of third-party images), regeneratable from the URLs
 # documented in data/openimages_public/README.md, and deliberately kept out

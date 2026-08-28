@@ -140,6 +140,7 @@ import argparse
 import math
 import os
 import subprocess
+import sys
 import threading
 import time
 from collections import defaultdict, deque
@@ -150,6 +151,23 @@ from dataclasses import dataclass, field
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import cv2
+
+# Phase 6: backend/ is a sibling of cv/, not a subpackage of it (see
+# docs/decision-log.md, 2026-08-28 Phase 6 kickoff - backend-agent owns
+# "SQLite schema and queries" as its own domain). Added to sys.path
+# explicitly (rather than relying on CWD, which changes depending on
+# whether this script is launched from cv/ or the repo root) so `import
+# persistence` below resolves regardless of launch directory, matching this
+# file's own flat-module imports (camera, detect_stream, etc.) rather than a
+# package-relative import.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
+from persistence import (  # noqa: E402
+    EventWriter,
+    insert_pending_clip,
+    sweep_expired_clips,
+    update_clip_write_result,
+)
+from db import DEFAULT_DB_PATH, init_db  # noqa: E402
 
 from camera import (
     DEFAULT_CAMERA_INDEX,
@@ -488,6 +506,16 @@ DEFAULT_CLIPS_DIR = "clips/pending"
 # shown to the parent to keep/discard; the keep/discard mechanism itself and
 # the auto-delete-if-undecided timeout are explicitly Phase 6's job, not
 # this one.
+
+# Phase 6: how often main()'s loop calls sweep_expired_clips() (see
+# backend/persistence.py - CLIP_PENDING_TIMEOUT_HOURS, 24h, is the actual
+# auto-delete threshold; this is just the polling cadence for checking it).
+# A coarse, once-a-minute cadence, reusing the same "wall-clock interval
+# tracked against time.monotonic()" idiom already used for
+# --scan-interval/--socket-scan-interval above, for consistency rather than
+# inventing a different periodic-task pattern in the same loop. Sweeping a
+# 24h timeout doesn't need finer granularity than this.
+DEFAULT_SWEEP_INTERVAL_SECONDS = 60.0
 
 DEFAULT_AUDIO_DIR = "audio"
 # Pre-recorded voice clips, per CLAUDE.md decision 4 ("pre-recorded audio
@@ -1444,11 +1472,22 @@ class ClipRecorder:
     it stays testable without spawning real threads.
     """
 
-    def __init__(self, output_dir: str, fps: float, tail_seconds: float = CLIP_TAIL_SECONDS):
+    def __init__(
+        self, output_dir: str, fps: float, tail_seconds: float = CLIP_TAIL_SECONDS,
+        on_write_complete=None,
+    ):
         self._output_dir = output_dir
         self._fps = fps
         self._tail_seconds = tail_seconds
         self._pending: list[dict] = []
+        # Phase 6 (backend-agent): optional hook, called as
+        # on_write_complete(path, event, success, frame_count) once a
+        # background write actually finishes - NOT called on the main frame
+        # loop thread, see write_clip()'s on_complete parameter and
+        # backend/persistence.py's module docstring for the threading note
+        # this exists to satisfy. Trigger/tail timing above is unchanged;
+        # this is purely additive bookkeeping.
+        self._on_write_complete = on_write_complete
         os.makedirs(output_dir, exist_ok=True)
 
     def trigger(self, buffer_snapshot: list, event: AlertEvent, now: float) -> None:
@@ -1468,19 +1507,22 @@ class ClipRecorder:
             if timestamp <= record["deadline"]:
                 record["frames"].append((timestamp, encoded_jpeg))
 
-    def poll(self, now: float) -> list[str]:
+    def poll(self, now: float) -> list[tuple[str, AlertEvent]]:
         """Call once per frame. Finalizes (spawns a background write thread
         for) any pending recording whose tail window has elapsed. Returns
-        the destination paths of clips just started this call - the path is
+        (path, event) pairs for clips just started this call - the path is
         known immediately even though the file itself is written
-        asynchronously.
+        asynchronously; `event` is the triggering AlertEvent (Phase 6:
+        callers use it to link a persisted clip row to its event - see
+        backend/persistence.py's insert_pending_clip).
         """
         ready = [r for r in self._pending if now >= r["deadline"]]
         self._pending = [r for r in self._pending if now < r["deadline"]]
-        paths = []
+        results = []
         for record in ready:
-            paths.append(self._start_write(record))
-        return paths
+            path = self._start_write(record)
+            results.append((path, record["event"]))
+        return results
 
     def _start_write(self, record: dict) -> str:
         event = record["event"]
@@ -1488,12 +1530,20 @@ class ClipRecorder:
         filename = f"{timestamp}_event{event.id}_{event.hazard_label}.mp4"
         path = os.path.join(self._output_dir, filename)
         jpeg_frames = [buf for _, buf in record["frames"]]
-        thread = threading.Thread(target=write_clip, args=(path, jpeg_frames, self._fps), daemon=True)
+
+        def _completion(success: bool, frame_count: int) -> None:
+            if self._on_write_complete is not None:
+                self._on_write_complete(path, event, success, frame_count)
+
+        thread = threading.Thread(
+            target=write_clip, args=(path, jpeg_frames, self._fps),
+            kwargs={"on_complete": _completion}, daemon=True,
+        )
         thread.start()
         return path
 
 
-def write_clip(path: str, jpeg_frames: list, fps: float) -> bool:
+def write_clip(path: str, jpeg_frames: list, fps: float, on_complete=None) -> bool:
     """Decode a list of JPEG-encoded frames and write them out as one mp4.
     A module-level function (not a ClipRecorder method) specifically so it
     can be called directly and synchronously in a test - ClipRecorder always
@@ -1504,13 +1554,26 @@ def write_clip(path: str, jpeg_frames: list, fps: float) -> bool:
     CLIP_FOURCC_FALLBACK (mp4v) if the platform's OpenCV build can't open an
     avc1 writer - see CLIP_FOURCC_PRIMARY's comment for the measured
     size/cost tradeoff. Returns True if a clip was actually written.
+
+    `on_complete`, if given, is called exactly once, on every exit path
+    (including every failure path below), as `on_complete(success:
+    bool, frame_count: int)` - Phase 6 (backend-agent) uses this to record
+    write_status/frame_count once the write actually finishes, from
+    whichever thread this function happens to run on (ClipRecorder always
+    calls it on a background thread; direct/synchronous test calls get the
+    callback invoked synchronously instead). frame_count is 0 for every
+    failure path, `written` on success.
     """
     if not jpeg_frames:
         print(f"Warning: no frames to write for {path} - skipping.")
+        if on_complete is not None:
+            on_complete(False, 0)
         return False
     first = cv2.imdecode(jpeg_frames[0], cv2.IMREAD_COLOR)
     if first is None:
         print(f"Warning: could not decode first frame for {path} - skipping.")
+        if on_complete is not None:
+            on_complete(False, 0)
         return False
     height, width = first.shape[:2]
     writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*CLIP_FOURCC_PRIMARY), fps, (width, height))
@@ -1518,6 +1581,8 @@ def write_clip(path: str, jpeg_frames: list, fps: float) -> bool:
         writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*CLIP_FOURCC_FALLBACK), fps, (width, height))
     if not writer.isOpened():
         print(f"Warning: VideoWriter failed to open for {path} (tried {CLIP_FOURCC_PRIMARY} and {CLIP_FOURCC_FALLBACK}).")
+        if on_complete is not None:
+            on_complete(False, 0)
         return False
     written = 0
     for buf in jpeg_frames:
@@ -1527,6 +1592,8 @@ def write_clip(path: str, jpeg_frames: list, fps: float) -> bool:
             written += 1
     writer.release()
     print(f"Clip saved: {path} ({written}/{len(jpeg_frames)} frames)")
+    if on_complete is not None:
+        on_complete(True, written)
     return True
 
 
@@ -1772,6 +1839,19 @@ def main() -> None:
         "--disable-audio", dest="audio_enabled", action="store_false", default=True,
         help="Turn off voice-clip playback entirely (visual alerts and clip-saving still run).",
     )
+    parser.add_argument(
+        "--db-path", type=str, default=DEFAULT_DB_PATH,
+        help=f"Phase 6: SQLite DB path for event/clip persistence (default: {DEFAULT_DB_PATH}).",
+    )
+    parser.add_argument(
+        "--disable-persistence", dest="persistence_enabled", action="store_false", default=True,
+        help="Turn off Phase 6 event/clip persistence entirely (no DB writes, no auto-delete sweep) - "
+        "for isolating the persistence layer during debugging.",
+    )
+    parser.add_argument(
+        "--sweep-interval", type=float, default=DEFAULT_SWEEP_INTERVAL_SECONDS,
+        help=f"Wall-clock seconds between undecided-pending-clip auto-delete sweeps (default: {DEFAULT_SWEEP_INTERVAL_SECONDS}).",
+    )
     args = parser.parse_args()
 
     socket_prompts = [p.strip() for p in args.socket_prompts.split(",") if p.strip()]
@@ -1847,6 +1927,27 @@ def main() -> None:
     person_tracker = PersonTracker()
     rolling_windows: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=ROLLING_WINDOW_SIZE))
 
+    # Phase 6 (backend-agent): event/clip persistence - see
+    # backend/persistence.py's module docstring and
+    # docs/decision-log.md's 2026-08-28 "Phase 6 kickoff" entry. Off by
+    # default is False (persistence is on unless explicitly disabled) so a
+    # normal run always gets a demoable event log without extra flags.
+    event_writer = EventWriter(args.db_path) if args.persistence_enabled else None
+    if args.persistence_enabled:
+        init_db(args.db_path)
+        print(f"Persistence enabled - DB: {args.db_path} (run_started_at={event_writer.run_started_at})")
+    else:
+        print("Persistence disabled (--disable-persistence) - no DB writes, no auto-delete sweep.")
+    last_sweep_time = time.monotonic()
+
+    def on_clip_write_complete(path: str, event: "AlertEvent", success: bool, frame_count: int) -> None:
+        # Runs on ClipRecorder's background write thread, not the main loop
+        # thread - update_clip_write_result() opens its own connection (see
+        # backend/persistence.py's threading note), so this is safe to call
+        # from here.
+        if args.persistence_enabled:
+            update_clip_write_result(path, success, frame_count, db_path=args.db_path)
+
     last_socket_scan_time = time.monotonic() - args.socket_scan_interval
     last_room_scan_time = time.monotonic() - args.scan_interval
     room_scan_index = 0
@@ -1875,13 +1976,28 @@ def main() -> None:
     alert_arbiter = AlertArbiter()
     audio_player = AudioPlayer(args.audio_dir) if args.audio_enabled else None
     rolling_buffer = RollingBuffer(fps=DEFAULT_TARGET_FPS)
-    clip_recorder = ClipRecorder(args.clips_dir, fps=DEFAULT_TARGET_FPS)
+    clip_recorder = ClipRecorder(args.clips_dir, fps=DEFAULT_TARGET_FPS, on_write_complete=on_clip_write_complete)
 
     def speak(signal: AlertSignal) -> None:
         audio_name = audio_for_signal(signal)
         if audio_name is not None and audio_player is not None:
             audio_player.play(audio_name)
         raise_alert(banner_text_for_signal(signal))
+        # Phase 6: persistence lives HERE, inside speak(), and deliberately
+        # not at speak()'s call sites - decision 3 (docs/decision-log.md,
+        # 2026-08-28 "Phase 6 kickoff") is "persist exactly what the parent
+        # was actually told," and speak() IS the thing that tells them. Two
+        # separate call sites reach it: AlertArbiter.offer() returning a
+        # winner (handle_alert_signal below) and AlertArbiter.poll()
+        # releasing a signal that was held back by the pacing window (the
+        # main loop). The original Phase 6 wiring recorded only at the
+        # first, so every held-then-released alert was voiced and bannered
+        # to the parent but never persisted - confirmed against real live
+        # data on 2026-08-28, roughly half the session's alerts missing.
+        # Putting the write inside speak() makes the invariant structural
+        # rather than something each new call site has to remember.
+        if args.persistence_enabled:
+            event_writer.record(signal)
 
     def handle_alert_signal(signal: AlertSignal, now: float) -> None:
         if signal.kind == "closed":
@@ -1975,6 +2091,21 @@ def main() -> None:
                             first_scan_done = True
                         last_room_scan_time = now
 
+                # Phase 6 (backend-agent): coarse-cadence auto-delete sweep
+                # for undecided-pending clips older than
+                # CLIP_PENDING_TIMEOUT_HOURS (backend/persistence.py) - same
+                # "track a wall-clock interval against time.monotonic()"
+                # idiom as --scan-interval/--socket-scan-interval above, not
+                # a new pattern. Not latency-critical (Layer A-adjacent
+                # housekeeping, not Layer B), so it runs inline rather than
+                # on its own thread - sweep_expired_clips is a handful of
+                # DB rows at most per call at this write volume.
+                if args.persistence_enabled and now - last_sweep_time >= args.sweep_interval:
+                    swept = sweep_expired_clips(db_path=args.db_path)
+                    if swept:
+                        print(f"Auto-delete sweep: expired {swept} undecided pending clip(s).")
+                    last_sweep_time = now
+
                 live_persons = person_tracker.update(person_boxes, frame_diagonal)
 
                 live_person_ids = {p.id for p in live_persons}
@@ -2006,8 +2137,26 @@ def main() -> None:
                 encoded = rolling_buffer.append(annotated, now)
                 if encoded is not None:
                     clip_recorder.add_tail_frame(encoded, now)
-                for path in clip_recorder.poll(now):
+                for path, clip_event in clip_recorder.poll(now):
                     print(f"Clip write started: {path}")
+                    if args.persistence_enabled:
+                        db_event_id = event_writer.db_id_for(clip_event.id)
+                        if db_event_id is not None:
+                            insert_pending_clip(db_event_id, path, clip_event.hazard_label, db_path=args.db_path)
+                        else:
+                            # Should not happen in practice: should_trigger_clip
+                            # only fires for PROXIMITY events at peak_zone=='red',
+                            # and RED signals bypass AlertArbiter's pacing
+                            # entirely (see alert_priority/AlertArbiter.offer), so
+                            # the triggering event is always voiced - and
+                            # therefore persisted - on the very same frame the
+                            # clip is triggered, before poll() ever returns this
+                            # path. Guarded rather than crashing, since
+                            # clips.event_id is NOT NULL.
+                            print(
+                                f"Warning: clip {path} triggered by event #{clip_event.id} which has no "
+                                "persisted row - skipping clip DB insert."
+                            )
                 held = alert_arbiter.poll(now)
                 if held is not None:
                     speak(held)

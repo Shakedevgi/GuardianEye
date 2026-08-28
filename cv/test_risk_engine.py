@@ -36,6 +36,7 @@ Exits non-zero (via AssertionError propagating) on first failure, prints
 import math
 import os
 import tempfile
+import threading
 from collections import defaultdict, deque
 
 import cv2
@@ -1177,10 +1178,46 @@ def test_clip_recorder_poll_only_finalizes_after_deadline():
         assert ok
         recorder.trigger(buffer_snapshot=[(0.0, jpeg)], event=event, now=0.0)
         assert recorder.poll(now=1.0) == []  # tail not elapsed yet
-        paths = recorder.poll(now=2.1)  # tail elapsed - spawns a write thread
-        assert len(paths) == 1
-        assert paths[0].endswith("_event1_object.mp4")
+        results = recorder.poll(now=2.1)  # tail elapsed - spawns a write thread
+        assert len(results) == 1
+        path, returned_event = results[0]
+        assert path.endswith("_event1_object.mp4")
+        assert returned_event is event  # Phase 6: poll() now returns (path, event) pairs
         assert recorder._pending == []
+
+
+def test_clip_recorder_poll_calls_on_write_complete_with_path_and_event():
+    # Phase 6 (backend-agent): ClipRecorder's optional on_write_complete hook
+    # fires once write_clip() actually finishes, with (path, event, success,
+    # frame_count) - real thread, real file, matching this suite's no-mocking
+    # style (like test_write_clip_produces_a_real_playable_file below).
+    with tempfile.TemporaryDirectory() as tmp:
+        calls = []
+        recorder = re.ClipRecorder(
+            tmp, fps=10.0, tail_seconds=2.0,
+            on_write_complete=lambda path, event, success, frame_count: calls.append(
+                (path, event, success, frame_count)
+            ),
+        )
+        event = re.AlertEvent(
+            id=7, kind=re.ALERT_KIND_PROXIMITY, person_id=1, hazard_id=1, hazard_label="object",
+            hazard_bbox=(0, 0, 10, 10), zone="red", peak_zone="red", started_at=0.0, last_seen_at=0.0,
+        )
+        ok, jpeg = cv2.imencode(".jpg", _tiny_frame())
+        assert ok
+        recorder.trigger(buffer_snapshot=[(0.0, jpeg)], event=event, now=0.0)
+        results = recorder.poll(now=2.1)
+        path, _ = results[0]
+        thread_list = threading.enumerate()
+        for t in thread_list:
+            if t.name != threading.main_thread().name:
+                t.join(timeout=5.0)
+        assert len(calls) == 1
+        called_path, called_event, success, frame_count = calls[0]
+        assert called_path == path
+        assert called_event is event
+        assert success is True
+        assert frame_count == 1
 
 
 def test_write_clip_produces_a_real_playable_file():
@@ -1206,6 +1243,40 @@ def test_write_clip_returns_false_for_empty_frame_list():
         path = os.path.join(tmp, "clip.mp4")
         assert re.write_clip(path, [], fps=10.0) is False
         assert not os.path.isfile(path)
+
+
+def test_write_clip_still_works_with_no_on_complete_argument():
+    # Phase 6 added an optional on_complete parameter - must remain callable
+    # exactly as before with no callback (existing callers/tests do this).
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "clip.mp4")
+        ok, jpeg = cv2.imencode(".jpg", _tiny_frame())
+        assert ok
+        assert re.write_clip(path, [jpeg], fps=10.0) is True
+        assert os.path.isfile(path)
+
+
+def test_write_clip_calls_on_complete_with_success_and_frame_count():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "clip.mp4")
+        frames = []
+        for color in ((10, 10, 10), (200, 200, 200), (50, 100, 150)):
+            ok, jpeg = cv2.imencode(".jpg", _tiny_frame(color))
+            assert ok
+            frames.append(jpeg)
+        calls = []
+        result = re.write_clip(path, frames, fps=10.0, on_complete=lambda success, count: calls.append((success, count)))
+        assert result is True
+        assert calls == [(True, 3)]
+
+
+def test_write_clip_calls_on_complete_on_failure_paths_too():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "clip.mp4")
+        calls = []
+        result = re.write_clip(path, [], fps=10.0, on_complete=lambda success, count: calls.append((success, count)))
+        assert result is False
+        assert calls == [(False, 0)]
 
 
 # --- Phase 5: AudioPlayer (pure missing-file logic only - see module docstring) --
