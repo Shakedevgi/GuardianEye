@@ -2185,3 +2185,165 @@ churn issue.
   hearing `hazard_detected.wav` during this session ("yes i did heard it
   works"). `PHASE_PLAN.md`'s Phase 5 section amended in place (not
   rewritten) to note this; Phase 5's own `[x]` and history are untouched.
+
+### 2026-08-28 — Phase 7 kickoff: the concurrency model is the phase, and it
+is the reverse of the obvious one (Shaked approved all seven)
+
+Phase 7 (FastAPI serving layer) opened by reading Phases 4-6 back rather than
+adding routes. The finding that shaped everything: `main()` is a
+single-threaded blocking loop that owns the camera, both YOLO models,
+`hazard_map`, `review_queue`, the annotated frame, and a `cv2.imshow` window
+driven by a blocking `cv2.waitKey()`. ASGI needs to serve HTTP concurrently
+with that. There is no "just add routes" version of this phase — the
+concurrency model IS the design problem, the same way `AlertEvent.id`
+collision was the design problem at the start of Phase 6.
+
+**1. The camera loop keeps the MAIN thread; uvicorn runs on a background
+daemon thread. This was measured, not assumed, and it inverts the obvious
+arrangement.** The natural proposal — camera loop to a background thread,
+uvicorn on main — was tested before being built on:
+
+```
+cv2.error: Unknown C++ exception from OpenCV code
+```
+
+`cv2.imshow` from a non-main thread fails on this machine. OpenCV's macOS
+highgui is Cocoa-backed and Cocoa windows must be created on the main thread.
+Moving the loop off main would therefore have killed the local debug window —
+which CLAUDE.md decision 1 explicitly protects ("this does not constrain the
+local OpenCV debug window"). Ten seconds of measurement replaced an assumption
+that would have been discovered as a crash halfway through the phase, and it
+also dissolved the second trap raised at kickoff: because the loop stays on
+main, the `h`/`n`/`s` keys and the debug window keep working exactly as they
+do today, unchanged, alongside the server.
+
+State crosses the thread boundary two ways, and HTTP handlers never touch
+`HazardMap`/`ReviewQueue`/`PersonTracker`/`AlertManager` directly:
+- **Reads**: a `SharedState` guarded by one `threading.Condition`. The loop
+  publishes `(jpeg, status_dict, frame_seq)` once per frame — rebind two
+  references, bump a counter, `notify_all`, release. The dict is built fresh
+  each frame and never mutated after publish, so readers grab a reference
+  under the lock and serialize outside it. No torn reads, no lock held across
+  I/O, and the loop never blocks on HTTP.
+- **Writes**: a lock-protected command queue the loop drains once per frame,
+  right beside the existing `waitKey` handlers, calling the same functions
+  those keys call.
+
+**Why writes go through a queue rather than the HTTP thread calling
+`HazardMap` directly** — this is load-bearing, not stylistic:
+`hazard_map.dismiss(entry_id, frame)` *requires the current camera frame* to
+compute its dismissal fingerprint (`cv/risk_engine.py:846`), and only the loop
+thread has one. A dismiss from the HTTP thread would silently skip the
+fingerprint and break the "spot changed since dismissal" re-raise rule —
+exactly the rule Phase 5 spent two failed debugging rounds getting right
+(2026-08-26 follow-ups #2 and #3). The queue also keeps exactly one writer to
+Layer A/B state, which is the simplest model that is actually correct.
+
+**2. `/video_feed` serves the JPEG the rolling buffer already encoded.**
+`rolling_buffer.append(annotated, now)` (`risk_engine.py:2137`) already returns
+the encoded clean annotated frame, and MJPEG is by definition a stream of
+JPEGs. Publishing that same object costs zero additional encode (~2.7ms/frame
+already spent, measured at `ROLLING_BUFFER_JPEG_QUALITY`) and — more
+importantly — makes **CLAUDE.md decision 1 structurally enforced rather than a
+matter of discipline**. The served bytes are literally the same object the
+rolling buffer stores, captured above the diagnostics line, so a future
+diagnostic overlay physically cannot leak into the stream without also
+corrupting saved clips, where it would be caught immediately. This is the
+payoff of the capture point cv-agent placed one phase early, on purpose.
+
+**3. `/risk_status`'s shape — smaller new work than kickoff assumed, and worth
+correcting.** The kickoff brief stated none of this is assembled into a dict
+anywhere. Half of it already is: `score_frame()` returns `frame_risk` with
+`zone`/`value`/`person_id`/`hazard_label`/`hazard_id`/`hazard_bbox`, and its
+docstring (`risk_engine.py:1109`) already names `/risk_status` as its
+consumer. What genuinely does not exist is everything around it — FPS, model/
+`imgsz`/`conf`/`device`, hazard-map counts (computed inline inside
+`draw_risk_readout` and thrown straight at pixels), review-queue state, and
+the person list. Assembled by a new `build_risk_status()` in
+`risk_engine.py` — it lives cv-side because it reads `HazardEntry`/
+`PersonEntry`, keeping `backend/server.py` a pure serving layer that knows
+nothing about them. `hazard_counts` is factored out and shared with
+`draw_risk_readout` rather than copied, so the pixel readout and the JSON
+cannot drift apart.
+
+**4. Hazard-review endpoints ARE in Phase 7, expanding `PHASE_PLAN.md`'s
+literal goal line.** Phase 4's close named the keyboard `h`/`n`/`s` loop "a
+developer stand-in... explicitly Phase 8's job" to become a real interaction —
+and Phase 8 cannot build that against nothing. Shipping Phase 7 without it
+means Phase 8's first act is reopening Phase 7. Marginal cost is near zero:
+the command queue has to exist for decision 1 regardless, so this is three
+routes on infrastructure already being built. `PHASE_PLAN.md`'s Phase 7
+section amended in place to record the expanded scope.
+
+**5. `/clips` serves video bytes, on a separate route.** `/clips` itself stays
+metadata-only JSON; `GET /clips/{id}/video` returns the file. This is not
+scope creep — clips are *already* written as `avc1`/H.264 specifically for
+this, and `risk_engine.py:497` says so in as many words ("avc1 is chosen ...
+because Phase 7/8 will want these playable in a browser"). The alternative is
+Phase 8 reading the local filesystem directly, which breaks decision 1's
+"Flet is a client of FastAPI." The path comes only from the DB row, never from
+the client, and is `realpath`-verified to sit under the clips directory before
+being served — a client-supplied path here would be a plain directory-traversal
+read of the whole disk.
+
+**6. Dependencies pinned in a new `backend/requirements.txt`**, installed into
+the same shared `.venv` (one virtualenv for the project, not one per
+component). `fastapi==0.141.1`, `uvicorn==0.52.4`, `starlette==1.6.0`,
+`pydantic==2.13.4`, `httpx==0.28.1`. Pinned exactly, matching
+`cv/requirements.txt`'s stated policy for fast-moving stacks — `/video_feed`'s
+correctness rests on one specific documented Starlette behaviour (a *sync*
+generator passed to `StreamingResponse` is iterated in a threadpool, so
+blocking inside it does not stall the event loop; an `async def` generator that
+blocked would freeze every other endpoint in the process), which is exactly the
+kind of load-bearing assumption that should not silently ride an auto-upgrade.
+Deliberately plain `uvicorn`, **not** `uvicorn[standard]` — the extra pulls
+uvloop/httptools/watchfiles/websockets/PyYAML and this server needs none of
+them; fewer moving parts matters more than marginal throughput on a machine
+already carrying a delicate torch/MPS stack. `httpx` is a test-only dependency
+(Starlette's `TestClient` transport) pinned explicitly rather than left
+transitive, so a clean-venv rebuild cannot produce a backend whose test suite
+silently cannot run. Verified additive: both suites still pass 93/16 after the
+install, torch and ultralytics untouched.
+
+**7. The server binds `127.0.0.1` by default, and this is a privacy decision
+rather than a default (Shaked).** Offered three options — localhost-only, LAN
+with no auth, or LAN plus a shared token. Shaked chose localhost-only. The feed
+is live video of a room with a child in it plus every saved clip, with no
+authentication; binding `0.0.0.0` would expose that to every device on the WiFi
+including guests and anything compromised, which sits badly against CLAUDE.md
+decision 8's stance that privacy here is "a requirement, not just a convenience
+choice." A `--host` flag exists to opt into the LAN. **Phase 8 must decide
+authentication before it is used**, since Phase 8's own done-when ("reachable
+from a tablet/phone browser on the same WiFi") requires LAN binding — recorded
+here so that decision is made deliberately rather than by someone reaching for
+the flag mid-demo.
+
+**One thing deliberately NOT done, and one open question it leaves.** Phase 6's
+write-up and decision log both recorded "extract `main()`'s alert wiring into
+an injectable object" as Phase 7's job, the remedy for the bug that ate half of
+Phase 6's alerts. Having read `main()`: **Phase 7 does not actually need it.**
+What Phase 7 needs is small and additive (publish a snapshot, drain a queue);
+the alert-wiring extraction is a separate refactor of the exact three closures
+that just received a live-verified bug fix. Shaked's call: do it, but as its own
+step *after* `/video_feed` is live-verified, so a failure tells you which change
+caused it rather than nothing. Recorded explicitly because two documents carry
+it as a Phase 7 commitment and letting that quietly lapse is precisely the drift
+docs-agent flagged at Phase 6's close.
+
+**Proposed CLAUDE.md amendment, NOT yet made, awaiting Shaked/Yahli.**
+Decision 1 names the JSON API as "(`/events`, `/risk_status`, `/clips`)".
+Phase 7 also serves `/review` (+ confirm/dismiss/skip) and `/health`. Following
+the same precedent as the 2026-08-22 diagnostics entry, this is logged as a
+proposal rather than edited into CLAUDE.md unilaterally. Nothing in the
+implementation contradicts decision 1 — the addition is to its illustrative
+list, not to its rule.
+
+**Two carried-forward data-quality issues that `/events` now exposes to a
+client for the first time. Neither is fixed here, and neither is papered over.**
+There is no `ended_at` column (deliberate, Phase 6 decision 3) — `/events` will
+NOT synthesize one from `last_seen_at + ALERT_HOLD_SECONDS`, because that would
+be the serving layer inventing data and would quietly convert a deliberate
+decision into a fake column. And `PersonTracker` ID churn means one continuous
+approach can surface as several rows with different `person_id`s. Both are
+documented at the route so whoever meets them in Phase 8 recognises them
+instead of filing a fresh Phase 7 bug.

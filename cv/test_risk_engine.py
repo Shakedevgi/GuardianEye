@@ -33,6 +33,7 @@ Exits non-zero (via AssertionError propagating) on first failure, prints
 "ALL TESTS PASSED" on success.
 """
 
+import json
 import math
 import os
 import tempfile
@@ -1287,6 +1288,230 @@ def test_audio_player_missing_file_does_not_raise_and_warns_once():
         player = re.AudioPlayer(tmp)
         player.play("does_not_exist.wav")  # must not raise
         assert "does_not_exist.wav" in player._warned
+
+
+# --- Phase 7: build_risk_status (/risk_status JSON payload) -----------------
+
+
+def _empty_status_kwargs():
+    """Shared base kwargs for build_risk_status - a fully empty session (no
+    persons tracked, no hazards proposed yet, nothing scored), matching what
+    a freshly-started run's very first --serve frame would produce.
+    """
+    return dict(
+        camera_index=0,
+        camera_name="Arducam",
+        width=1920,
+        height=1080,
+        frame_risk={
+            "zone": re.RISK_ZONE_NONE, "value": None, "person_id": None,
+            "hazard_label": None, "hazard_id": None, "hazard_bbox": None,
+        },
+        live_persons=[],
+        per_person={},
+        hazard_map=re.HazardMap(),
+        review_queue=re.ReviewQueue(),
+        alert_text=None,
+        alert_active=False,
+        smoothed_fps=None,
+        model_name="yolo26l.pt",
+        imgsz=640,
+        conf=0.35,
+        device="mps",
+        scan_enabled=True,
+        socket_detect_enabled=True,
+        persistence_enabled=True,
+    )
+
+
+def test_build_risk_status_empty_case():
+    status = re.build_risk_status(**_empty_status_kwargs())
+
+    assert status["camera"] == {"index": 0, "name": "Arducam", "width": 1920, "height": 1080}
+    assert status["risk"]["zone"] == re.RISK_ZONE_NONE
+    assert status["risk"]["hazard_bbox"] is None
+    assert status["persons"] == []
+    assert status["hazards"] == []
+    assert status["hazard_counts"] == {
+        "total": 0, "confirmed": 0, "pending_first_scan": 0, "pending_new": 0, "dismissed": 0,
+    }
+    assert status["review_queue"] == {"length": 0, "current_id": None, "queue": []}
+    assert status["alert"] == {"text": None, "active": False}
+    assert status["diagnostics"]["fps"] is None
+    assert status["diagnostics"]["model"] == "yolo26l.pt"
+    assert status["diagnostics"]["imgsz"] == 640
+    assert status["diagnostics"]["conf"] == 0.35
+    assert status["diagnostics"]["device"] == "mps"
+    assert status["diagnostics"]["scan_enabled"] is True
+    assert status["diagnostics"]["socket_detect_enabled"] is True
+    assert status["diagnostics"]["persistence_enabled"] is True
+    # A fresh wall-clock ISO8601 read, per persistence.now_iso() - not a
+    # time.monotonic() value (see build_risk_status's docstring).
+    assert "T" in status["timestamp"]
+
+
+def test_build_risk_status_populated_case():
+    hazard_map = re.HazardMap()
+    confirmed = hazard_map._new_entry("chair", (20.0, 0.0, 30.0, 10.0), re.HAZARD_ORIGIN_NAMED, is_first_scan=True, state=re.HAZARD_STATE_CONFIRMED)
+    pending_first = hazard_map._new_entry("object", (100.0, 100.0, 110.0, 110.0), re.HAZARD_ORIGIN_SCAN, is_first_scan=True)
+    pending_new = hazard_map._new_entry("object", (200.0, 200.0, 210.0, 210.0), re.HAZARD_ORIGIN_SCAN, is_first_scan=False)
+    dismissed = hazard_map._new_entry("object", (300.0, 300.0, 310.0, 310.0), re.HAZARD_ORIGIN_SCAN, is_first_scan=False, state=re.HAZARD_STATE_DISMISSED)
+
+    review_queue = re.ReviewQueue()
+    review_queue.enqueue(pending_new.id)
+
+    person = re.PersonEntry(id=1, bbox=(0.0, 0.0, 10.0, 10.0), last_seen=0.0)
+    per_person = {1: (confirmed, 0.05, "red")}
+    frame_risk = {
+        "zone": "red", "value": 0.05, "person_id": 1, "hazard_label": "chair",
+        "hazard_id": confirmed.id, "hazard_bbox": confirmed.bbox,
+    }
+
+    kwargs = _empty_status_kwargs()
+    kwargs.update(
+        hazard_map=hazard_map,
+        review_queue=review_queue,
+        live_persons=[person],
+        per_person=per_person,
+        frame_risk=frame_risk,
+        alert_text="RED - person #1 near chair",
+        alert_active=True,
+        smoothed_fps=14.756,
+    )
+    status = re.build_risk_status(**kwargs)
+
+    assert status["risk"]["zone"] == "red"
+    assert status["risk"]["value"] == 0.05
+    assert status["risk"]["person_id"] == 1
+    assert status["risk"]["hazard_id"] == confirmed.id
+    assert status["risk"]["hazard_bbox"] == [20.0, 0.0, 30.0, 10.0]
+
+    assert len(status["persons"]) == 1
+    p = status["persons"][0]
+    assert p["id"] == 1
+    assert p["bbox"] == [0.0, 0.0, 10.0, 10.0]
+    assert p["nearest_hazard_id"] == confirmed.id
+    assert p["distance"] == 0.05
+    assert p["zone"] == "red"
+
+    assert len(status["hazards"]) == 4
+    by_id = {h["id"]: h for h in status["hazards"]}
+    assert by_id[confirmed.id]["state"] == re.HAZARD_STATE_CONFIRMED
+    assert by_id[confirmed.id]["alerts_on_approach"] is True
+    assert by_id[pending_first.id]["state"] == re.HAZARD_STATE_PENDING
+    assert by_id[pending_first.id]["is_first_scan"] is True
+    assert by_id[pending_first.id]["alerts_on_approach"] is False
+    assert by_id[pending_new.id]["alerts_on_approach"] is True
+    assert by_id[dismissed.id]["state"] == re.HAZARD_STATE_DISMISSED
+    assert by_id[dismissed.id]["alerts_on_approach"] is False
+
+    assert status["hazard_counts"] == re.hazard_counts(hazard_map)
+    assert status["review_queue"] == {
+        "length": 1, "current_id": pending_new.id, "queue": [pending_new.id],
+    }
+    assert status["alert"] == {"text": "RED - person #1 near chair", "active": True}
+    assert status["diagnostics"]["fps"] == 14.756
+
+
+def test_build_risk_status_counts_match_draw_risk_readout_helper():
+    # hazard_counts() is the single shared implementation draw_risk_readout
+    # and build_risk_status both read from - this guards against the two
+    # representations of the same numbers drifting apart (Phase 7 brief's
+    # explicit ask).
+    hazard_map = re.HazardMap()
+    hazard_map._new_entry("chair", (0, 0, 1, 1), re.HAZARD_ORIGIN_NAMED, is_first_scan=True, state=re.HAZARD_STATE_CONFIRMED)
+    hazard_map._new_entry("object", (0, 0, 1, 1), re.HAZARD_ORIGIN_SCAN, is_first_scan=True)
+    hazard_map._new_entry("object", (0, 0, 1, 1), re.HAZARD_ORIGIN_SCAN, is_first_scan=False)
+    hazard_map._new_entry("object", (0, 0, 1, 1), re.HAZARD_ORIGIN_SCAN, is_first_scan=False, state=re.HAZARD_STATE_DISMISSED)
+
+    kwargs = _empty_status_kwargs()
+    kwargs.update(hazard_map=hazard_map)
+    status = re.build_risk_status(**kwargs)
+
+    assert status["hazard_counts"] == re.hazard_counts(hazard_map)
+    assert status["hazard_counts"] == {
+        "total": 4, "confirmed": 1, "pending_first_scan": 1, "pending_new": 1, "dismissed": 1,
+    }
+
+
+def test_build_risk_status_survives_json_dumps():
+    # The test that actually catches numpy leakage: a bbox built from real
+    # box.xyxy[0]-style numpy float32 scalars (exactly what main() reads off
+    # a YOLO Boxes object before its own `tuple(float(v) for v in ...)`
+    # conversion) must still come out the other side of build_risk_status as
+    # plain, json.dumps()-safe Python types - see _bbox_to_list's docstring.
+    np_box = tuple(np.float32(v) for v in (20.0, 0.0, 30.0, 10.0))
+
+    hazard_map = re.HazardMap()
+    hazard = hazard_map._new_entry("chair", np_box, re.HAZARD_ORIGIN_NAMED, is_first_scan=True, state=re.HAZARD_STATE_CONFIRMED)
+
+    person = re.PersonEntry(id=np.int64(1), bbox=tuple(np.float32(v) for v in (0.0, 0.0, 10.0, 10.0)), last_seen=0.0)
+    per_person = {1: (hazard, np.float64(0.12), "orange")}
+    frame_risk = {
+        "zone": "orange", "value": np.float64(0.12), "person_id": np.int64(1), "hazard_label": "chair",
+        "hazard_id": hazard.id, "hazard_bbox": np_box,
+    }
+
+    kwargs = _empty_status_kwargs()
+    kwargs.update(
+        hazard_map=hazard_map, live_persons=[person], per_person=per_person, frame_risk=frame_risk,
+        smoothed_fps=np.float32(14.8),
+    )
+    status = re.build_risk_status(**kwargs)
+
+    # json.dumps with NO custom encoder - this is what actually 500s at
+    # serialization time on the HTTP thread if a numpy scalar leaked through.
+    dumped = json.dumps(status)
+    assert isinstance(dumped, str)
+    reloaded = json.loads(dumped)
+    assert reloaded["persons"][0]["bbox"] == [0.0, 0.0, 10.0, 10.0]
+    assert reloaded["risk"]["hazard_bbox"] == [20.0, 0.0, 30.0, 10.0]
+
+
+def test_build_risk_status_queue_is_real_membership_not_pending_hazards():
+    """The published review queue must be ReviewQueue's ACTUAL FIFO
+    membership, never something a client could re-derive from `hazards`.
+
+    Regression test for a real defect found during Phase 7 review: /review
+    briefly derived its `queue` as "every hazard whose state is pending",
+    which is a different set. This test pins the two cases where they
+    diverge, both of which a parent-facing Phase 8 UI would render wrongly:
+
+      1. After skip_remaining(), the queue is empty while every one of those
+         entries is still PENDING - the derived version reported `length: 0`
+         next to a non-empty queue in the same payload, offering a parent
+         items that confirm/dismiss would refuse (the loop-side handlers
+         fail closed on anything that is not the current candidate).
+      2. The queue is FIFO; `hazards` is id-ordered. Enqueueing out of id
+         order must survive into the payload, or "next up" names the wrong
+         entry.
+    """
+    hazard_map = re.HazardMap()
+    a = hazard_map._new_entry("object", (0, 0, 1, 1), re.HAZARD_ORIGIN_SCAN, is_first_scan=False)
+    b = hazard_map._new_entry("object", (2, 2, 3, 3), re.HAZARD_ORIGIN_SCAN, is_first_scan=False)
+    c = hazard_map._new_entry("object", (4, 4, 5, 5), re.HAZARD_ORIGIN_SCAN, is_first_scan=False)
+
+    # Case 2 first: enqueue deliberately out of id order.
+    review_queue = re.ReviewQueue()
+    for entry in (c, a, b):
+        review_queue.enqueue(entry.id)
+
+    kwargs = _empty_status_kwargs()
+    kwargs["hazard_map"] = hazard_map
+    kwargs["review_queue"] = review_queue
+    status = re.build_risk_status(**kwargs)
+
+    assert status["review_queue"]["queue"] == [c.id, a.id, b.id], "FIFO order must survive"
+    assert status["review_queue"]["current_id"] == c.id
+    assert status["review_queue"]["length"] == 3
+
+    # Case 1: skip clears the queue but leaves all three entries PENDING.
+    review_queue.skip_remaining()
+    status = re.build_risk_status(**kwargs)
+
+    assert all(e.state == re.HAZARD_STATE_PENDING for e in hazard_map.entries)
+    assert status["hazard_counts"]["pending_new"] == 3
+    assert status["review_queue"] == {"length": 0, "current_id": None, "queue": []}
 
 
 def run_all():

@@ -291,9 +291,44 @@ blanket pass:
 **Owner:** backend-agent
 **Goal:** FastAPI exposing the MJPEG video stream + `/events`, `/risk_status`,
 `/clips` (with keep/discard actions).
+
+**Scope amended 2026-08-28 at kickoff, approved by Shaked (see
+`docs/decision-log.md`, "Phase 7 kickoff") — three additions to the goal line
+above, which is left in place rather than rewritten:**
+
+1. **Hazard-review endpoints are in scope** (`/review`, plus confirm/dismiss/
+   skip). Not in the original goal line, added deliberately: Phase 4's own
+   closure named the keyboard `h`/`n`/`s` loop "a developer stand-in...
+   explicitly Phase 8's job" to become a real parent interaction — and Phase 8
+   cannot build that against an API that doesn't exist. Shipping Phase 7
+   without it means Phase 8's first act is reopening Phase 7. The marginal cost
+   is near zero, because the command queue these routes use has to exist for
+   the concurrency model regardless.
+2. **`/clips/{id}/video` serves actual video bytes**, while `/clips` itself
+   stays metadata-only JSON. Clips are already encoded `avc1`/H.264
+   specifically for this (`cv/risk_engine.py:497` says so explicitly); the
+   alternative is Phase 8 reading the local filesystem directly, which would
+   break CLAUDE.md decision 1's "Flet is a client of FastAPI."
+3. **`/health`** — reports whether the camera loop is alive and how old the
+   last published frame is. Cheap, and the only way to tell "the stream is
+   black because the room is dark" from "the loop thread died."
+
+**The real work of this phase is the concurrency model, not the routes.**
+`main()` is a single-threaded blocking loop that owns the camera, both models,
+and a `cv2.imshow` window; ASGI must serve HTTP concurrently with it. Settled
+by measurement: the camera loop keeps the **main** thread (because `cv2.imshow`
+from a background thread throws on macOS — Cocoa requires the main thread, and
+CLAUDE.md decision 1 protects the debug window), and uvicorn runs on a
+background daemon thread. Full reasoning in the decision-log entry.
+
+**The server binds `127.0.0.1` by default — a privacy decision, not an
+oversight** (Shaked, chosen over LAN-with-no-auth and LAN-plus-token). Note the
+consequence for the phase below: **Phase 8's done-when requires LAN binding, so
+Phase 8 must decide authentication before it points `--host` at the network.**
+
 **Done when:** you can open the stream URL directly in a browser and see live
 annotated video, and hit the API endpoints and get correct JSON.
-`[ ]`
+`[~]` — in progress, opened 2026-08-28.
 
 ### Phase 8 — UI
 **Owner:** ui-agent

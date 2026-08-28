@@ -1,0 +1,49 @@
+# GuardianEye - backend component - dependencies
+#
+# Phase 7 (serving layer). Separate from cv/requirements.txt because Phase 6
+# established backend/ as its own domain, but installed into the SAME shared
+# .venv at the repo root - there is one virtualenv for this project, not one
+# per component:
+#
+#     .venv/bin/python3 -m pip install -r cv/requirements.txt -r backend/requirements.txt
+#
+# Phase 6 (SQLite persistence) added no dependencies at all - sqlite3 is in
+# the Python standard library - which is why this file did not exist until
+# now.
+#
+# Pinned exactly (not >=), matching cv/requirements.txt's stated policy for
+# the parts of this stack that move fast. FastAPI/Starlette in particular
+# have changed StreamingResponse and TestClient behaviour across minor
+# versions, and /video_feed depends on one specific documented behaviour of
+# theirs (see backend/server.py's module docstring: a SYNC generator passed
+# to StreamingResponse is iterated in a threadpool, so blocking on a
+# threading.Condition inside it does not stall the event loop). That is
+# exactly the kind of load-bearing assumption that should not silently ride
+# an auto-upgrade.
+#
+# Deliberately plain `uvicorn`, NOT `uvicorn[standard]`. The [standard] extra
+# pulls uvloop, httptools, watchfiles, websockets, python-dotenv and PyYAML;
+# this server streams MJPEG and serves small JSON payloads and needs none of
+# them. Fewer moving parts matters more than marginal throughput on a machine
+# already carrying a delicate torch/MPS stack.
+#
+# starlette and pydantic arrive as fastapi's own dependencies and are pinned
+# here too, since /video_feed's correctness rests on Starlette's behaviour
+# specifically rather than on FastAPI's public surface.
+#
+# httpx is a TEST dependency, not a runtime one: it is the transport
+# Starlette's TestClient runs on, and backend/test_server.py needs it. It
+# happened to be present in the shared .venv already as a transitive
+# dependency of another package, which is exactly why it is pinned here
+# explicitly rather than left implicit - a future `pip install -r` into a
+# clean venv would otherwise install a backend whose test suite cannot run,
+# and the failure would look like a broken test rather than a missing pin.
+# This file does not split runtime/test requirements into two files;
+# cv/requirements.txt doesn't either, and one extra pure-Python package is
+# not worth inventing a second convention over.
+
+fastapi==0.141.1
+uvicorn==0.52.4
+starlette==1.6.0
+pydantic==2.13.4
+httpx==0.28.1

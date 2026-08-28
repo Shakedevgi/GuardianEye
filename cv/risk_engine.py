@@ -164,6 +164,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from persistence import (  # noqa: E402
     EventWriter,
     insert_pending_clip,
+    now_iso,
     sweep_expired_clips,
     update_clip_write_result,
 )
@@ -1002,6 +1003,21 @@ class ReviewQueue:
     def current_id(self):
         return self._ids[0] if self._ids else None
 
+    def ids(self) -> list[int]:
+        """The queue's actual membership, in FIFO order, as a plain list.
+
+        Added in Phase 7 for /risk_status -> /review. It matters that this is
+        the real queue rather than something a client can re-derive: after
+        's' (skip_remaining) the queue is EMPTY while the underlying entries
+        are all still PENDING, so "every pending hazard" and "the review
+        queue" are different sets, and a client reconstructing one from the
+        other would show a parent items they cannot actually act on. Order
+        matters for the same reason - the queue is strictly FIFO (only
+        current_id() is decidable), so an id-sorted approximation would name
+        the wrong "next up".
+        """
+        return list(self._ids)
+
     def advance(self) -> None:
         """'h'/'n' - the current item has been decided, move to the next."""
         if self._ids:
@@ -1764,6 +1780,31 @@ def review_candidate_label(position: int, total: int) -> str:
     return f"REVIEW {position}/{total} - h=hazard n=not s=skip queued"
 
 
+def hazard_counts(hazard_map: HazardMap) -> dict:
+    """The four-way breakdown of hazard_map.entries by state (plus
+    is_first_scan for PENDING), shared by draw_risk_readout's local debug
+    overlay and build_risk_status's `/risk_status` JSON (Phase 7) - factored
+    out so the two representations of the same count cannot drift apart, per
+    the Phase 7 brief. Keys match build_risk_status's `hazard_counts` object
+    exactly.
+    """
+    n_confirmed = sum(1 for e in hazard_map.entries if e.state == HAZARD_STATE_CONFIRMED)
+    n_pending_first = sum(
+        1 for e in hazard_map.entries if e.state == HAZARD_STATE_PENDING and e.is_first_scan
+    )
+    n_pending_new = sum(
+        1 for e in hazard_map.entries if e.state == HAZARD_STATE_PENDING and not e.is_first_scan
+    )
+    n_dismissed = sum(1 for e in hazard_map.entries if e.state == HAZARD_STATE_DISMISSED)
+    return {
+        "total": len(hazard_map.entries),
+        "confirmed": n_confirmed,
+        "pending_first_scan": n_pending_first,
+        "pending_new": n_pending_new,
+        "dismissed": n_dismissed,
+    }
+
+
 def draw_risk_readout(image, frame_risk: dict, hazard_map: HazardMap, review_queue: ReviewQueue) -> None:
     zone = frame_risk["zone"]
     if zone == RISK_ZONE_NONE or frame_risk["person_id"] is None:
@@ -1775,21 +1816,161 @@ def draw_risk_readout(image, frame_risk: dict, hazard_map: HazardMap, review_que
         )
     draw_overlay_line(image, risk_text, 3)
 
-    n_confirmed = sum(1 for e in hazard_map.entries if e.state == HAZARD_STATE_CONFIRMED)
-    n_pending_first = sum(
-        1 for e in hazard_map.entries if e.state == HAZARD_STATE_PENDING and e.is_first_scan
-    )
-    n_pending_new = sum(
-        1 for e in hazard_map.entries if e.state == HAZARD_STATE_PENDING and not e.is_first_scan
-    )
-    n_dismissed = sum(1 for e in hazard_map.entries if e.state == HAZARD_STATE_DISMISSED)
+    counts = hazard_counts(hazard_map)
     draw_overlay_line(
         image,
-        f"Hazard map: {len(hazard_map.entries)} entries ({n_confirmed} confirmed, "
-        f"{n_pending_first} pending/first-scan, {n_pending_new} pending/NEW [alerts], "
-        f"{n_dismissed} dismissed)  |  review queue: {len(review_queue)}",
+        f"Hazard map: {counts['total']} entries ({counts['confirmed']} confirmed, "
+        f"{counts['pending_first_scan']} pending/first-scan, {counts['pending_new']} pending/NEW [alerts], "
+        f"{counts['dismissed']} dismissed)  |  review queue: {len(review_queue)}",
         4,
     )
+
+
+# --- Phase 7: /risk_status JSON payload --------------------------------------
+
+
+def _bbox_to_list(bbox):
+    """None-safe conversion of a bbox tuple (possibly holding numpy float32
+    scalars straight out of a YOLO box.xyxy[0] read) to a plain list[float] -
+    the JSON-serializable type build_risk_status's docstring/contract
+    requires. `bbox` is already a plain Python tuple of floats everywhere in
+    this file (see the `tuple(float(v) for v in box.xyxy[0])` conversions in
+    main()), but build_risk_status is the boundary to an HTTP JSON response
+    read by another codebase (backend-agent's server.py) on another thread -
+    it is cheap insurance to convert here explicitly rather than trust every
+    upstream call site to have already done it and stay that way forever.
+    """
+    if bbox is None:
+        return None
+    return [float(v) for v in bbox]
+
+
+def build_risk_status(
+    *,
+    camera_index: int,
+    camera_name,
+    width: int,
+    height: int,
+    frame_risk: dict,
+    live_persons: list,
+    per_person: dict,
+    hazard_map: HazardMap,
+    review_queue: ReviewQueue,
+    alert_text,
+    alert_active: bool,
+    smoothed_fps,
+    model_name: str,
+    imgsz: int,
+    conf: float,
+    device: str,
+    scan_enabled: bool,
+    socket_detect_enabled: bool,
+    persistence_enabled: bool,
+) -> dict:
+    """Assembles the exact `/risk_status` JSON payload backend-agent's
+    server.py serves as-is (see the Phase 7 API contract in
+    docs/decision-log.md and the brief this was built against). Lives here
+    rather than in backend/server.py because it reads cv-side objects
+    (HazardEntry, PersonEntry, frame_risk) directly - backend/server.py stays
+    a pure serving layer that only forwards whatever dict this returns,
+    per CLAUDE.md decision 1's "video pipeline vs. control UI are decoupled"
+    split.
+
+    Every value returned is a plain JSON-serializable type (str/int/float/
+    bool/None/list/dict) - NEVER a numpy scalar (e.g. the float32 values
+    living in a bbox tuple straight out of box.xyxy[0]) or a dataclass.
+    json.dumps() on a numpy float32 raises TypeError, and that would surface
+    as a 500 on the HTTP thread, not here - so every numeric value below is
+    explicitly passed through float()/int()/bool(), even where the value is
+    already a plain Python type today, as insurance against a future upstream
+    change reintroducing a numpy type unnoticed. See
+    test_build_risk_status_survives_json_dumps in test_risk_engine.py, which
+    is the test that would actually catch a regression here.
+
+    `timestamp` is a FRESH wall-clock read via persistence.now_iso() (see
+    that module's docstring) - never a converted time.monotonic() value,
+    which has no fixed relationship to a wall-clock date. This matches
+    backend/persistence.py's own timestamp convention exactly, so a
+    `/risk_status` timestamp and an `events` table timestamp are directly
+    comparable by a parent looking at both.
+    """
+    risk = {
+        "zone": frame_risk["zone"],
+        "value": None if frame_risk["value"] is None else float(frame_risk["value"]),
+        "person_id": None if frame_risk["person_id"] is None else int(frame_risk["person_id"]),
+        "hazard_id": None if frame_risk["hazard_id"] is None else int(frame_risk["hazard_id"]),
+        "hazard_label": frame_risk["hazard_label"],
+        "hazard_bbox": _bbox_to_list(frame_risk["hazard_bbox"]),
+    }
+
+    persons = []
+    for person in live_persons:
+        nearest = per_person.get(person.id)
+        if nearest is None:
+            nearest_hazard_id, distance, zone = None, None, None
+        else:
+            hazard, smoothed, zone = nearest
+            nearest_hazard_id, distance = int(hazard.id), float(smoothed)
+        persons.append({
+            "id": int(person.id),
+            "bbox": _bbox_to_list(person.bbox),
+            "nearest_hazard_id": nearest_hazard_id,
+            "distance": distance,
+            "zone": zone,
+        })
+
+    hazards = []
+    for entry in hazard_map.entries:
+        hazards.append({
+            "id": int(entry.id),
+            "label": entry.label,
+            "bbox": _bbox_to_list(entry.bbox),
+            "state": entry.state,
+            "origin": entry.origin,
+            "is_first_scan": bool(entry.is_first_scan),
+            # CLAUDE.md decision 4's four-state table, read out through the
+            # same hazard_alerts_on_approach() the live scoring loop uses
+            # (score_frame's alert_eligible_hazards filter in main()) -
+            # deliberately NOT reimplemented here, so a served client sees
+            # exactly the rule Layer B actually applies, not a second copy of
+            # it that could silently diverge.
+            "alerts_on_approach": bool(hazard_alerts_on_approach(entry)),
+        })
+
+    return {
+        "timestamp": now_iso(),
+        "camera": {
+            "index": int(camera_index),
+            "name": camera_name,
+            "width": int(width),
+            "height": int(height),
+        },
+        "risk": risk,
+        "persons": persons,
+        "hazards": hazards,
+        "hazard_counts": hazard_counts(hazard_map),
+        "review_queue": {
+            "length": len(review_queue),
+            "current_id": review_queue.current_id(),
+            # The real FIFO membership, not a set a client could rebuild from
+            # `hazards` - see ReviewQueue.ids() for why those two differ.
+            "queue": review_queue.ids(),
+        },
+        "alert": {
+            "text": alert_text,
+            "active": bool(alert_active),
+        },
+        "diagnostics": {
+            "fps": None if smoothed_fps is None else float(smoothed_fps),
+            "model": model_name,
+            "imgsz": int(imgsz),
+            "conf": float(conf),
+            "device": device,
+            "scan_enabled": bool(scan_enabled),
+            "socket_detect_enabled": bool(socket_detect_enabled),
+            "persistence_enabled": bool(persistence_enabled),
+        },
+    }
 
 
 # --- main --------------------------------------------------------------------
@@ -1851,6 +2032,30 @@ def main() -> None:
     parser.add_argument(
         "--sweep-interval", type=float, default=DEFAULT_SWEEP_INTERVAL_SECONDS,
         help=f"Wall-clock seconds between undecided-pending-clip auto-delete sweeps (default: {DEFAULT_SWEEP_INTERVAL_SECONDS}).",
+    )
+    # Phase 7 (backend-agent's server.py): purely additive. Default False
+    # means a plain `python risk_engine.py` run behaves EXACTLY as it did
+    # before Phase 7 - no server thread started, no fastapi/uvicorn import
+    # attempted (see the guarded import below), same cv2.imshow debug window
+    # and h/n/s keys as always. This flag is the only thing that turns any
+    # of that on.
+    parser.add_argument(
+        "--serve", action="store_true", default=False,
+        help="Also start the Phase 7 FastAPI server (MJPEG /video_feed + /risk_status + /events + "
+        "/clips) on a background thread, alongside the local cv2.imshow debug window.",
+    )
+    parser.add_argument(
+        "--host", type=str, default="127.0.0.1",
+        help="Host/interface the Phase 7 server binds to (default: 127.0.0.1, localhost only). "
+        "This default is a DELIBERATE privacy decision (Shaked), not an oversight: the served feed "
+        "shows a room with a child in it, plus every saved clip, and there is no authentication yet "
+        "in front of it. Phase 8 must decide an auth story before this is ever pointed at 0.0.0.0 or "
+        "a LAN-reachable address - do not change this default to widen exposure without that decision "
+        "being made first.",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000,
+        help="Port the Phase 7 server binds to (default: 8000). Only meaningful with --serve.",
     )
     args = parser.parse_args()
 
@@ -1915,6 +2120,36 @@ def main() -> None:
     frame_diagonal = math.hypot(width, height)
     device_label = camera.resolved_name or f"index {camera.index}"
     print(f"Streaming from camera {camera.index} ({device_label}) at {width}x{height}. Press 'q' to quit.")
+
+    # Phase 7: GUARDED, LOCAL import - only touched when --serve is passed,
+    # so a normal (non-serving) run of this script never requires fastapi/
+    # uvicorn to be installed, matching every other optional dependency in
+    # this file (the socket/scan models are likewise skippable via their own
+    # --disable-* flags with no import attempted). risk_engine.py already
+    # puts ../backend on sys.path for the `from persistence import ...` /
+    # `from db import ...` block near the top of this file, so `from server
+    # import ...` resolves here regardless of the directory this script was
+    # launched from.
+    #
+    # uvicorn runs on a background DAEMON thread (start_server's job) while
+    # THIS function keeps the main thread for the camera loop below - the
+    # reverse of the obvious arrangement, and deliberate: cv2.imshow from a
+    # non-main thread throws `cv2.error: Unknown C++ exception from OpenCV
+    # code` on this machine (Cocoa requires window/UI calls on the main
+    # thread), and CLAUDE.md decision 1 explicitly protects this file's local
+    # debug window rather than allowing Phase 7 to quietly break it.
+    shared = None
+    commands = None
+    if args.serve:
+        from server import CommandQueue, SharedState, start_server  # noqa: E402 (guarded, not module-level)
+
+        shared = SharedState()
+        commands = CommandQueue()
+        start_server(
+            shared, commands, host=args.host, port=args.port,
+            db_path=args.db_path, clips_dir=args.clips_dir,
+        )
+        print(f"Serving on http://{args.host}:{args.port} (video_feed/risk_status/events/clips).")
 
     hazard_map = HazardMap()
     for x1, y1, x2, y2, label in args.seed_hazards:
@@ -2027,6 +2262,64 @@ def main() -> None:
     # crop, instead of silently no-op'ing until the next successful read.
     last_valid_frame = first_frame
 
+    # Phase 7: the review-queue actions ('h'/'n'/'s') factored into their own
+    # functions, so the local keyboard handler below and the HTTP command
+    # queue (Phase 7's `commands.drain(handlers)`) call the EXACT same code
+    # rather than two copies that could drift apart. This was already true
+    # in spirit (both paths always meant "call hazard_map.confirm/dismiss +
+    # review_queue.advance()") - Phase 7 just gives it one name each instead
+    # of leaving it inlined at the one call site it used to have.
+    #
+    # Each takes an entry_id (Phase 7's HTTP handlers act on a specific id a
+    # client saw in a `/risk_status` response, which may be stale by the time
+    # the request arrives) and only acts if that id is still the CURRENT
+    # review candidate - the review queue is strictly FIFO by design (Layer
+    # A/CLAUDE.md decision 3/4), so "confirm/dismiss anything at any time" is
+    # not a supported operation; a request for a non-current id fails closed
+    # with a reason rather than silently reordering the queue.
+    def handle_confirm(entry_id) -> dict:
+        current = review_queue.current_id()
+        if current is None or entry_id != current:
+            return {"ok": False, "reason": "not the current review candidate", "entry_id": entry_id}
+        entry = hazard_map.confirm(entry_id)
+        if entry is None:
+            return {"ok": False, "reason": "unknown hazard id", "entry_id": entry_id}
+        review_queue.advance()
+        print(f"Confirmed hazard entry #{entry_id}.")
+        return {"ok": True, "entry_id": entry_id, "action": "confirm"}
+
+    def handle_dismiss(entry_id) -> dict:
+        # MUST run on this (the main loop) thread, not the HTTP thread -
+        # hazard_map.dismiss() crops `last_valid_frame` right now to compute
+        # the dismissal fingerprint (see HazardMap.dismiss/fingerprint_bbox).
+        # A stale or wrong frame here would silently break the "spot changed
+        # since dismissal" re-raise rule (CLAUDE.md decision 4's "better safe
+        # than sorry" ruling) - the exact bug Phase 5 spent two debugging
+        # rounds fixing (see fingerprint_bbox's own docstring above). Every
+        # call to this function, whether from the 'n' key or from
+        # commands.drain() below, already runs here for that reason - this
+        # is not a new constraint Phase 7 introduces, just the first time
+        # something other than the keyboard could reach this function.
+        current = review_queue.current_id()
+        if current is None or entry_id != current:
+            return {"ok": False, "reason": "not the current review candidate", "entry_id": entry_id}
+        entry = hazard_map.dismiss(entry_id, last_valid_frame)
+        if entry is None:
+            return {"ok": False, "reason": "unknown hazard id", "entry_id": entry_id}
+        review_queue.advance()
+        print(f"Dismissed entry #{entry_id} (not a hazard).")
+        return {"ok": True, "entry_id": entry_id, "action": "dismiss"}
+
+    def handle_skip(entry_id=None) -> dict:
+        # 's' clears the whole queue, not one entry - entry_id is accepted
+        # (and ignored) only so this fits the same callable(entry_id) -> dict
+        # shape as the other two handlers for commands.drain()'s dispatch.
+        skipped = len(review_queue)
+        if skipped > 0:
+            print(f"Skipping {skipped} currently-queued candidate(s).")
+        review_queue.skip_remaining()
+        return {"ok": True, "skipped": skipped, "action": "skip"}
+
     cv2.imshow(WINDOW_NAME, prepare_for_display(first_frame))
     cv2.waitKey(1)
 
@@ -2135,6 +2428,55 @@ def main() -> None:
                 # frame" Phase 7's /video_feed is meant to be built from,
                 # one phase early, for free.
                 encoded = rolling_buffer.append(annotated, now)
+
+                # Phase 7: publish that EXACT clean-annotated JPEG - not a
+                # second encode, not a second annotation path. `encoded` is
+                # already the same cv2.imencode() result the rolling buffer
+                # just stored for clip-saving (MJPEG is nothing but a stream
+                # of JPEGs, so there is no reason to pay for a second
+                # cv2.imencode call on the same pixels). Publishing it here,
+                # above the "LOCAL cv2.imshow debug window only" section
+                # below, makes CLAUDE.md decision 1 ("diagnostics never
+                # reach the served frame") a structural fact rather than a
+                # matter of discipline: a future diagnostic overlay added
+                # below this line physically cannot leak into /video_feed
+                # without ALSO corrupting saved clips, which would be caught
+                # immediately (see rolling_buffer.append's own comment,
+                # unchanged above, which already named this as the "clean
+                # annotated frame Phase 7's /video_feed is meant to be built
+                # from").
+                #
+                # `smoothed_fps` in this frame's published status is the
+                # value carried over from the PREVIOUS frame (the FPS
+                # smoothing update happens further below, inside the debug-
+                # only section) - a harmless one-frame lag given it's already
+                # an EMA over many frames, not a fresh instantaneous read
+                # either way; see FPS_SMOOTHING_ALPHA / draw_overlay_line's
+                # FPS line below for the value this mirrors.
+                if args.serve and encoded is not None:
+                    status = build_risk_status(
+                        camera_index=camera.index,
+                        camera_name=camera.resolved_name,
+                        width=width,
+                        height=height,
+                        frame_risk=frame_risk,
+                        live_persons=live_persons,
+                        per_person=per_person,
+                        hazard_map=hazard_map,
+                        review_queue=review_queue,
+                        alert_text=alert_text,
+                        alert_active=(alert_text is not None and now < alert_until),
+                        smoothed_fps=smoothed_fps,
+                        model_name=args.model,
+                        imgsz=args.imgsz,
+                        conf=args.conf,
+                        device=device,
+                        scan_enabled=args.scan_enabled,
+                        socket_detect_enabled=args.socket_detect_enabled,
+                        persistence_enabled=args.persistence_enabled,
+                    )
+                    shared.publish(encoded.tobytes(), status)
+
                 if encoded is not None:
                     clip_recorder.add_tail_frame(encoded, now)
                 for path, clip_event in clip_recorder.poll(now):
@@ -2205,19 +2547,29 @@ def main() -> None:
             if key == ord("h"):
                 entry_id = review_queue.current_id()
                 if entry_id is not None:
-                    hazard_map.confirm(entry_id)
-                    review_queue.advance()
-                    print(f"Confirmed hazard entry #{entry_id}.")
+                    handle_confirm(entry_id)
             elif key == ord("n"):
                 entry_id = review_queue.current_id()
                 if entry_id is not None:
-                    hazard_map.dismiss(entry_id, last_valid_frame)
-                    review_queue.advance()
-                    print(f"Dismissed entry #{entry_id} (not a hazard).")
+                    handle_dismiss(entry_id)
             elif key == ord("s"):
-                if len(review_queue) > 0:
-                    print(f"Skipping {len(review_queue)} currently-queued candidate(s).")
-                review_queue.skip_remaining()
+                handle_skip()
+
+            # Phase 7: drain any confirm/dismiss/skip commands a client sent
+            # over HTTP since the last frame - dispatched to the EXACT same
+            # handle_confirm/handle_dismiss/handle_skip functions the h/n/s
+            # keys above just called, so the two entry points can never
+            # decide the same id two different ways. This runs on the main
+            # loop thread (same thread that owns hazard_map/review_queue) by
+            # design - see this file's module-level "Why the camera loop
+            # keeps the main thread" note and handle_dismiss's own docstring
+            # for why dismiss in particular cannot safely run anywhere else.
+            if args.serve:
+                commands.drain({
+                    "confirm": handle_confirm,
+                    "dismiss": handle_dismiss,
+                    "skip": handle_skip,
+                })
 
             if key == ord("q"):
                 print("Quit key pressed - exiting.")
@@ -2233,6 +2585,13 @@ def main() -> None:
     finally:
         camera.release()
         cv2.destroyAllWindows()
+        # Phase 7: unblock any client(s) parked on a /video_feed streaming
+        # response's `while True: yield next frame` loop - without this,
+        # exiting risk_engine.py (this process) leaves a connected browser
+        # tab or ui-agent client hanging indefinitely instead of seeing the
+        # stream end.
+        if shared is not None:
+            shared.mark_stopped()
 
 
 if __name__ == "__main__":
