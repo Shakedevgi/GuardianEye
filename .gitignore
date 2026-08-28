@@ -35,6 +35,16 @@ cv/measurements/
 # cv/captures/ applies to it.
 cv/datasets/
 
+# Ultralytics label cache built from cv/datasets/ (a .cache numpy blob written
+# next to the dataset it indexes). Derived from the gitignored captures above
+# and regenerated automatically on the next training/val run, but it embeds
+# `im_file` paths and label/bbox data traceable straight back to photographs of
+# a real home - so the same privacy reasoning as cv/captures/, cv/measurements/
+# and cv/datasets/ applies to it. Added 2026-08-28: it was sitting untracked
+# and NOT ignored, i.e. one `git add -A` away from a public push.
+cv/*.cache
+cv/**/*.cache
+
 # Fine-tuned training runs (Ultralytics' default `runs/` output dir) -
 # weights, checkpoints and training-run images, all regeneratable, all large.
 cv/runs/

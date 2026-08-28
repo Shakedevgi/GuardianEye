@@ -1115,3 +1115,169 @@ both and diff them — don't just check that neither one errored.
   symptom at all. Cross-referencing two independent counts of the same
   thing (what was said vs. what was stored) is the cheapest version of the
   right check, and it's the one that actually found this phase's bug.
+
+---
+
+## Entry 10 — Phase 7 (2026-08-28): the first real parallel run, a defect
+correctly found and mis-graded, and a stale claim that survived into the
+review's own task briefing
+
+Phase 7 is the first phase this project ran backend-agent and cv-agent
+**in parallel**, against a contract (`SharedState`/`CommandQueue`/
+`start_server` signatures, and the `/risk_status` JSON shape) pinned in both
+agents' briefs *before* either one started, rather than the strictly
+sequential handoffs every previous phase used (cv-agent finishes, backend-
+agent starts on top of what exists, as in Phase 5→6). This is worth its own
+entry rather than folding into the technical write-up, because it's the
+first data point this project has on a coordination question the earlier
+entries could only gesture at.
+
+### The parallel run itself worked, and worked specifically because the
+contract was pinned before either agent touched code
+
+The two agents touched disjoint files (cv-agent: `cv/risk_engine.py`'s new
+`AlertDispatcher`/`build_risk_status`/`hazard_counts`/`ReviewQueue.ids()`
+sections; backend-agent: all of `backend/server.py`) and the integration
+worked on the first attempt, with no drift I could find reading both sides
+against each other — cv-agent independently re-read the actual committed
+`server.py` afterward and confirmed the signatures it had built against
+matched what backend-agent actually shipped. I checked this claim the way
+this file has checked every other claim about how a phase went: by reading
+both files directly and confirming they actually agree (`build_risk_status`'s
+returned shape against `server.py`'s `/risk_status` docstring's example
+payload; `ReviewQueue.ids()`'s existence and semantics against `/review`'s
+comment about why it needs exactly that method), not by trusting either
+agent's account that they agreed. They do. This is a genuinely different
+and more efficient handoff shape than anything Entries 1–9 recorded — those
+were all "agent A finishes, agent B starts from what A left," which is safe
+but sequential; this is "both start from a shared, written-down contract,"
+which is faster if the contract holds and would be a much worse failure
+mode if it didn't (silent, hard-to-localize integration bugs instead of one
+agent simply blocked waiting on the other). Worth naming for a future team
+considering this: the contract being *specific* — actual method names
+(`ReviewQueue.ids()`), actual field names, not just "cv-agent will expose
+review state somehow" — is very plausibly what made this work rather than
+just being cheaper on paper. A vaguer contract pinned in the same way could
+easily have produced silent drift instead.
+
+### Two agents independently misattributed the same edits to each other,
+from the same kind of evidence, in the same direction
+
+Both cv-agent and backend-agent, working in parallel, at some point
+attributed the `PHASE_PLAN.md`/`docs/decision-log.md` edits accompanying
+their own work to *the other agent* — when those edits were actually made
+by the orchestrator, in between their sessions, while both were running.
+Both reasoned from `git status` alone (seeing the files already modified
+when their own session started or resumed) and both drew the same
+plausible-but-wrong inference from it. Worth naming precisely why this
+matters even though it caused no actual harm this time: `git status` tells
+you a file changed, not *who* changed it or *why* — and in a workflow where
+three or four distinct actors (two parallel subagents plus the orchestrator,
+here) can all legitimately touch the same shared files
+(`PHASE_PLAN.md`/`docs/decision-log.md` in particular, since every phase's
+scaffolding touches both), an agent inferring authorship from file state
+alone has a real, structural reason to be wrong, not just bad luck. This is
+a new failure shape for this file's record — Entry 6 (Phase 6) documented an
+error *propagating* from orchestrator to subagent through an explicit
+briefing; this is two subagents independently *mis-crediting* the
+orchestrator's own concurrent edits, without any briefing being wrong at
+all, purely from ambiguous file-state evidence during a parallel run. It is
+specifically a parallel-work artifact: the sequential handoffs in Phases
+1–6 never put two agents' sessions in a position to observe the same
+shared-file diff mid-flight and have to guess who wrote it.
+
+### A defect correctly found and mis-graded — a distinct failure mode from
+anything logged so far
+
+Covered in full in `docs/phase-writeups/phase-7.md`'s Claim 4, but it
+belongs here too because it's a workflow finding, not just a code one:
+backend-agent found the real `/review` queue-derivation bug itself,
+unprompted, and reported it — as a documentation caveat, not a defect. It
+was a defect, with a concrete failure mode (Phase 8 offering a parent items
+that fail closed on `confirm`/`dismiss`). This is worth distinguishing
+sharply from every other quality issue this file has logged: it is not
+"the agent missed something" (Entry 2's Phase 2 index-resolution bug,
+Entry 6's fine-tuning side effects), and it is not "the agent did its job
+correctly on bad input" (Entry 9's Phase 6 date propagation). It is
+correctly identifying a real problem and then getting its *severity*
+wrong — a calibration failure sitting one layer past diligence. That
+matters for how a team reviews subagent output: a checklist of "did the
+agent flag any issues" would have passed this cleanly, since the issue
+*was* flagged. Catching this required someone re-reading the *reasoning
+behind* a flagged caveat closely enough to notice it actually described a
+behavioral divergence with a real downstream consequence, not a cosmetic
+note — which is a materially higher bar than "check that issues get
+surfaced at all."
+
+### The review's own task briefing carried a stale claim forward, and this
+is a new direction for an error this file hasn't seen yet
+
+Every previous instance of a stale or wrong claim propagating in this
+project (Entry 6's Phase 6 date, Phase 6's own audit catching
+`backend/API.md`'s un-updated date) moved from an earlier document into a
+later one — decision log into code comments, one file into another. This
+phase's review briefing described the "unreviewed hazard escalating to RED"
+safety path as still open, two live sessions after it was supposedly
+flagged. Checked directly against the record: it was closed at Phase 4,
+the same day Phase 4 closed, with a specific, frame-pulled recording as
+evidence. What was actually stale was `PHASE_PLAN.md`'s own Phase 4 status
+block, which never got updated to match its own linked write-up's
+Addendum — and that staleness had, by the time this review started,
+propagated one step further: into the *task briefing written to direct this
+very review*. This is worth naming precisely because of who wrote it: not a
+subagent executing on secondhand information (Entry 9's shape), but the
+orchestrator itself, repeating a claim from a document it presumably read
+(`PHASE_PLAN.md`) without cross-checking it against that same document's own
+linked write-up, which had already recorded the correction. The lesson from
+Entry 9 — "a claim needs checking, not just repeating, regardless of how
+confidently it's phrased" — evidently needs to be applied by every actor in
+this workflow, including the one giving the instructions, not just the ones
+receiving them. Docs-agent's role as "the one who checks claims against the
+repo rather than against what it was told" did its job here exactly as
+designed — but it's worth recording that the claim needing correction this
+time originated one level higher up the chain than any previous instance.
+
+### A small, self-caught miscount, recorded because this project's own
+record includes its own misses
+
+Worth one paragraph rather than a full section, but worth including
+precisely because omitting small self-caught errors would make this file's
+record of the team's own process look cleaner than it actually was: on
+first reading the live session 2 log (the `AlertDispatcher` re-verification,
+6 `ALERT:` lines against 6 DB rows), the orchestrator counted 5 `ALERT:`
+lines against 6 DB rows and began reasoning about the discrepancy before
+re-reading the log and finding the 6th line it had missed the first time.
+The final 6-to-6 match is correct and was re-checked before being reported
+here. This is the same shape as Entry 6's "landed everywhere" catch and
+Entry 9's date-propagation finding: a claim briefly treated as settled that
+turned out to need one more direct look. Small, self-corrected, and reported
+anyway, on the theory that a project whose record only shows other people's
+mistakes being caught, never its own team's, would be a less honest record
+than one that shows both.
+
+### What I'd tell another student team about this phase specifically
+
+- If you're going to run two agents in parallel for the first time, pin the
+  actual interface (method/field names, not descriptions of behavior)
+  before either one starts, and verify after the fact that both sides
+  independently agree it matches — this phase's clean integration is real
+  evidence that specificity is what made it work, not luck.
+- In a parallel-agent workflow, expect `git status`-based authorship
+  inference to be systematically unreliable whenever a third actor (an
+  orchestrator, a docs-agent, anyone) can also touch the same shared
+  bookkeeping files mid-flight — this didn't cause harm here, but it's a
+  predictable blind spot worth designing around (e.g., a commit message or
+  a brief note naming who touched what) rather than assuming it won't
+  recur.
+- "Did the agent flag the issues" is a necessary check, not a sufficient
+  one — this phase's `/review` bug shows an issue can be correctly flagged
+  and still shipped as low-severity if nobody re-reads the reasoning behind
+  the flag itself. Build that second-level check into whatever "review the
+  subagent's own review" means in your process.
+- A briefing written to direct an audit is not exempt from the same
+  "checked, not repeated" discipline the audit itself is supposed to
+  apply — this project's own review process caught its own instructions
+  carrying a stale claim, which is a healthy sign the process is actually
+  adversarial rather than just procedural, but it's worth building the
+  expectation that *any* actor's claims get checked, including the one
+  issuing the task.

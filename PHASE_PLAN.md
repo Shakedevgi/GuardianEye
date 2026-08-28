@@ -160,13 +160,21 @@ blanket pass:
   tested, and live-verified) — the *keyboard* h/n/s loop that exercises it
   is a developer stand-in, not a parent-usable interaction. That interaction
   is explicitly Phase 8's job.
-- **One specific, safety-critical path is code-and-test-verified but NOT
-  yet watched happen on camera**: approaching an *unreviewed* hazard
-  (arrived after the first scan, not yet confirmed) escalating to RED —
-  CLAUDE.md decision 4's "unreviewed means dangerous" row. Every RED event
-  in the live test was against an already-confirmed hazard. Flagged as the
-  first thing to check in a future recording, not hidden inside "Phase 4
-  works."
+- **One specific, safety-critical path was code-and-test-verified but NOT
+  yet watched happen on camera at the time this bullet was first written**:
+  approaching an *unreviewed* hazard (arrived after the first scan, not yet
+  confirmed) escalating to RED — CLAUDE.md decision 4's "unreviewed means
+  dangerous" row. Every RED event in the first live test was against an
+  already-confirmed hazard. **Closed the same day (2026-08-22), by a targeted
+  follow-up recording** — a placed-but-never-confirmed object correctly fired
+  RED as a person approached it, against a hazard map with 0 confirmed
+  entries, frame-pulled and checked directly rather than taken on a report.
+  See `docs/phase-writeups/phase-4.md`'s "Addendum" section for the full
+  account. This bullet was left un-updated until Phase 7's docs-agent audit
+  (2026-08-28) found the mismatch between this file (still saying "not yet
+  watched") and the write-up/decision-log (already saying "closed") — a
+  stale-cross-reference bug of the same shape as the Phase 6 API.md date, not
+  a new gap.
 - **Two forward pointers, not silently dropped**: debug telemetry (FPS,
   model config, raw distances) is currently drawn into the served frame's
   pixels rather than exposed as `/risk_status` JSON — a concrete note for
@@ -328,7 +336,68 @@ Phase 8 must decide authentication before it points `--host` at the network.**
 
 **Done when:** you can open the stream URL directly in a browser and see live
 annotated video, and hit the API endpoints and get correct JSON.
-`[~]` — in progress, opened 2026-08-28.
+
+`[x]` — closed 2026-08-28 by docs-agent. Full reasoning in
+`docs/phase-writeups/phase-7.md`; read "done when" here precisely, not as a
+blanket pass:
+- **Both halves of the done-when bar are met, on real but differently-shaped
+  evidence.** "Live annotated video in a browser" rests on one first-person
+  live report against a specific commit (`b768510`) — consistent with how
+  this project has always weighed a sensory human confirmation (Phase 5's
+  "Shaked confirmed hearing it"). "Hit the API endpoints and get correct
+  JSON" rests on something stronger: 26/26 `test_server.py` tests (every one
+  read directly by docs-agent, not just counted) plus a real-`uvicorn`,
+  real-socket preflight the orchestrator ran specifically because
+  Starlette's `TestClient` — what all 26 committed tests use — never touches
+  a real socket or real `uvicorn`, and therefore cannot itself prove
+  `/risk_status` stays responsive while `/video_feed` streams, which is the
+  actual claim the whole concurrency model rests on. That check passed
+  (17/17), but it lives in an uncommitted script, not a repo-checkable test
+  — named as this phase's top open gap, not smoothed over.
+- **The concurrency model — camera loop on the main thread, uvicorn on a
+  background daemon thread, the reverse of the obvious arrangement — was
+  independently verified against the actual pinned `starlette==1.6.0`
+  source, not just the code's own comments describing it.** docs-agent read
+  `StreamingResponse.__init__`/`iterate_in_threadpool` directly and confirmed
+  a sync generator really is iterated via `anyio.to_thread.run_sync` per
+  frame, off the event loop — the single most load-bearing correctness claim
+  in the phase, and it checks out against the library itself.
+- **CLAUDE.md decision 1 ("diagnostics are JSON, boxes are pixels") is now
+  structurally enforced, not just followed** — traced directly: `encoded =
+  rolling_buffer.append(annotated, now)` captures the served JPEG bytes
+  before any diagnostic overlay is drawn onto `annotated`, and `/video_feed`
+  publishes that exact `encoded` object, not a second encode. A future
+  diagnostic draw call moved above that line would corrupt saved clips too,
+  which is loud and immediate, not silent.
+- **Phase 6's gap #4 — no test coverage for the exact code that shipped
+  Phase 6's real bug — is closed correctly, per docs-agent's own Phase 6
+  objection.** The new `AlertDispatcher` invariant test drives a real
+  `AlertArbiter` through the held-then-released path (the original bug's
+  exact shape) and observes the real `speak()` method without reimplementing
+  or importing `main()`'s wiring — a genuine invariant test, not a
+  restatement of the wiring it's meant to guard.
+- **A real defect, found correctly and mis-graded, not missed:** `/review`'s
+  first draft derived its `queue` as "every hazard whose `state` is
+  `pending`," which diverges from the real `ReviewQueue` right after a skip
+  (queue empty, entries still pending) — Phase 8 would have offered a parent
+  items `confirm`/`dismiss` fail closed on. backend-agent found this and
+  reported it as a documentation caveat rather than a defect; fixed via
+  `ReviewQueue.ids()` published end-to-end, with regression tests both
+  sides. Logged as a process finding (severity miscalibration, distinct from
+  "missed" or "found and handled well") for the workflow record, not just a
+  code fix.
+- **This review corrected its own task briefing rather than repeating it:**
+  the briefing described the "unreviewed hazard escalating to RED" path
+  (CLAUDE.md decision 4) as still unverified on camera. It was actually
+  closed at Phase 4, the same day Phase 4 closed (2026-08-22) — see that
+  phase's entry above, now fixed in place, and `docs/phase-writeups/phase-4.md`'s
+  Addendum. What was real was a stale cross-reference (this file's own Phase
+  4 bullet never got updated to match), not an open safety gap — fixed
+  mechanically this session.
+- **One disclosed, pre-existing flaky test** (`ClipRecorder`/`write_clip`,
+  a `tempfile.TemporaryDirectory` teardown race, unrelated to anything this
+  phase touched) is now logged in `docs/decision-log.md` rather than left
+  only in conversation — low urgency, named for completeness.
 
 ### Phase 8 — UI
 **Owner:** ui-agent

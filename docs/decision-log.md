@@ -2474,3 +2474,108 @@ checked on real hardware, not just a green test suite - matching this
 project's standing "a clean run is not proof" position, applied here
 specifically because the Phase 6 bug this refactor touches passed 93/93 the
 entire time it was live-dropping alerts.
+
+### 2026-08-28 — Phase 7 reviewed and closed (docs-agent audit)
+
+Full write-up: `docs/phase-writeups/phase-7.md`. Every mechanism claimed in
+this log's four Phase 7 entries was traced directly against the current
+code (`SharedState`, `CommandQueue`, `build_risk_status`, `hazard_counts`,
+`ReviewQueue.ids()`, `AlertDispatcher`, the capture-point ordering) rather
+than summarized from the log - including one check that went past this
+project's own code into the pinned `starlette==1.6.0` source itself
+(`StreamingResponse.__init__`/`iterate_in_threadpool`), confirming a sync
+generator really is iterated via `anyio.to_thread.run_sync` per frame, not
+on the event loop. That is the single most load-bearing correctness claim
+in the phase and it checked out against the library, not just the comment
+describing it.
+
+**Both halves of the phase's own done-when bar are met, on real evidence.**
+The browser/keyboard half rests on one first-person live report against
+commit `b768510` (consistent with how this project has always weighed a
+sensory human confirmation - see Phase 5's audio-played-and-heard entry).
+The JSON half rests on 26/26 `test_server.py` tests (all read directly, not
+just counted - including tracing the `/review` regression test and the
+`/clips/{id}/video` traversal-guard tests by hand) plus a real-`uvicorn`,
+real-socket preflight the orchestrator ran and disclosed as necessary
+specifically because Starlette's `TestClient` never touches a real socket
+or real `uvicorn`, and therefore cannot itself prove `/risk_status` stays
+responsive while `/video_feed` streams - the actual claim the whole
+concurrency model rests on.
+
+**Phase 6's gap #4 - no test coverage for the exact code that shipped
+Phase 6's real bug - is closed correctly, not just closed.** This was
+docs-agent's own objection at Phase 6 close: a test that duplicates
+`main()`'s wiring tests nothing. Read
+`test_alert_dispatcher_every_voiced_signal_is_also_recorded_including_held_release`
+directly - it drives a real `AlertArbiter` through the held-then-released
+path (the exact shape of the original bug), observes the real `speak()`
+method via instance-level wrapping rather than reimplementing it, and never
+imports or re-types `main()`'s call sequence. The objection is answered,
+not just addressed.
+
+**A real defect found in `/review`'s first draft, correctly found and
+mis-graded, not missed.** Confirmed by reading `ReviewQueue` directly:
+`skip_remaining()` clears the queue but never touches `HazardEntry.state`,
+so a derived `queue` ("every `state == pending` hazard") genuinely diverges
+from the real FIFO membership right after a skip - `length: 0` beside a
+non-empty derived `queue`, and Phase 8 would have offered a parent items
+`confirm`/`dismiss` fail closed on. backend-agent found this itself and
+reported it as a documentation caveat rather than a defect; it was the
+latter. Recorded as a distinct process finding from anything logged so far:
+not "missed the bug," not "found and fixed it well," but "found it, fixed
+it correctly, mis-graded its severity when reporting it" - a calibration
+failure, worth watching for specifically because it survives a shallow
+"did they find the issues" check.
+
+**A claim in this review's own task briefing turned out to be stale, and
+was checked rather than repeated.** The briefing described the "unreviewed
+hazard escalating to RED" path (CLAUDE.md decision 4) as still unverified
+on camera. Checked against the actual record: it was closed at Phase 4,
+the same day Phase 4 closed (2026-08-22, "Unreviewed-approach path
+live-verified" entry above, and `docs/phase-writeups/phase-4.md`'s own
+Addendum) - a placed, never-confirmed object correctly fired RED against a
+hazard map with 0 confirmed entries, frame-pulled via ffmpeg, not taken
+from a summary. What was actually true: `PHASE_PLAN.md`'s Phase 4 status
+block was never updated to match its own linked write-up's Addendum, so it
+still read "NOT yet watched happen on camera" - the same shape of stale
+cross-reference as Phase 6's `backend/API.md` date. Fixed in place this
+session (mechanical correction, the underlying fact was already settled
+and documented elsewhere) rather than left to look like an open safety
+gap. No live-safety-path precondition is actually outstanding here for
+Phase 8/9.
+
+**One disclosed, pre-existing flaky test, now logged rather than left only
+in the write-up.** A `ClipRecorder`/`write_clip` test in
+`cv/test_risk_engine.py` (real file I/O against a `tempfile.TemporaryDirectory`
+plus a background write thread) failed once with `OSError: [Errno 66]
+Directory not empty`, then passed three consecutive re-runs - plausibly a
+teardown race between the background write thread and directory cleanup,
+not confirmed. Confirmed in scope terms: Phase 7 touches zero lines of
+`ClipRecorder`/`write_clip`/`RollingBuffer` (`AlertDispatcher`'s own
+docstring states clip triggering deliberately stays in `main()`), so this
+is pre-existing test-infrastructure flakiness, not a Phase 7 regression.
+Not urgent, not previously on this log - named here so it is, per this
+project's own "log the finding the turn it's found" standard.
+
+**Named gaps, in priority order (full reasoning in the write-up):**
+1. The concurrency model's core proof (`/risk_status` answers promptly
+   while `/video_feed` streams) lives in an uncommitted script
+   (`scratchpad/preflight.py`), not a repo-checkable test - real and
+   credible, per the same "scratchpad-only evidence" caveat Phase 3's
+   write-up applied to change detection's original numbers, but not
+   re-runnable by a future reader of only this repository.
+2. The flaky `write_clip`/`ClipRecorder` test, above - low urgency, now
+   logged.
+3. `/review`'s severity-miscalibration process finding, above - already
+   fixed in code; a team-process item, not an outstanding defect.
+4. Phase 8 has "decide authentication before LAN binding" flagged in two
+   places (`PHASE_PLAN.md`, `server.py`'s docstring) but no candidate
+   approach pre-selected between "LAN with no auth" and "LAN plus a shared
+   token" - flagged is not yet decided.
+5. The stale `PHASE_PLAN.md` cross-reference on the unreviewed-hazard path
+   - fixed this session, named here for traceability.
+
+None of these five block closing the phase. `PHASE_PLAN.md`'s Phase 7
+status set to `[x]` in this same turn. Also fixed this session, as a pure
+mechanical correction: `PHASE_PLAN.md`'s Phase 4 status block's stale
+"NOT yet watched happen on camera" bullet (see above).
