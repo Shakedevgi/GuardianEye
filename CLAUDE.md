@@ -29,7 +29,11 @@ Team: Shaked Ivgi, Yahli Mazri. Advisor: Tom Cohen.
 1. **Video pipeline vs. control UI are decoupled.**
    OpenCV + YOLO run the detection loop and produce annotated frames. FastAPI
    serves those frames as an MJPEG stream (`/video_feed`) plus a small JSON API
-   (`/events`, `/risk_status`, `/clips`). Flet is a *client* of FastAPI — it does
+   (`/events`, `/risk_status`, `/clips`, `/review`, `/health` — the last two
+   added at Phase 7, see `docs/decision-log.md`'s 2026-08-28 "Phase 7 kickoff"
+   entry: `/review` gives Phase 8 an API for the hazard confirm/dismiss/skip
+   flow Phase 4 always meant to move off the keyboard, `/health` distinguishes
+   a dark room from a dead camera loop). Flet is a *client* of FastAPI — it does
    NOT push frames through its own state system. Flet runs as both a Desktop app
    and a local Web App from the same codebase, both talking to the same FastAPI
    backend.

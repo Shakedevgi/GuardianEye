@@ -2347,3 +2347,14 @@ decision into a fake column. And `PersonTracker` ID churn means one continuous
 approach can surface as several rows with different `person_id`s. Both are
 documented at the route so whoever meets them in Phase 8 recognises them
 instead of filing a fresh Phase 7 bug.
+
+### 2026-08-28 — CLAUDE.md decision 1 amended: `/review` and `/health` added
+to the API list (Shaked approved)
+
+The 2026-08-28 "Phase 7 kickoff" entry above logged this as a proposal per
+CLAUDE.md's own rule (ask before changing it, log in the same turn). Shaked
+confirmed. Decision 1's illustrative route list now reads `/events`,
+`/risk_status`, `/clips`, `/review`, `/health` instead of the original three.
+Nothing about the rule itself changed — the video/control decoupling and the
+"diagnostics are JSON, boxes are pixels" split are untouched; this only
+updates the example list to match what actually shipped.
