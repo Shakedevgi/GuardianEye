@@ -2358,3 +2358,77 @@ confirmed. Decision 1's illustrative route list now reads `/events`,
 Nothing about the rule itself changed — the video/control decoupling and the
 "diagnostics are JSON, boxes are pixels" split are untouched; this only
 updates the example list to match what actually shipped.
+
+### 2026-08-28 — Phase 7 follow-up: `main()`'s alert wiring extracted into
+`AlertDispatcher`, closing Phase 6's named debt
+
+Done as its own step AFTER Phase 7's concurrency work was committed and
+live-verified (`b768510`), per Shaked's call at kickoff — deliberately not
+folded into the same pass, so that if something broke it would be
+attributable to one change rather than two structural edits to the same
+code at once.
+
+**What this closes.** `docs/phase-writeups/phase-6.md`'s gap #4 and the
+2026-08-28 Phase 6 live-test entry both recorded the same debt: the
+persistence-drop bug lived in `main()`'s closures, no unit test could reach
+it, and the stated remedy was "extract `main()`'s alert wiring into an
+injectable object." Phase 6's own reasoning for not adding a test then —
+"a test that mirrors `main()`'s call sequence would duplicate the wiring
+rather than test it" — was judged by docs-agent as *correct but incomplete*,
+because an invariant-level test using the real classes was possible and
+simply didn't exist. It exists now.
+
+**The extraction.** `AlertDispatcher` (cv/risk_engine.py, next to
+`AlertArbiter`) owns `speak()`, `offer()`, `poll()` and the banner state that
+used to be `alert_text`/`alert_until` locals. It takes the arbiter, an
+audio player, and an `event_recorder` (anything with `.record(signal)` —
+`EventWriter` in production, `None` under `--disable-persistence`), plus an
+injectable `clock` so banner expiry is testable without sleeping.
+
+Deliberately scoped to the VOICING path only. **Clip triggering stays in
+`main()`**, because it is intentionally not gated by the arbiter (Phase 5: a
+critical moment is worth recording even on a frame where we chose not to
+re-announce it audibly, and `should_trigger_clip()` has its own
+once-per-event/30s gate). Folding it in would have coupled two things Phase 5
+deliberately separated.
+
+**Behaviour is unchanged, and this was verified line by line rather than
+asserted.** Every removed line — the two banner locals, `raise_alert()`,
+`speak()`, and the four call sites — has an exact counterpart inside the new
+class, including the detail that the banner's expiry clock is a *fresh*
+`time.monotonic()` read rather than the `now` passed into `offer()`/`poll()`,
+matching what `raise_alert()` did. One incidental simplification: `speak()`
+used to test `args.persistence_enabled` before calling
+`event_writer.record()`, while `event_writer` was *already*
+`EventWriter`-or-`None` from the same flag — the dispatcher checks the
+recorder itself, so there is one source of truth instead of two conditions
+that could drift apart.
+
+**Five new tests (98 → 103).** The headline one,
+`test_alert_dispatcher_every_voiced_signal_is_also_recorded_including_held_release`,
+drives a real `AlertArbiter` through the exact failure shape: voice one
+signal, offer a second inside the 2.5s pacing window so it is *held*, confirm
+it is neither voiced nor persisted, then release it via `poll()` after the
+window reopens and assert `recorder.recorded == spoken`. That held-then-
+released path is precisely what was silently unpersisted before the fix. It
+observes the real code path by wrapping `speak` on the instance rather than
+subclassing, so it tests the shipping implementation, not a reimplementation
+of it — and it never imports or re-types `main()`'s call sequence, which was
+the whole objection to the naive version of this test.
+
+Also covered: RED bypassing the pacing window is still recorded (a *third*
+route into `speak()`, and the structural point of the extraction is that a
+new route gets persistence for free); `--disable-persistence` still voices;
+banner expiry on an injected clock; and a pinned check that `"closed"`
+signals never produce audio, since a `"closed"` signal reaching `speak()`
+would create exactly the row `db.py`'s missing `ended_at` column says should
+not exist.
+
+**Not yet live-re-verified, and that matters here specifically.** Phase 7's
+browser/stream/keyboard live test (Shaked, 2026-08-28) ran against
+`b768510`, i.e. BEFORE this refactor. 103/26/16 tests pass and the removed-
+line audit is exact, but this is a change to the alert path, and this
+project's own record is that a clean suite is not proof for this particular
+code — the Phase 6 bug passed 93/93 the entire time it was losing half the
+session's alerts. A short camera run confirming alerts still voice, banner,
+and land in the DB should happen before docs-agent closes the phase.

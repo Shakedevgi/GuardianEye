@@ -1435,6 +1435,118 @@ def banner_text_for_signal(signal: AlertSignal) -> str:
     return f"RISK {event.zone.upper()}: {event.hazard_label} approaching (person #{event.person_id})"
 
 
+class AlertDispatcher:
+    """The single path from "AlertManager produced a signal" to "the parent
+    was told about it, and it was persisted."
+
+    Extracted out of main()'s closures in Phase 7 (2026-08-28). This is the
+    Phase 6 debt named in docs/phase-writeups/phase-6.md and re-logged in
+    docs/decision-log.md's Phase 7 kickoff entry - it is deliberately a
+    refactor with NO behaviour change, and the tests that guard it care about
+    exactly that.
+
+    Why it exists, stated plainly, because the reason is a real bug and not a
+    style preference: Phase 6 originally persisted alerts at ONE of speak()'s
+    two call sites. AlertArbiter.offer() either voices a signal immediately or
+    HOLDS it behind the GLOBAL_ALERT_MIN_INTERVAL_SECONDS pacing window, and a
+    held signal is released later by a separate poll() call in the frame loop.
+    The poll() release path spoke and bannered to the parent without recording
+    anything, so roughly half of one real session's voiced alerts never reached
+    the database (docs/decision-log.md, 2026-08-28 "Phase 6 live test").
+
+    The fix at the time moved the record() call INSIDE speak(), which closed
+    the bug. What it could not close was the testability gap: speak(), offer()
+    and poll() were all closures over main()'s locals, so the invariant
+    "everything voiced is also recorded" could only be verified by reading
+    main() or by running a camera. Phase 6's own write-up called that
+    reasoning "correct as far as it goes but incomplete" and named this
+    extraction as the remedy. This class is that remedy - the same three
+    functions, now constructible in a test with a real AlertArbiter and a real
+    (or spy) recorder, with no camera and no import of main().
+
+    Ownership note: this owns the VOICING path only. Clip triggering
+    deliberately stays in main(), because it is intentionally NOT gated by the
+    arbiter - a critical moment is worth recording even on a frame where we
+    chose not to re-announce it audibly, and should_trigger_clip() has its own
+    independent once-per-event/30s-cooldown gate. Folding it in here would
+    couple two things Phase 5 deliberately kept separate.
+    """
+
+    def __init__(self, arbiter: AlertArbiter, audio_player=None, event_recorder=None,
+                 banner_seconds: float = ALERT_BANNER_SECONDS, clock=time.monotonic):
+        """`event_recorder` is anything with a .record(signal) method - in
+        production it is backend/persistence.py's EventWriter, and it is None
+        when --disable-persistence was passed (main() already resolves
+        EventWriter-or-None once, so passing it straight through keeps one
+        source of truth rather than a second `if persistence_enabled` that
+        could drift out of agreement with the first).
+
+        `clock` is injectable for the same reason AlertManager/HazardMap take
+        an explicit `now`: the banner's expiry is real elapsed time, and a test
+        should not have to sleep to exercise it. It defaults to
+        time.monotonic, matching what the extracted raise_alert() called
+        directly - note this is deliberately NOT the `now` passed to
+        offer()/poll(), preserving the pre-extraction behaviour exactly.
+        """
+        self._arbiter = arbiter
+        self._audio_player = audio_player
+        self._event_recorder = event_recorder
+        self._banner_seconds = banner_seconds
+        self._clock = clock
+        self.banner_text = None
+        self.banner_until = 0.0
+
+    def speak(self, signal: AlertSignal) -> None:
+        """The ONE choke point where a parent is actually told something.
+
+        Audio, on-screen banner and persistence all happen here together, on
+        purpose: CLAUDE.md decision 3's persistence scope is "persist exactly
+        what the parent was actually told," and this method IS the telling. Any
+        future third caller gets persistence for free instead of having to
+        remember it - which is the entire structural point of the extraction.
+        """
+        audio_name = audio_for_signal(signal)
+        if audio_name is not None and self._audio_player is not None:
+            self._audio_player.play(audio_name)
+        text = banner_text_for_signal(signal)
+        # Kept as a print rather than a logger: the terminal's "ALERT:" lines
+        # are the evidence trail every live test in this project has been
+        # verified against (docs/decision-log.md cross-checks them against DB
+        # rows character-for-character). Changing this format breaks that.
+        print(f"ALERT: {text}")
+        self.banner_text = text
+        self.banner_until = self._clock() + self._banner_seconds
+        if self._event_recorder is not None:
+            self._event_recorder.record(signal)
+
+    def offer(self, signal: AlertSignal, now: float):
+        """A freshly-produced signal. Voices it if the arbiter says this is
+        the moment, otherwise the arbiter holds it and poll() releases it
+        later. Returns whatever was voiced (or None), mostly for tests.
+        """
+        voiced = self._arbiter.offer(signal, now)
+        if voiced is not None:
+            self.speak(voiced)
+        return voiced
+
+    def poll(self, now: float):
+        """Call once per frame. Releases a signal the pacing window held back.
+        THIS is the path that was silently unpersisted before the Phase 6 fix.
+        """
+        held = self._arbiter.poll(now)
+        if held is not None:
+            self.speak(held)
+        return held
+
+    def banner(self, now: float) -> tuple:
+        """(text, active) for the current moment - the debug overlay and
+        /risk_status's `alert` field read the same state through this one
+        accessor, so the pixels and the JSON can never disagree about what the
+        parent is currently being shown.
+        """
+        return self.banner_text, (self.banner_text is not None and now < self.banner_until)
+
+
 class RollingBuffer:
     """CLAUDE.md decision 6's "last ~5 seconds always in memory," JPEG-
     encoded rather than raw - see ROLLING_BUFFER_JPEG_QUALITY's comment for
@@ -2193,15 +2305,6 @@ def main() -> None:
     # own cadence) - flagged explicitly, not silently assumed exact.
     first_scan_done = not args.scan_enabled
 
-    alert_text = None
-    alert_until = 0.0
-
-    def raise_alert(text: str) -> None:
-        nonlocal alert_text, alert_until
-        print(f"ALERT: {text}")
-        alert_text = text
-        alert_until = time.monotonic() + ALERT_BANNER_SECONDS
-
     # Phase 5: alert lifecycle, rolling buffer, clips, audio - see the
     # AlertManager/RollingBuffer/ClipRecorder/AudioPlayer docstrings for the
     # measured reasoning behind each. rolling_buffer/clip_recorder use
@@ -2213,26 +2316,18 @@ def main() -> None:
     rolling_buffer = RollingBuffer(fps=DEFAULT_TARGET_FPS)
     clip_recorder = ClipRecorder(args.clips_dir, fps=DEFAULT_TARGET_FPS, on_write_complete=on_clip_write_complete)
 
-    def speak(signal: AlertSignal) -> None:
-        audio_name = audio_for_signal(signal)
-        if audio_name is not None and audio_player is not None:
-            audio_player.play(audio_name)
-        raise_alert(banner_text_for_signal(signal))
-        # Phase 6: persistence lives HERE, inside speak(), and deliberately
-        # not at speak()'s call sites - decision 3 (docs/decision-log.md,
-        # 2026-08-28 "Phase 6 kickoff") is "persist exactly what the parent
-        # was actually told," and speak() IS the thing that tells them. Two
-        # separate call sites reach it: AlertArbiter.offer() returning a
-        # winner (handle_alert_signal below) and AlertArbiter.poll()
-        # releasing a signal that was held back by the pacing window (the
-        # main loop). The original Phase 6 wiring recorded only at the
-        # first, so every held-then-released alert was voiced and bannered
-        # to the parent but never persisted - confirmed against real live
-        # data on 2026-08-28, roughly half the session's alerts missing.
-        # Putting the write inside speak() makes the invariant structural
-        # rather than something each new call site has to remember.
-        if args.persistence_enabled:
-            event_writer.record(signal)
+    # Phase 7 (2026-08-28): the voice/banner/persist wiring that used to live
+    # in a speak() closure here is now AlertDispatcher (see its docstring).
+    # Behaviour is identical - the extraction exists so the invariant "every
+    # signal voiced to the parent is also recorded" can be tested with the
+    # real AlertArbiter and a real recorder, without a camera and without
+    # duplicating main()'s call sequence into a test. That was Phase 6's own
+    # named remedy for the bug that silently dropped roughly half of one live
+    # session's alerts. event_writer is already EventWriter-or-None, so it is
+    # passed straight through rather than re-testing args.persistence_enabled.
+    alert_dispatcher = AlertDispatcher(
+        alert_arbiter, audio_player=audio_player, event_recorder=event_writer,
+    )
 
     def handle_alert_signal(signal: AlertSignal, now: float) -> None:
         if signal.kind == "closed":
@@ -2245,9 +2340,7 @@ def main() -> None:
         if alert_manager.should_trigger_clip(signal, now):
             clip_recorder.trigger(rolling_buffer.snapshot(), signal.event, now)
             print(f"Critical alert - recording clip for event #{signal.event.id} ({signal.event.hazard_label}).")
-        voiced = alert_arbiter.offer(signal, now)
-        if voiced is not None:
-            speak(voiced)
+        alert_dispatcher.offer(signal, now)
 
     def enqueue_and_maybe_alert(entry: HazardEntry, alert_reason: str) -> None:
         review_queue.enqueue(entry.id)
@@ -2454,6 +2547,11 @@ def main() -> None:
                 # either way; see FPS_SMOOTHING_ALPHA / draw_overlay_line's
                 # FPS line below for the value this mirrors.
                 if args.serve and encoded is not None:
+                    # Read the banner at THIS point in the frame, before the
+                    # pacing window's poll() below can release a held alert -
+                    # matching the pre-extraction ordering exactly, where
+                    # /risk_status was built from alert_text as it stood here.
+                    banner_text, banner_active = alert_dispatcher.banner(now)
                     status = build_risk_status(
                         camera_index=camera.index,
                         camera_name=camera.resolved_name,
@@ -2464,8 +2562,8 @@ def main() -> None:
                         per_person=per_person,
                         hazard_map=hazard_map,
                         review_queue=review_queue,
-                        alert_text=alert_text,
-                        alert_active=(alert_text is not None and now < alert_until),
+                        alert_text=banner_text,
+                        alert_active=banner_active,
                         smoothed_fps=smoothed_fps,
                         model_name=args.model,
                         imgsz=args.imgsz,
@@ -2499,9 +2597,7 @@ def main() -> None:
                                 f"Warning: clip {path} triggered by event #{clip_event.id} which has no "
                                 "persisted row - skipping clip DB insert."
                             )
-                held = alert_arbiter.poll(now)
-                if held is not None:
-                    speak(held)
+                alert_dispatcher.poll(now)
 
                 # --- everything below is the LOCAL cv2.imshow debug window
                 # only (connector line + diagnostics) - exempt from decision
@@ -2538,8 +2634,9 @@ def main() -> None:
                             (cx1, review_label_y), REVIEW_CANDIDATE_OUTLINE_COLOR,
                         )
 
-                if alert_text is not None and now < alert_until:
-                    draw_overlay_line(annotated, f"ALERT: {alert_text}", 5)
+                banner_text, banner_active = alert_dispatcher.banner(now)
+                if banner_active:
+                    draw_overlay_line(annotated, f"ALERT: {banner_text}", 5)
 
                 cv2.imshow(WINDOW_NAME, prepare_for_display(annotated))
 

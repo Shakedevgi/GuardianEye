@@ -1514,6 +1514,157 @@ def test_build_risk_status_queue_is_real_membership_not_pending_hazards():
     assert status["review_queue"] == {"length": 0, "current_id": None, "queue": []}
 
 
+# --- Phase 7 (2026-08-28): AlertDispatcher and the speak-implies-record
+# invariant -------------------------------------------------------------------
+#
+# These are the tests docs/phase-writeups/phase-6.md said were possible but
+# did not exist. Phase 6's data-loss bug (roughly half of one live session's
+# voiced alerts never reaching the database) lived in main()'s closures, so no
+# unit test could reach it. The stated reason for adding none at the time was
+# that a test mirroring main()'s call sequence would duplicate the wiring
+# rather than test it - correct, and the reason these tests do NOT do that.
+# They exercise the REAL AlertArbiter through AlertDispatcher and assert the
+# invariant directly, with no camera and no copy of main()'s call order.
+
+
+class _SpyRecorder:
+    """Stands in for backend/persistence.py's EventWriter - same .record()
+    surface, no SQLite. Deliberately not a Mock: this project has no mocking
+    library and the existing suites all use real objects or tiny hand-written
+    stand-ins (see backend/test_persistence.py's FakeEvent).
+    """
+
+    def __init__(self):
+        self.recorded = []
+
+    def record(self, signal):
+        self.recorded.append(signal)
+        return len(self.recorded)
+
+
+def _dispatcher_with_spies(recorder=None):
+    """A real AlertArbiter plus a spy recorder, with speak() wrapped so the
+    test can see exactly what was voiced. Wrapping the bound method on the
+    INSTANCE (rather than subclassing) means offer()/poll() still reach it
+    through normal attribute lookup - i.e. we observe the real code path
+    rather than a reimplementation of it.
+    """
+    recorder = recorder if recorder is not None else _SpyRecorder()
+    dispatcher = re.AlertDispatcher(re.AlertArbiter(), audio_player=None, event_recorder=recorder)
+    spoken = []
+    original_speak = dispatcher.speak
+
+    def spy_speak(signal):
+        spoken.append(signal)
+        return original_speak(signal)
+
+    dispatcher.speak = spy_speak
+    return dispatcher, recorder, spoken
+
+
+def test_alert_dispatcher_every_voiced_signal_is_also_recorded_including_held_release():
+    """THE invariant. This is the exact failure Phase 6 shipped and fixed:
+    AlertArbiter.offer() holds a non-RED signal back when the
+    GLOBAL_ALERT_MIN_INTERVAL_SECONDS pacing window is closed, and a separate
+    poll() call releases it later. Before the fix, the release path spoke to
+    the parent without persisting anything.
+
+    The test deliberately forces at least one signal down the held-then-
+    released path, then asserts speak() and record() saw the same set, in the
+    same order.
+    """
+    dispatcher, recorder, spoken = _dispatcher_with_spies()
+
+    # t=0: first signal is voiced immediately (window has never been used).
+    first = dispatcher.offer(_new_object_signal(hazard_id=1), now=0.0)
+    assert first is not None
+    assert len(spoken) == 1
+
+    # t=0.5: inside the 2.5s pacing window, so this one is HELD, not voiced.
+    second = dispatcher.offer(_new_object_signal(hazard_id=2), now=0.5)
+    assert second is None, "should have been held by the pacing window"
+    assert len(spoken) == 1, "a held signal must not be voiced yet"
+    assert len(recorder.recorded) == 1, "and must not be persisted yet either"
+
+    # A poll before the window reopens releases nothing.
+    assert dispatcher.poll(now=1.0) is None
+    assert len(spoken) == 1
+
+    # t=3.0: window has reopened - poll() releases the held signal. THIS is
+    # the path that used to speak without recording.
+    released = dispatcher.poll(now=3.0)
+    assert released is not None
+    assert released.event.hazard_id == 2
+    assert len(spoken) == 2
+
+    # The invariant itself, stated as directly as it can be:
+    assert recorder.recorded == spoken, "every voiced signal must also be recorded"
+
+
+def test_alert_dispatcher_records_red_signals_that_bypass_pacing():
+    """RED bypasses the arbiter's pacing entirely (Shaked, 2026-08-26:
+    immediate danger must never wait its turn). That is a THIRD way into
+    speak(), and the whole point of putting persistence inside speak() is that
+    a new path gets it for free rather than having to remember it.
+    """
+    dispatcher, recorder, spoken = _dispatcher_with_spies()
+
+    dispatcher.offer(_new_object_signal(hazard_id=1), now=0.0)
+    # Immediately inside the pacing window - a non-RED signal would be held.
+    red = dispatcher.offer(_proximity_signal("red", hazard_id=9), now=0.1)
+
+    assert red is not None, "RED must never be held by the pacing window"
+    assert len(spoken) == 2
+    assert recorder.recorded == spoken
+
+
+def test_alert_dispatcher_with_persistence_disabled_still_voices():
+    """--disable-persistence passes event_recorder=None. The parent must
+    still be told; only the database write is skipped. Guards against a future
+    refactor making persistence load-bearing for voicing.
+    """
+    dispatcher = re.AlertDispatcher(re.AlertArbiter(), audio_player=None, event_recorder=None)
+    voiced = dispatcher.offer(_new_object_signal(), now=0.0)
+    assert voiced is not None
+    assert dispatcher.banner_text is not None
+
+
+def test_alert_dispatcher_banner_expires_on_its_own_clock():
+    """The banner state main() used to hold as alert_text/alert_until locals.
+    Both the cv2.imshow overlay and /risk_status's `alert` field now read it
+    through banner(), so the pixels and the JSON cannot disagree.
+    """
+    fake_now = [100.0]
+    dispatcher = re.AlertDispatcher(
+        re.AlertArbiter(), audio_player=None, event_recorder=None,
+        clock=lambda: fake_now[0],
+    )
+    assert dispatcher.banner(now=100.0) == (None, False)
+
+    dispatcher.offer(_new_object_signal(), now=0.0)
+    text, active = dispatcher.banner(now=100.0)
+    assert text is not None and active is True
+
+    # Just before expiry, still active; just after, text is retained but the
+    # banner reports inactive (matching the old `now < alert_until` check).
+    _, active = dispatcher.banner(now=100.0 + re.ALERT_BANNER_SECONDS - 0.01)
+    assert active is True
+    text, active = dispatcher.banner(now=100.0 + re.ALERT_BANNER_SECONDS + 0.01)
+    assert active is False
+    assert text is not None, "text is retained; only `active` goes false"
+
+
+def test_alert_dispatcher_closed_signals_never_reach_it():
+    """Sanity check on the scope boundary: 'closed' signals are filtered by
+    main()'s handle_alert_signal BEFORE the dispatcher, and audio_for_signal
+    returns None for them. There is deliberately no persisted close time
+    (backend/db.py: no ended_at column, by design) - if a 'closed' signal ever
+    did reach speak(), it would create a row that decision 3 says should not
+    exist. Pinned so that stays a deliberate choice.
+    """
+    assert re.audio_for_signal(_proximity_signal("red", kind="closed")) is None
+
+
 def run_all():
     tests = [obj for name, obj in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:
