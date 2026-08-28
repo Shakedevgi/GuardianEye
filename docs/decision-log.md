@@ -2432,3 +2432,45 @@ project's own record is that a clean suite is not proof for this particular
 code — the Phase 6 bug passed 93/93 the entire time it was losing half the
 session's alerts. A short camera run confirming alerts still voice, banner,
 and land in the DB should happen before docs-agent closes the phase.
+
+### 2026-08-28 — AlertDispatcher refactor live-re-verified: alerts still
+voice, banner, and persist correctly
+
+Shaked ran a live camera session against `c9c3046` (the `AlertDispatcher`
+extraction commit) specifically to close the one open item that commit
+left on the record — the Phase 7 stream/keyboard live test had run against
+the prior commit, before this refactor touched the alert path.
+
+**Method: the same one that caught the original Phase 6 bug** — diff
+`ALERT:` terminal lines against `events` rows for the run's own
+`run_started_at`, not a bare pass/fail read of the session. The terminal
+log shows 6 `ALERT:` lines (3 `New object detected (room scan): object`,
+3 `RISK ORANGE: object approaching` for persons #1/#2/#3). The DB shows
+6 rows for that exact `run_started_at`, in the same order, same kind,
+same hazard/person ids, same zones — a clean one-to-one match:
+
+```
+id=27 new_object  hazard=15               reason="room scan"
+id=28 new_object  hazard=16               reason="room scan"
+id=29 new_object  hazard=17               reason="room scan"
+id=30 proximity   hazard=4 person=1 zone=orange
+id=31 proximity   hazard=4 person=2 zone=orange
+id=32 proximity   hazard=4 person=3 zone=orange
+```
+
+`session_local_id` has two gaps (5, 6 — between the last new-object row's 3
+and the first proximity row's 4/7) - two `AlertEvent`s were opened
+internally but never won voicing (held by `AlertArbiter`'s pacing window,
+then superseded or the window never reopened before another candidate took
+priority). This is normal arbiter behaviour, not a discrepancy: per the fix,
+a row is written only for what actually reached `speak()`, and both this
+session and the entry above confirm nothing that *did* reach `speak()` went
+unrecorded.
+
+This closes the one item the AlertDispatcher commit left open. Phase 7 is
+now fully live-verified: the stream/keyboard test (against `b768510`) and
+the alert-persistence invariant (against `c9c3046`, this entry) both
+checked on real hardware, not just a green test suite - matching this
+project's standing "a clean run is not proof" position, applied here
+specifically because the Phase 6 bug this refactor touches passed 93/93 the
+entire time it was live-dropping alerts.
