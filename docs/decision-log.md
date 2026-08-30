@@ -2579,3 +2579,75 @@ None of these five block closing the phase. `PHASE_PLAN.md`'s Phase 7
 status set to `[x]` in this same turn. Also fixed this session, as a pure
 mechanical correction: `PHASE_PLAN.md`'s Phase 4 status block's stale
 "NOT yet watched happen on camera" bullet (see above).
+
+### 2026-08-30 — Post-close live check: `--serve` after the AlertDispatcher
+refactor, and remote review driven over real HTTP
+
+Phase 7 was already closed (`60ad82b`) when Shaked asked whether another
+camera run was needed before Phase 8. Checking rather than reassuring turned
+up two things that had genuinely never run on hardware, both of which Phase 8
+builds directly on:
+
+1. **`--serve` had not run since the `AlertDispatcher` refactor.** The two
+   live sessions each covered one half and never overlapped: session 1
+   (`b768510`) exercised `--serve` but predates the refactor; session 2
+   (`c9c3046`) verified the alert/persistence invariant but was run *without*
+   `--serve`, so `build_risk_status`'s new `alert_dispatcher.banner(now)` read
+   had never executed on a real frame.
+2. **Remote confirm/dismiss had never touched a real `HazardMap`.** Covered by
+   `TestClient` tests and by the pre-flight, but the pre-flight used a
+   *synthetic* loop with stub handlers - the real `handle_dismiss` calling
+   `hazard_map.dismiss(entry_id, last_valid_frame)` over HTTP had never fired.
+
+**Both now verified live** (`run_started_at=2026-08-30T04:53:03.962563+00:00`).
+
+`--serve` came up clean: `Serving on http://127.0.0.1:8000`, and
+`/risk_status` returned real values throughout - `fps: 17.27`, `device: mps`,
+`model: yolo26l.pt`, plus `review_queue: {length: 12, current_id: 14, queue:
+[14,15,16,17,18,19,20,22,23,24,25,26]}`, i.e. the `ReviewQueue.ids()` fix
+publishing genuine FIFO membership against a live queue rather than a derived
+set. **17.27 fps with the server running is above the 15 fps target**, so the
+publish path and the streaming threads cost nothing measurable in the frame
+loop - worth recording as a number rather than an assumption.
+
+`POST /review/{id}/confirm` moved `confirmed` 3→4 and advanced the queue.
+`POST /review/{id}/dismiss` moved `dismissed` 21→22 and flipped entry #31 to
+`state: dismissed, alerts_on_approach: false`. `POST /review/99999/confirm`
+correctly returned `{ok: false, reason: "not the current review candidate"}`.
+
+**The fingerprint proof, which is the whole reason dismiss routes through the
+command queue instead of the HTTP thread.** `fingerprint_changed()` prints
+`no fingerprint recorded - treating as changed` when the crop is missing, and
+a real `change_frac=` otherwise. Entry #31 - dismissed *over HTTP*, never by a
+keypress - produced on every subsequent scan:
+
+```
+Dismissed entry #31 (not a hazard).
+  [fingerprint] entry #31: change_frac=0.000 (threshold=0.15)
+  ...
+  [fingerprint] entry #31: change_frac=0.024 (threshold=0.15)
+```
+
+Real measured fractions, including non-zero ones. The command queue handed
+the handler a genuine live frame, the crop was stored, and CLAUDE.md decision
+4's "spot changed since dismissal" re-raise rule is actively running against
+it. Had dismiss been wired to the HTTP thread, this is exactly where it would
+have silently degraded - the failure Phase 5 spent two debugging rounds on.
+
+**One limit on this session's persistence check, stated rather than glossed.**
+21 event rows exist for this run and the first two `ALERT:` lines (both
+`refrigerator` named-detections) map exactly to rows 1 and 2, with
+`session_local_id` gaps consistent with the expected opened-but-never-voiced
+events. But the terminal log captured was **truncated** - the DB carries
+`session_local_id` up to 38 including three proximity ORANGE events absent
+from the captured text - so this is NOT the full one-to-one audit performed
+for the 2026-08-28 session. The invariant was already closed by that session;
+this run corroborates it, and is not claimed as independent proof.
+
+**Process note:** the first attempt at this check contained a bug in the
+*verification script*, not the server - it read `/review` twice, the queue
+drained between reads, and it posted to `/review/None/dismiss`, which FastAPI
+correctly rejected with a 422 path-parse error. Recorded because a harness bug
+that looks like a server failure is exactly the kind of thing that gets
+mis-filed, and the retry (poll until a candidate exists, then dismiss) is the
+correct shape for anyone re-running this.
