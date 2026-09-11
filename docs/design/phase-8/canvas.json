@@ -1,0 +1,124 @@
+{
+  "artboards": [
+    {
+      "file": "Main.dc.html",
+      "title": "A \u00b7 Night Watch \u2014 calm",
+      "x": 0,
+      "y": 0,
+      "w": 1024,
+      "h": 768
+    },
+    {
+      "file": "DirectionB_Idle.dc.html",
+      "title": "B \u00b7 Console \u2014 calm",
+      "x": 1124,
+      "y": 0,
+      "w": 1024,
+      "h": 768
+    },
+    {
+      "file": "DirectionC_Idle.dc.html",
+      "title": "C \u00b7 Ambient \u2014 calm",
+      "x": 2248,
+      "y": 0,
+      "w": 1024,
+      "h": 768
+    },
+    {
+      "file": "DirectionA_Alert.dc.html",
+      "title": "A \u00b7 Night Watch \u2014 red",
+      "x": 0,
+      "y": 908,
+      "w": 1024,
+      "h": 768
+    },
+    {
+      "file": "DirectionB_Alert.dc.html",
+      "title": "B \u00b7 Console \u2014 red",
+      "x": 1124,
+      "y": 908,
+      "w": 1024,
+      "h": 768
+    },
+    {
+      "file": "DirectionC_Alert.dc.html",
+      "title": "C \u00b7 Ambient \u2014 red",
+      "x": 2248,
+      "y": 908,
+      "w": 1024,
+      "h": 768
+    },
+    {
+      "file": "DirectionA_Review.dc.html",
+      "title": "A \u00b7 Night Watch \u2014 review",
+      "x": 0,
+      "y": 1816,
+      "w": 1024,
+      "h": 768
+    },
+    {
+      "file": "DirectionB_Review.dc.html",
+      "title": "B \u00b7 Console \u2014 review",
+      "x": 1124,
+      "y": 1816,
+      "w": 1024,
+      "h": 768
+    },
+    {
+      "file": "DirectionC_Review.dc.html",
+      "title": "C \u00b7 Ambient \u2014 review",
+      "x": 2248,
+      "y": 1816,
+      "w": 1024,
+      "h": 768
+    },
+    {
+      "file": "Palette.dc.html",
+      "title": "Shared \u00b7 colours already decided",
+      "x": 1124,
+      "y": 2724,
+      "w": 1024,
+      "h": 700
+    }
+  ],
+  "annotations": [
+    {
+      "id": "row-calm",
+      "x": -320,
+      "y": 0,
+      "w": 260,
+      "text": "CALM \u2014 the state the product is in almost all the time. If this looks alarming, parents stop trusting it."
+    },
+    {
+      "id": "row-red",
+      "x": -320,
+      "y": 908,
+      "w": 260,
+      "text": "RED \u2014 has to be readable from the doorway, in the dark, out of the corner of your eye."
+    },
+    {
+      "id": "row-review",
+      "x": -320,
+      "y": 1816,
+      "w": 260,
+      "text": "REVIEW \u2014 one item at a time, in arrival order. The queue is strictly first-in-first-out: only the front item can be acted on, so no direction offers a pick-any list."
+    },
+    {
+      "id": "how-to-read",
+      "x": -320,
+      "y": 2724,
+      "w": 260,
+      "text": "CHOSEN 2026-08-30: direction B, Console. Shaked's reason - the built app needed to read as real desktop software, and B is the direction that does. A and C stay here on purpose: nothing is locked, and Yahli has not reacted yet.\n\nRead DOWN a column to judge one direction. Read ACROSS a row to compare the same moment three ways."
+    },
+    {
+      "id": "no-ack-route",
+      "x": -320,
+      "y": 1170,
+      "w": 260,
+      "text": "No 'Got him' / 'Mute' button, deliberately. Nothing in the backend can acknowledge or silence an alert that is happening now - confirm/dismiss/skip are about what an OBJECT is, not about an alert in progress. Rather than draw a button that does nothing, the alert stays informational and clears itself when he moves away. Making acknowledgement real means adding it to the backend first."
+    }
+  ],
+  "launch": {
+    "view": "canvas"
+  }
+}

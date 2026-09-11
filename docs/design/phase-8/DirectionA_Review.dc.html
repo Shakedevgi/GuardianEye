@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+  <style>
+    body { margin: 0; font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; }
+    a { color: #ff8c00; } a:hover { color: #ffb04d; }
+    .cond { font-family: "Barlow Semi Condensed", "IBM Plex Sans", system-ui, sans-serif; }
+  </style>
+</helmet>
+
+<div style="width: 1024px; height: 768px; background: #07080a; display: flex; flex-direction: column; box-sizing: border-box;">
+
+  <!-- live view dimmed but never hidden: the room keeps being watched while you triage -->
+  <div style="flex-grow: 1; position: relative; background: #0d1014; overflow: hidden;">
+    <div style="position: absolute; inset: 0; background: linear-gradient(#0f1319 0%, #0f1319 46%, #171c23 46%, #12161c 100%); opacity: 0.5;"></div>
+    <div style="position: absolute; left: 40px; top: 190px; width: 300px; height: 150px; background: #1b212a; border-radius: 10px 10px 4px 4px; opacity: 0.5;"></div>
+    <div style="position: absolute; left: 470px; top: 292px; width: 190px; height: 78px; background: #1d232c; border-radius: 4px; opacity: 0.5;"></div>
+    <!-- the candidate keeps its white review outline, exactly as the engine draws it -->
+    <div style="position: absolute; left: 464px; top: 286px; width: 202px; height: 90px; border: 3px solid #ffffff;"></div>
+  </div>
+
+  <!-- one card. no list, no checkboxes: the queue is strictly first-in-first-out -->
+  <div style="height: 430px; flex-shrink: 0; background: #101317; border-top: 1px solid #23262b; padding: 26px 30px; display: flex; gap: 28px; box-sizing: border-box;">
+
+    <div style="width: 260px; height: 196px; flex-shrink: 0; border-radius: 6px; border: 3px solid #ff8c00; background: #191d23; position: relative; overflow: hidden;">
+      <div style="position: absolute; left: 46px; top: 62px; width: 168px; height: 72px; background: #232a33; border-radius: 4px;"></div>
+      <div style="position: absolute; left: 8px; bottom: 8px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #8b939c;">what the camera saw</div>
+    </div>
+
+    <div style="flex-grow: 1; display: flex; flex-direction: column;">
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 12px; border-radius: 14px; background: rgba(255,140,0,0.14); border: 1px solid #ff8c00;">
+          <div style="width: 7px; height: 7px; border-radius: 50%; background: #ff8c00;"></div>
+          <div style="font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: #ffb04d;">alerting now</div>
+        </div>
+        <div class="cond" style="font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; color: #5b636c;">1 of 3</div>
+      </div>
+
+      <div class="cond" style="font-size: 44px; line-height: 1.06; color: #e8eaed; margin-top: 16px;">Something arrived on the low table</div>
+      <div style="font-size: 16px; line-height: 1.5; color: #8b939c; margin-top: 10px; max-width: 520px;">It appeared at 14:02, after monitoring started. Until you say otherwise it is treated as dangerous and will alert when he gets close.</div>
+
+      <div style="flex-grow: 1;"></div>
+
+      <div style="display: flex; gap: 12px;">
+        <div style="display: flex; align-items: center; justify-content: center; height: 60px; padding: 0 30px; border-radius: 30px; background: #ff0000; color: #ffffff; font-size: 18px; font-weight: 600;">Yes, dangerous</div>
+        <div style="display: flex; align-items: center; justify-content: center; height: 60px; padding: 0 30px; border-radius: 30px; border: 1px solid #3a4048; color: #d4d8dd; font-size: 18px;">Not a hazard</div>
+        <div style="flex-grow: 1;"></div>
+        <div style="display: flex; align-items: center; justify-content: center; height: 60px; padding: 0 24px; border-radius: 30px; color: #6b737c; font-size: 17px;">Skip all for now</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

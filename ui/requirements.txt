@@ -1,0 +1,77 @@
+# GuardianEye - ui component - dependencies
+#
+# Phase 8 (Flet desktop + web app). Separate from cv/requirements.txt and
+# backend/requirements.txt because each component owns its own file, but
+# installed into the SAME shared .venv at the repo root - there is one
+# virtualenv for this project, not one per component:
+#
+#     .venv/bin/python3 -m pip install -r cv/requirements.txt \
+#         -r backend/requirements.txt -r ui/requirements.txt
+#
+# Pinned exactly (not >=), matching the policy cv/ and backend/ already state.
+# Here the pin is doing more work than usual, so it is worth being explicit
+# about why:
+#
+# 0.86.5 is a HARD API BREAK from the 0.28-era Flet that virtually every
+# tutorial, StackOverflow answer and LLM-generated snippet still shows. Code
+# written from memory of the old API fails in ways that look like environment
+# problems rather than version problems. Measured differences that bit during
+# the Phase 8 probe (see docs/decision-log.md, 2026-08-30):
+#
+#   - main() is async-first; ft.run(main) replaces ft.app(target=main).
+#   - ft.Image.src is typed `str | bytes`. Passing raw JPEG bytes is what
+#     replaced src_base64, which NO LONGER EXISTS. This is load-bearing for
+#     this project: it is the only measured way to get live video into Flet
+#     (see below).
+#   - ft.Image requires src as a positional argument - there is no
+#     "construct empty, fill later".
+#   - Page.take_screenshot() returns a COROUTINE and must be awaited.
+#   - Screenshot.capture(pixel_ratio=2) raises "type 'int' is not a subtype
+#     of type 'double?'" - pass a float.
+#
+# WHY THE VIDEO PATH DEPENDS ON THIS PIN. /video_feed is
+# multipart/x-mixed-replace (MJPEG). Handing that URL to ft.Image does NOT
+# work and does not fail loudly: on desktop the control stays permanently
+# blank with no error event while the Flutter client buffers the endless
+# response at ~25 MB/min; in a browser Flutter fetches images by XHR (not an
+# <img> tag, and the HTML renderer that would have made <img> work no longer
+# exists), so it is blocked cross-origin and would be decoded as one image
+# anyway. The approach that works - measured 13.9 fps against a 15 fps source
+# on BOTH desktop and web, with flat memory over 1245 frames - is to parse
+# the multipart stream in PYTHON and assign raw JPEG bytes to Image.src. That
+# is a behaviour of this pinned version's API surface, so it should not
+# silently ride an auto-upgrade.
+#
+# Deliberately NOT included:
+#   - flet-video: clip playback is handed off to the system browser for now
+#     (decision 4, 2026-08-30). Add this pin if that is ever revisited.
+#   - flet-audio: voice alerts are pre-recorded clips played by
+#     cv/risk_engine.py (CLAUDE.md decision 4). The UI does not play audio.
+#
+# flet-desktop ships the native window client; flet-web ships the browser
+# client. Phase 8's done-when requires BOTH (a desktop window AND a tablet on
+# the WiFi), so both are pinned explicitly rather than left to an extra.
+# flet-web additionally means the Flutter client assets are served from
+# localhost rather than a CDN - verified, every request during the probe went
+# to 127.0.0.1 - which matters for a product whose whole stance is that none
+# of this leaves the house.
+
+flet==0.86.5
+flet-desktop==0.86.5
+flet-web==0.86.5
+
+# flet-cli's `flet run` command is the ONLY documented way the App Store
+# "Flet" preview app connects to a script on this machine (confirmed by
+# reading flet_cli/commands/run.py: `--ios` sets FLET_FORCE_WEB_SERVER=true,
+# which routes through the same flet-web transport `--mode web` already
+# uses - it is NOT a separate native protocol, see docs/decision-log.md,
+# 2026-09-06). Pinned explicitly rather than left to auto-install (which is
+# what happened the first time it was used) so a clean checkout has it too.
+flet-cli==0.86.5
+
+# opencv is used ONLY to downscale frames for the web/tablet path (see
+# ui/video.py MjpegClient._shrink). It is already a cv/ dependency in the
+# shared .venv; pinned here explicitly rather than left implicit so a
+# clean-venv install of ui/ alone cannot produce a UI whose web video path
+# silently falls back to full-resolution frames and a black pane.
+opencv-python==5.0.0.93

@@ -1,0 +1,71 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+  <style>
+    body { margin: 0; font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; }
+    a { color: #ff8c00; } a:hover { color: #ffb04d; }
+    .cond { font-family: "Barlow Semi Condensed", "IBM Plex Sans", system-ui, sans-serif; }
+  </style>
+</helmet>
+
+<div style="width: 1024px; height: 768px; background: #07080a; display: flex; flex-direction: column; box-sizing: border-box;">
+
+  <!-- risk edge: idle = hairline, neutral -->
+  <div style="flex-grow: 1; padding: 3px; background: #23262b; display: flex;">
+    <div style="flex-grow: 1; position: relative; background: #0d1014; overflow: hidden;">
+
+      <!-- synthetic camera view -->
+      <div style="position: absolute; inset: 0; background: linear-gradient(#0f1319 0%, #0f1319 46%, #171c23 46%, #12161c 100%);"></div>
+      <div style="position: absolute; left: 40px; top: 300px; width: 300px; height: 150px; background: #1b212a; border-radius: 10px 10px 4px 4px;"></div>
+      <div style="position: absolute; left: 470px; top: 402px; width: 190px; height: 78px; background: #1d232c; border-radius: 4px;"></div>
+      <div style="position: absolute; left: 806px; top: 250px; width: 150px; height: 230px; background: #161b22; border-radius: 4px;"></div>
+      <div style="position: absolute; left: 690px; top: 300px; width: 46px; height: 46px; background: #2a3038; border-radius: 50%;"></div>
+      <div style="position: absolute; left: 694px; top: 348px; width: 40px; height: 108px; background: #2a3038; border-radius: 14px;"></div>
+
+      <!-- engine boxes: person green, hazards by state -->
+      <div style="position: absolute; left: 682px; top: 292px; width: 62px; height: 174px; border: 2px solid #00ff00;"></div>
+      <div style="position: absolute; left: 464px; top: 396px; width: 202px; height: 90px; border: 2px solid #ff0000;"></div>
+      <div style="position: absolute; left: 34px; top: 294px; width: 312px; height: 162px; border: 2px solid #00ffff;"></div>
+      <div style="position: absolute; left: 800px; top: 244px; width: 162px; height: 242px; border: 2px solid #8c8c8c;"></div>
+
+      <!-- idle status band, bottom-left, minimal -->
+      <div style="position: absolute; left: 0; right: 0; bottom: 0; padding: 22px 26px; display: flex; align-items: flex-end; justify-content: space-between; background: linear-gradient(rgba(7,8,10,0), rgba(7,8,10,0.92));">
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+          <div class="cond" style="font-size: 46px; line-height: 1; letter-spacing: 0.01em; color: #e8eaed;">All calm</div>
+          <div style="font-size: 15px; color: #7c848e;">No one near anything flagged</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 26px;">
+          <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 3px;">
+            <div class="cond" style="font-size: 26px; color: #e8eaed;">3</div>
+            <div style="font-size: 12px; letter-spacing: 0.09em; text-transform: uppercase; color: #7c848e;">to review</div>
+          </div>
+          <div style="width: 1px; height: 34px; background: #2b3037;"></div>
+          <div style="display: flex; align-items: center; gap: 9px;">
+            <div style="width: 8px; height: 8px; border-radius: 50%; background: #00ff00;"></div>
+            <div style="font-size: 13px; color: #9aa3ad;">Camera live</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- one quiet action bar; nothing else competes -->
+  <div style="height: 78px; flex-shrink: 0; display: flex; align-items: center; gap: 12px; padding: 0 26px; background: #07080a; border-top: 1px solid #16191d;">
+    <div style="display: flex; align-items: center; justify-content: center; height: 46px; padding: 0 22px; border-radius: 23px; background: #16191d; color: #d4d8dd; font-size: 15px;">Review 3 things</div>
+    <div style="display: flex; align-items: center; justify-content: center; height: 46px; padding: 0 22px; border-radius: 23px; border: 1px solid #23262b; color: #8b939c; font-size: 15px;">Saved moments</div>
+    <div style="flex-grow: 1;"></div>
+    <div class="cond" style="font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; color: #4d545c;">Arducam &middot; living room</div>
+  </div>
+
+</div>
+</x-dc>
+</body>
+</html>

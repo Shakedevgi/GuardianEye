@@ -422,3 +422,16 @@ without manual intervention.
 - Cloud architecture / remote access
 - Dedicated mobile app
 - Automatic new-hazard discovery mid-session beyond current detection loop
+- **One-command launch / packaged app** (Shaked, 2026-08-30: "we can't each
+  time do like 3 terminal commands and run it like devs"). The goal is that
+  starting GuardianEye is ONE action, not a developer ritual. Recorded as the
+  goal rather than as a technology, because the obvious technology does not
+  work here: **Docker is the wrong tool for this specific project**, and that
+  is a hardware fact, not an opinion. A Linux container on macOS cannot see
+  the USB camera (Docker Desktop does not pass through USB video devices) and
+  cannot see Apple's MPS GPU (torch would fall back to CPU), so containerising
+  would break both the camera capture and the ~17 fps inference this system is
+  built on. What actually gets the goal: a single launcher (one script that
+  starts the camera/backend and the UI together and shuts both down cleanly),
+  and/or `flet build macos` to produce a real double-clickable .app for the UI
+  half. See `docs/decision-log.md`, 2026-08-30.

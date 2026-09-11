@@ -286,6 +286,36 @@ DISMISS_REAPPEAR_CONSECUTIVE_SCANS_REQUIRED = 2
 # session) - see the report for what that means is still unverified.
 SCAN_CONSECUTIVE_SCANS_REQUIRED = 2
 
+# How many consecutive missed scans it takes to forget a spot the PARENT HAS
+# ALREADY JUDGED (confirmed or dismissed), as opposed to one still awaiting
+# review. Deliberately far larger than SCAN_CONSECUTIVE_SCANS_REQUIRED.
+#
+# WHY THIS EXISTS (Shaked, live, 2026-08-30 - "the re-hazard detected 100
+# times in the same spot error is back"). Before this constant, EVERY
+# scan-origin entry expired after 2 missed scans regardless of state. So a
+# confirmed or dismissed spot the segmenter simply failed to return a box for
+# twice in a row - routine for a class-agnostic segmenter on anything
+# low-contrast, thin or oddly lit - was DELETED, taking the parent's decision
+# with it. The next time that spot was seen it came back through the
+# provisional/arrived path as a BRAND NEW pending entry, which by CLAUDE.md
+# decision 4 alerts on appearance AND on approach. At a 5s scan cadence that
+# is a full re-alert every ~20s, forever, with nothing in the room having
+# changed. Reproduced in isolation for BOTH confirm and dismiss before
+# changing anything.
+#
+# Note this bypassed the 2026-08-26 dismissal-fingerprint work entirely:
+# fingerprint_changed() only runs when a candidate MATCHES an existing
+# dismissed entry, and here there was no entry left to match.
+#
+# The asymmetry is the point: a detection is cheap and repeatable, a parent's
+# decision is expensive and must not be silently discarded. 60 scans at the
+# 5s default cadence is ~5 minutes of continuous absence - long enough that
+# intermittent segmenter misses can never accumulate to it, short enough that
+# an object genuinely carried out of the room still leaves the map rather
+# than haunting an empty spot forever (which is why option A, "judged spots
+# never expire", was offered and NOT chosen - Shaked, 2026-08-30).
+JUDGED_ABSENT_SCANS_REQUIRED = 60
+
 # If tracked people cover more than this fraction of the frame when a scan
 # is due, the scan is deferred to the next cadence tick instead of run this
 # tick. Reasoning: person-overlap suppression (reused from
@@ -938,7 +968,12 @@ class HazardMap:
             if entry.id in matched_ids:
                 continue
             entry.absent_scans += 1
-            if entry.absent_scans >= SCAN_CONSECUTIVE_SCANS_REQUIRED:
+            # A spot the parent has already ruled on gets a far longer
+            # absence budget than one still awaiting review - see
+            # JUDGED_ABSENT_SCANS_REQUIRED for the live failure this fixes.
+            judged = entry.state in (HAZARD_STATE_CONFIRMED, HAZARD_STATE_DISMISSED)
+            threshold = JUDGED_ABSENT_SCANS_REQUIRED if judged else SCAN_CONSECUTIVE_SCANS_REQUIRED
+            if entry.absent_scans >= threshold:
                 removed.append(entry)
         if removed:
             removed_ids = {e.id for e in removed}

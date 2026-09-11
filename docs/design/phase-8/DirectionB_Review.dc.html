@@ -1,0 +1,79 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+  <style>
+    body { margin: 0; font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; }
+    a { color: #7fb0ff; } a:hover { color: #a8c8ff; }
+    .mono { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }
+    .lbl { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #6a737d; }
+  </style>
+</helmet>
+
+<div style="width: 1024px; height: 768px; background: #0b0e12; display: flex; box-sizing: border-box; color: #d7dce2;">
+
+  <div style="width: 244px; flex-shrink: 0; background: #0e1217; border-right: 1px solid #1b2029; padding: 20px 18px; display: flex; flex-direction: column; gap: 20px; box-sizing: border-box;">
+    <div class="lbl">review queue</div>
+    <!-- position is shown; selection is not offered. the queue is strictly FIFO -->
+    <div style="display: flex; flex-direction: column; gap: 8px;">
+      <div style="display: flex; align-items: center; gap: 10px; padding: 10px 11px; border: 1px solid #ffffff; background: #161b22;">
+        <div class="mono" style="font-size: 12px; color: #ffffff;">1</div>
+        <div style="flex-grow: 1; font-size: 14px; color: #ffffff;">Low table</div>
+        <div style="width: 9px; height: 9px; border: 2px solid #ff8c00; box-sizing: border-box;"></div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 10px; padding: 10px 11px; opacity: 0.42;">
+        <div class="mono" style="font-size: 12px; color: #6a737d;">2</div>
+        <div style="flex-grow: 1; font-size: 14px; color: #8b949e;">Floor, by the sofa</div>
+        <div style="width: 9px; height: 9px; border: 2px solid #00ffff; box-sizing: border-box;"></div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 10px; padding: 10px 11px; opacity: 0.42;">
+        <div class="mono" style="font-size: 12px; color: #6a737d;">3</div>
+        <div style="flex-grow: 1; font-size: 14px; color: #8b949e;">Low shelf</div>
+        <div style="width: 9px; height: 9px; border: 2px solid #00ffff; box-sizing: border-box;"></div>
+      </div>
+    </div>
+    <div style="font-size: 12px; line-height: 1.5; color: #5d666f;">You decide these one at a time, in order.</div>
+    <div style="flex-grow: 1;"></div>
+    <div class="mono" style="font-size: 11px; color: #4f5761;">parent view</div>
+  </div>
+
+  <div style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0; padding: 22px 24px; box-sizing: border-box; gap: 18px;">
+
+    <div style="display: flex; align-items: center; gap: 12px;">
+      <div style="display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 11px; background: rgba(255,140,0,0.13); border: 1px solid #ff8c00;">
+        <div class="mono" style="font-size: 11px; letter-spacing: 0.05em; color: #ffb04d;">ALERTING NOW</div>
+      </div>
+      <div class="mono" style="font-size: 12px; color: #6a737d;">appeared 14:02 &middot; after monitoring started</div>
+    </div>
+
+    <div style="display: flex; gap: 20px;">
+      <div style="width: 340px; height: 226px; flex-shrink: 0; border: 3px solid #ff8c00; background: #191d23; position: relative; overflow: hidden;">
+        <div style="position: absolute; left: 62px; top: 74px; width: 216px; height: 86px; background: #232a33;"></div>
+        <div class="mono" style="position: absolute; left: 8px; bottom: 7px; font-size: 10px; letter-spacing: 0.07em; color: #8b949e;">CROP AT DETECTION</div>
+      </div>
+      <div style="flex-grow: 1; display: flex; flex-direction: column;">
+        <div style="font-size: 30px; line-height: 1.15; color: #e8ecf1;">Something is on the low table that was not there before</div>
+        <div style="font-size: 15px; line-height: 1.55; color: #8b949e; margin-top: 12px;">GuardianEye does not know what it is, and does not need to. Until you decide, it is treated as dangerous.</div>
+      </div>
+    </div>
+
+    <div style="flex-grow: 1;"></div>
+
+    <div style="display: flex; gap: 12px;">
+      <div style="display: flex; align-items: center; justify-content: center; height: 56px; padding: 0 30px; background: #ff0000; color: #ffffff; font-size: 17px; font-weight: 600;">Yes, dangerous</div>
+      <div style="display: flex; align-items: center; justify-content: center; height: 56px; padding: 0 30px; border: 1px solid #2a313b; color: #d7dce2; font-size: 17px;">Not a hazard</div>
+      <div style="flex-grow: 1;"></div>
+      <div style="display: flex; align-items: center; justify-content: center; height: 56px; padding: 0 22px; color: #6a737d; font-size: 16px;">Skip all for now</div>
+    </div>
+
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

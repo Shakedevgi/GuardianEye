@@ -307,6 +307,91 @@ def test_apply_scan_candidates_removed_after_two_consecutive_absences():
     assert len(hm.entries) == 0
 
 
+def test_judged_entry_survives_the_absence_that_removes_an_unreviewed_one():
+    """Shaked, live 2026-08-30: "the re-hazard detected 100 times in the same
+    spot error is back." Root cause was that EVERY scan-origin entry expired
+    after SCAN_CONSECUTIVE_SCANS_REQUIRED misses regardless of state, so a
+    spot the parent had already judged was deleted - judgement and all - by
+    two routine segmenter misses, then came back through the arrived path as
+    a brand-new PENDING entry that alerts on appearance (CLAUDE.md decision
+    4). At a 5s cadence that is a fresh alert every ~20s, forever.
+
+    This pins the asymmetry directly: same absence, different outcome
+    depending on whether a human has ruled on the spot.
+    """
+    frame_diagonal = math.hypot(1920, 1080)
+    frame = _solid_frame((100, 100, 100))
+    spot = (100, 100, 200, 200)
+
+    for judge in ("confirm", "dismiss"):
+        hm = re.HazardMap()
+        hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=True)
+        hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False)
+        entry_id = hm.entries[0].id
+        if judge == "confirm":
+            hm.confirm(entry_id)
+        else:
+            hm.dismiss(entry_id, frame)
+
+        # The exact absence that deletes an unreviewed entry.
+        for _ in range(re.SCAN_CONSECUTIVE_SCANS_REQUIRED):
+            diff = hm.apply_scan_candidates([], frame, frame_diagonal, is_first_scan_cycle=False)
+            assert diff.removed == [], f"{judge}: judged entry removed by a routine miss"
+
+        assert len(hm.entries) == 1, f"{judge}: judged entry disappeared"
+        assert hm.entries[0].id == entry_id, f"{judge}: identity lost"
+
+        # Seen again: it must be the SAME entry with its judgement intact,
+        # never a new arrival.
+        diff = hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False)
+        assert diff.arrived == [], f"{judge}: re-raised as a new arrival"
+        assert len(hm.entries) == 1
+        assert hm.entries[0].id == entry_id
+        expected = re.HAZARD_STATE_CONFIRMED if judge == "confirm" else re.HAZARD_STATE_DISMISSED
+        assert hm.entries[0].state == expected, f"{judge}: judgement lost"
+
+
+def test_judged_entry_is_still_removed_after_a_long_enough_absence():
+    """The other half of the trade-off, so the fix cannot silently become
+    "judged spots live forever" (option A, which was offered and NOT chosen):
+    an object actually carried out of the room must still leave the map,
+    otherwise an empty spot keeps alerting."""
+    frame_diagonal = math.hypot(1920, 1080)
+    frame = _solid_frame((100, 100, 100))
+    spot = (100, 100, 200, 200)
+    hm = re.HazardMap()
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False)
+    hm.confirm(hm.entries[0].id)
+
+    for _ in range(re.JUDGED_ABSENT_SCANS_REQUIRED - 1):
+        hm.apply_scan_candidates([], frame, frame_diagonal, is_first_scan_cycle=False)
+    assert len(hm.entries) == 1, "removed too early"
+
+    diff = hm.apply_scan_candidates([], frame, frame_diagonal, is_first_scan_cycle=False)
+    assert len(diff.removed) == 1
+    assert hm.entries == []
+
+
+def test_unreviewed_entry_absence_budget_is_unchanged_by_the_judged_fix():
+    """Guards the fix's blast radius: PENDING entries must still expire fast.
+    A spot nobody has ruled on is cheap to re-propose, and letting those
+    linger for minutes would quietly fill the review queue with stale items."""
+    frame_diagonal = math.hypot(1920, 1080)
+    frame = _solid_frame((100, 100, 100))
+    spot = (100, 100, 200, 200)
+    hm = re.HazardMap()
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False)
+    assert hm.entries[0].state == re.HAZARD_STATE_PENDING
+
+    for _ in range(re.SCAN_CONSECUTIVE_SCANS_REQUIRED - 1):
+        hm.apply_scan_candidates([], frame, frame_diagonal, is_first_scan_cycle=False)
+    assert len(hm.entries) == 1
+    diff = hm.apply_scan_candidates([], frame, frame_diagonal, is_first_scan_cycle=False)
+    assert len(diff.removed) == 1, "unreviewed entries must still expire quickly"
+
+
 def test_apply_scan_candidates_reappearing_before_second_miss_resets_absence():
     frame_diagonal = math.hypot(1920, 1080)
     frame = _solid_frame((100, 100, 100))

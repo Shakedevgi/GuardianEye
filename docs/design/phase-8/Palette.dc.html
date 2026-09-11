@@ -1,0 +1,92 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+  <style>
+    body { margin: 0; font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; }
+    a { color: #7fb0ff; } a:hover { color: #a8c8ff; }
+    .mono { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace; }
+    .h { font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: #6a737d; }
+  </style>
+</helmet>
+
+<div style="width: 1024px; height: 700px; background: #0b0e12; color: #d7dce2; box-sizing: border-box; padding: 30px 34px; display: flex; flex-direction: column; gap: 22px;">
+
+  <div>
+    <div style="font-size: 26px; color: #e8ecf1;">The colours are already decided</div>
+    <div style="font-size: 14px; line-height: 1.55; color: #8b949e; margin-top: 6px; max-width: 820px;">These hexes are lifted from <span class="mono" style="color: #b9c1ca;">ZONE_COLORS</span> and the hazard-state box colours in <span class="mono" style="color: #b9c1ca;">cv/risk_engine.py</span>. They already mean something to the detection engine, and they are already painted onto the video frames the UI receives. All three directions keep these meanings; they differ only in how loudly they use them when nothing is wrong.</div>
+  </div>
+
+  <div style="display: flex; gap: 26px;">
+
+    <div style="flex-grow: 1; display: flex; flex-direction: column; gap: 10px;">
+      <div class="h">risk zones &middot; how close he is</div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 34px; height: 34px; background: #ff0000;"></div>
+        <div style="flex-grow: 1;"><div style="font-size: 15px;">Red</div><div style="font-size: 12px; color: #8b949e;">alert, and a clip is saved</div></div>
+        <div class="mono" style="font-size: 12px; color: #6a737d;">#FF0000</div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 34px; height: 34px; background: #ff8c00;"></div>
+        <div style="flex-grow: 1;"><div style="font-size: 15px;">Orange</div><div style="font-size: 12px; color: #8b949e;">getting close</div></div>
+        <div class="mono" style="font-size: 12px; color: #6a737d;">#FF8C00</div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 34px; height: 34px; background: #ffff00;"></div>
+        <div style="flex-grow: 1;"><div style="font-size: 15px;">Yellow</div><div style="font-size: 12px; color: #8b949e;">in the area</div></div>
+        <div class="mono" style="font-size: 12px; color: #6a737d;">#FFFF00</div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 34px; height: 34px; background: #8c8c8c;"></div>
+        <div style="flex-grow: 1;"><div style="font-size: 15px;">None</div><div style="font-size: 12px; color: #8b949e;">the normal state</div></div>
+        <div class="mono" style="font-size: 12px; color: #6a737d;">#8C8C8C</div>
+      </div>
+    </div>
+
+    <div style="flex-grow: 1; display: flex; flex-direction: column; gap: 10px;">
+      <div class="h">hazard states &middot; the four-state rule</div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 34px; height: 34px; border: 3px solid #ff0000; box-sizing: border-box;"></div>
+        <div style="flex-grow: 1;"><div style="font-size: 15px;">You confirmed it</div><div style="font-size: 12px; color: #ff8080;">alerts on approach</div></div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 34px; height: 34px; border: 3px solid #ff8c00; box-sizing: border-box;"></div>
+        <div style="flex-grow: 1;"><div style="font-size: 15px;">Arrived, unreviewed</div><div style="font-size: 12px; color: #ff8080;">alerts on approach</div></div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 34px; height: 34px; border: 3px solid #00ffff; box-sizing: border-box;"></div>
+        <div style="flex-grow: 1;"><div style="font-size: 15px;">Was already here</div><div style="font-size: 12px; color: #8b949e;">does not alert yet</div></div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 34px; height: 34px; border: 3px solid #8c8c8c; box-sizing: border-box;"></div>
+        <div style="flex-grow: 1;"><div style="font-size: 15px;">You said it is fine</div><div style="font-size: 12px; color: #8b949e;">does not alert</div></div>
+      </div>
+    </div>
+
+  </div>
+
+  <div style="height: 1px; background: #1b2029;"></div>
+
+  <div style="display: flex; gap: 26px;">
+    <div style="flex-grow: 1;">
+      <div class="h">parent view shows</div>
+      <div style="font-size: 14px; line-height: 1.7; color: #b9c1ca; margin-top: 8px;">The video with its boxes &middot; how close he is, by name &middot; what is waiting for review &middot; saved clips &middot; whether the camera is alive</div>
+    </div>
+    <div style="flex-grow: 1;">
+      <div class="h">developer view adds</div>
+      <div class="mono" style="font-size: 13px; line-height: 1.7; color: #8b949e; margin-top: 8px;">fps &middot; model &middot; imgsz &middot; conf &middot; device &middot; frame_seq &middot; last_frame_age &middot; raw normalized distances &middot; hazard ids, origins, bboxes</div>
+    </div>
+  </div>
+
+  <div style="font-size: 13px; line-height: 1.6; color: #6a737d;">The split is not cosmetic. Those diagnostics are deliberately kept out of the video pixels and served as JSON instead, so the UI &mdash; not the camera loop &mdash; decides who sees them.</div>
+
+</div>
+</x-dc>
+</body>
+</html>

@@ -2651,3 +2651,1133 @@ correctly rejected with a 422 path-parse error. Recorded because a harness bug
 that looks like a server failure is exactly the kind of thing that gets
 mis-filed, and the retry (poll until a candidate exists, then dismiss) is the
 correct shape for anyone re-running this.
+
+### 2026-08-30 — Phase 8 kickoff measurements: Flet cannot render MJPEG, and
+the fix also answers the auth question (findings, not yet decisions)
+
+Phase 8 opened by measuring the one thing that could invalidate the whole
+approach before any layout work, the same way Phase 7 opened on its
+concurrency model. Logged here as findings — **Shaked and Yahli have decided
+none of this yet**, matching the precedent of the 2026-08-09 "Phase 3 Step 0
+measurement (findings, not yet decisions)" entry.
+
+**Measured against the REAL `backend/server.py`,** not an imitation of it: a
+throwaway harness ran `SharedState` + `create_app` + `start_server` with a
+synthetic camera loop publishing real `cv2.imencode` JPEGs, so what the Flet
+probe talked to was production route and multipart-framing code. Flet 0.86.5
+installed into a THROWAWAY venv, deliberately not the shared `.venv`, since
+no version has been agreed yet.
+
+**1. `ft.Image(src="<mjpeg url>")` does not work, on either platform, and
+fails differently — and worse — than a plain error.**
+
+| | desktop (native Flutter) | web (Flutter/CanvasKit in a browser) |
+|---|---|---|
+| renders | **no** | **no** |
+| reports an error | **no** — `error_content` never fires | yes — CORS, then `ERR_FAILED` |
+| memory | Flutter client **+25 MB/min, unbounded** | — |
+
+On desktop the pane stays permanently, silently blank while the Flutter
+client buffers the never-ending `multipart/x-mixed-replace` response into
+memory forever — measured 156 MB → 181 MB in 60 s with that image as the
+*only* thing on the page. Silent blank is the worst possible failure mode
+here: it is indistinguishable from a dark room, which is the exact confusion
+`/health` was added at Phase 7 to prevent. In a browser the request never
+even reaches decoding — Flutter web fetches images by **XHR**, not an `<img>`
+tag, so `multipart/x-mixed-replace` is cross-origin-blocked first and would
+be buffered-then-decoded-as-one-image second. The HTML renderer that would
+have made `<img>` work no longer exists in modern Flutter (`WebRenderer` now
+offers only `auto`/`canvaskit`/`skwasm`).
+
+**2. What does work: the Python side parses the MJPEG stream and pushes raw
+JPEG bytes into `ft.Image`.** Flet 0.86.5's `Image.src` is typed
+`str | bytes` — passing bytes is what replaced the old `src_base64`, so there
+is no base64 inflation. Measured **13.9 fps against a 15 fps source, current
+(not lagging), on BOTH desktop and web**, and **flat memory: zero growth in
+the Flutter client over 1245 frames, ~1 MB in Python.** Cost: 1.9% CPU,
+58 MB RSS Python-side.
+
+**3. Polling a single-shot still (`src="/frame.jpg?t=n"`) works on desktop
+but degrades unacceptably in a browser** — it renders, but the displayed
+frame fell **10 s behind real time, then 16 s** over the following 16 s, i.e.
+the lag grows without bound. Browsers cap concurrent connections per origin
+(~6), so setting `src` at 15 Hz queues requests faster than they drain. This
+is the option that would have looked fine in a five-second demo and drifted
+badly in an overnight run. **No `/frame.jpg` endpoint is needed** — finding 2
+requires no backend change at all, so the additive endpoint floated at
+kickoff is not being requested.
+
+**4. The rendering finding collapses the authentication problem, which is
+why it is logged in the same entry.** Because the Python process fetches
+frames and pushes bytes, **the browser never talks to FastAPI at all** — it
+only talks to Flet's own web server. So `/video_feed` and
+`/clips/{id}/video` can **stay bound to `127.0.0.1`**, exactly as Shaked
+decided at Phase 7, and only ONE surface is ever exposed to the LAN. The
+choice narrows from "how do we authenticate 13 unauthenticated routes" to
+"how do we gate one app," which is a materially smaller problem than the one
+Phase 7 handed forward.
+
+**5. One privacy check, measured rather than assumed:** `ft.run()`'s
+`no_cdn` parameter defaults to `False`, which reads like the Flutter web
+client is fetched from a CDN. It is not — every request the browser made was
+to `127.0.0.1:8551`, including all fonts and the wasm client, because the
+`flet_web` package ships them locally. Recommend setting `no_cdn=True`
+explicitly anyway, so a local-only guarantee is enforced rather than
+incidental.
+
+**6. Two capability constraints found while checking what Flet can build:**
+`Video` and `Audio` are **not** in Flet 0.86.5's core — clip playback needs
+the separate `flet-video` package (available at a matching 0.86.5) or a
+hand-off to the system browser. `flet.canvas.Canvas` (Arc/Path/Circle/Shadow)
+and `Dismissible` (swipe-to-decide) **do** exist, so custom drawing and a
+one-at-a-time triage card are both buildable without leaving Flet.
+
+**Probe scripts live in the session scratchpad and are NOT committed** — the
+same evidentiary gap Phase 7's write-up named as its #1 open item for
+`scratchpad/preflight.py`. Worth a committed, minimal version before Phase 8
+builds on any of this.
+
+**Design directions for Yahli** published as a canvas (three directions ×
+calm/red/review, plus a shared artboard fixing the palette to
+`ZONE_COLORS`' actual hexes). Nothing chosen; the point is to give Yahli
+something to react to before any Flet code is written.
+
+### 2026-08-30 — Phase 8 decisions (Shaked, five calls)
+
+Made against the measurements in the entry above. Logged in the same turn per
+CLAUDE.md's own rule.
+
+1. **A PIN gates the app; FastAPI stays on `127.0.0.1`.** Only the Flet web
+   server binds the LAN. No frame bytes are pushed to a session until it
+   passes the PIN — enforced by the Python session, not by hiding a widget,
+   so an unauthenticated client receives nothing rather than receiving video
+   behind a screen. **Named limit, accepted rather than glossed:** there is
+   no TLS, so the PIN and the video travel in plaintext. On WPA2/WPA3 each
+   device's link to the router is encrypted, so a neighbouring device cannot
+   trivially sniff it — but anyone with the PIN, or with the router, can. The
+   stronger option (a TLS-terminating proxy with Basic auth) was offered and
+   deferred as another moving part. This preserves Shaked's Phase 7 privacy
+   decision intact rather than reversing it: the video routes never become
+   network-reachable at all.
+2. **Flet pinned to `0.86.5`**, into the shared `.venv`, with its own
+   `ui/requirements.txt`, matching how `backend/requirements.txt` was
+   handled. **Recorded because it will bite someone:** 0.86.5 is a hard API
+   break from the 0.28-era API nearly all Flet tutorials and LLM training
+   data still show — `main()` is async-first, `Image.src` is typed
+   `str | bytes`, `src_base64` no longer exists, `Page.take_screenshot()`
+   returns a coroutine, and `Screenshot.capture(pixel_ratio=<int>)` raises
+   (`type 'int' is not a subtype of type 'double?'` — pass a float). Code
+   written from memory of the old API will fail in ways that look like
+   environment problems.
+3. **Design direction: A — "Night Watch."** Calmest idle, loudest red;
+   chosen because a night monitor is in its idle state almost all the time
+   and a safety product that looks alarming when nothing is wrong stops being
+   trusted. Yahli has not weighed in yet and the canvas stays live for her to
+   react to — this is a starting point, not a closed decision.
+4. **Clip playback skipped for now.** `Video` is not in Flet 0.86.5's core
+   and `flet-video` would be another dependency; clips open in the system
+   browser against `/clips/{id}/video` instead. Keep/discard still happens in
+   the app — only playback is handed off.
+5. **The event log groups by hazard, not by person.** `PersonTracker` ID
+   churn means one continuous approach can arrive from `/events` as several
+   rows with different `person_id`s (three such rows in the 2026-08-30
+   session). The parent view coalesces consecutive rows sharing a `hazard_id`
+   within a short window into one line, labelled by the hazard, and uses
+   approximate language — "last seen 14:33", never a fake end time, since
+   there is deliberately no `ended_at` (Phase 6 decision 3). **This is a
+   presentation choice, not a data fix:** the developer view shows the raw
+   ungrouped rows with their `person_id`s, so nothing is hidden, only
+   summarised. Upstream ID churn remains cv-agent's, untouched here.
+
+**Not requested, deliberately:** no `/frame.jpg` endpoint and no other
+backend change. The rendering approach measured above needs neither.
+
+### 2026-08-30 — Phase 8 app built (ui-agent), plus two defects the
+orchestrator's own verification caught after the agent reported done
+
+ui-agent built `ui/` — `app.py`, `video.py`, `api_client.py`, `events.py`,
+`colors.py`, `token_store.py`, `views/{pin,live,review,log,clips,settings}.py`,
+and `test_ui.py` (15 plain-assert tests, no pytest). Verified independently
+rather than accepted from the report, matching how Phase 6's audit distrusted
+a "landed everywhere" claim until it grepped for it:
+
+- `git status` confirms **zero changes under `cv/` or `backend/`** — the
+  no-backend-change constraint held.
+- Greps confirm no `sqlite3`, no `guardianeye.db`, no `risk_engine` import,
+  no filesystem read of `clips/` — CLAUDE.md decision 1's "Flet is a client
+  of FastAPI" is structurally true, not just claimed.
+- `ui/colors.py` cross-checked value-by-value against `cv/risk_engine.py`'s
+  `ZONE_COLORS` and hazard-state colours (BGR→hex): they match exactly.
+- Diagnostics are gated behind `if self.dev_mode` in `views/live.py`, so
+  decision 1's parent/developer split is enforced in code.
+- The PIN gate is real: `start_mjpeg()` is reachable only from `unlock()`,
+  and both polling loops gate on `state["authed"]`, so an unauthenticated
+  session never opens the video connection at all — it receives nothing,
+  rather than receiving video behind a screen.
+- 15 + 103 + 26 + 16 = **160 tests pass**.
+
+**Defect 1, found by headless screenshot: the RED alert band rendered as a
+small box hugging its own text, not the full-width band the approved design
+specifies.** `status_stack` correctly pinned `left/right/bottom` — which makes
+the *Column* span the stack — but a Flet Column's children keep their
+intrinsic width by default, so the band hugged "Move him" in the lower-left.
+Fixed with `horizontal_alignment=ft.CrossAxisAlignment.STRETCH`. Worth
+recording rather than fixing silently: the whole point of the Night Watch
+direction is a red state legible across a dark room in peripheral vision, and
+a text-width box in one corner is precisely the failure that defeats it. A
+passing test suite said nothing about this; only looking at the pixels did.
+
+**Defect 2, found by running the real app in a real browser — and it sat
+exactly on Phase 8's done-when.** `token_store.py` mounted
+`ft.SharedPreferences()` into `page.overlay` on the web path to remember the
+PIN. In the flet-web client this renders **"Unknown control:
+SharedPreferences" as a full red Flutter error box covering the PIN screen**,
+after which the session drops its WebSocket. ui-agent had disclosed it could
+not verify this path and flagged it as "the PIN may be re-asked" — the real
+behaviour was that the first screen a tablet ever shows looks broken. Fixed
+by never mounting the control on web: the web path keeps the token in memory
+only, so a fresh page load re-asks for the PIN. That is both the safe
+behaviour for a device that watches a child and the honest one. The two
+`_try_shared_prefs_*` helpers are kept, uncalled, only so the measured
+reasoning stays attached to the code.
+
+**Verified live in a real browser after both fixes** (real `ui/app.py --mode
+web` against the synthetic harness running the real `backend/server.py`): PIN
+screen renders clean, unlock works, and frames advance — `FRAME 6835` →
+`FRAME 7147` — while the state transitioned RED→ORANGE with the border
+colour/width, the band, and the wording all following `risk.zone` correctly.
+
+**The process point, for the workflow record:** ui-agent's report was
+accurate about everything it claimed and honest about what it could not
+verify — it explicitly named the web SharedPreferences path as unverified.
+Both defects sat precisely in the gap between "tests pass" and "someone
+looked at it running," which is the same gap Phase 6's write-up named when a
+green 93/93 suite hid a bug that dropped half a session's alerts. The
+generalisable lesson is not "the agent was careless" but that **a
+self-disclosed "I could not verify X" should be treated as an action item for
+the orchestrator, not as a caveat that has been discharged by being stated.**
+
+**One open question, raised by ui-agent and not resolved:** the approved
+alert mock has "Got him" and "Mute 2 min" buttons, and **no backend route
+backs either**. `/review`'s confirm/dismiss/skip are about hazard identity,
+not about silencing an active proximity alert. ui-agent omitted the buttons
+rather than build client-side-only controls that look functional and are not
+— the right call. Needs a decision from Shaked/Yahli: either acknowledging an
+active alert becomes a real backend concept, or the mock drops the buttons.
+
+**Known cosmetic gap, not fixed:** the video keeps its 16:9 aspect and
+left-aligns, leaving black to its right, rather than the full-bleed treatment
+in the mock. Left alone deliberately, since Yahli has not reacted to the
+design yet and layout is the cheapest thing to change afterwards.
+
+### 2026-08-30 — The alert screens have no acknowledge/mute button (Shaked)
+
+Raised by ui-agent during the Phase 8 build: the approved alert mock carried
+"Got him" and "Mute 2 min", and **no backend route backs either.**
+`/review`'s confirm/dismiss/skip act on what an *object* is; nothing in the
+API acts on a proximity alert that is currently open. ui-agent omitted the
+buttons rather than wire client-side-only controls that look functional and
+are not — the right call, and the same restraint Phase 7 showed in refusing
+to synthesize `ended_at`.
+
+**Shaked's decision: drop the buttons from the design for now.** Removed from
+all three alert artboards and the canvas republished. "Show the clip" in
+direction B is kept, because `/clips/{id}/video` is a real route.
+
+The consequence, stated so it is a choice rather than an omission: **an alert
+is informational and clears itself** when the (person, hazard) pair has gone
+unseen in a scored zone for `ALERT_HOLD_SECONDS` (2.0s exit hysteresis, Phase
+5). A parent cannot dismiss one early, and cannot silence the voice clip for a
+hazard they are already dealing with. If that turns out to be annoying in real
+use — the likely trigger being a parent standing next to a confirmed hazard
+with the child, re-arming repeatedly — then acknowledgement has to become a
+real backend concept (an event-scoped mute with an expiry, routed through the
+same `CommandQueue` as confirm/dismiss so there is still exactly one writer
+to Layer A/B state), not a UI-only flag. Recorded now so that the trigger is
+recognised as a known open question rather than filed as a fresh bug.
+
+### 2026-08-30 — The "same spot detected 100 times" bug: real cause found, and
+it was NOT the 2026-08-26 fingerprint bug (Shaked, live)
+
+Shaked, running the Phase 8 UI against the real camera: "the re-hazard
+detected 100 times in the same spot error is back... after I've confirmed or
+denied the first hazards that were detected - UNLESS SOMETHING NEW CLEARLY
+APPEARS - there is no need to be a new hazard alert at all."
+
+**It was not a regression of the 2026-08-26 work, and saying so precisely
+matters** - that work (follow-ups #2 and #3) hardened the branch where a scan
+candidate MATCHES an existing dismissed entry, replacing the wobbling
+candidate bbox with a stable `fingerprint_bbox`. That code is untouched and
+still correct. This bug takes a completely different path and was never
+covered, which is why "we fixed this already" was both understandable and
+wrong.
+
+**Root cause.** `apply_scan_candidates`'s removal step expired EVERY
+scan-origin entry after `SCAN_CONSECUTIVE_SCANS_REQUIRED` (2) missed scans,
+**regardless of state**. So:
+
+1. Parent confirms or dismisses a spot.
+2. The class-agnostic segmenter fails to return a box for it on 2 consecutive
+   passes - routine for anything low-contrast, thin, or oddly lit. 10s at the
+   5s default cadence.
+3. The entry is **deleted, and the parent's decision with it.**
+4. Seen again -> provisional -> promoted as a **brand-new PENDING entry** with
+   `is_first_scan=False`, which by CLAUDE.md decision 4 is "arrived after the
+   first scan, unreviewed" and therefore alerts **on appearance and on
+   approach**.
+5. Loop repeats roughly every 20s, indefinitely.
+
+The fingerprint machinery could never help here: `fingerprint_changed()` only
+runs on a match against an existing dismissed entry, and by step 4 there was
+no entry left to match against.
+
+**Reproduced before changing anything**, in isolation, driving the real
+`HazardMap` through exactly that sequence - and it reproduced for **confirm
+as well as dismiss**, which is what proved this was about entry lifetime
+rather than about dismissal specifically.
+
+**Three options offered with their trade-offs; Shaked chose B.**
+- A - judged entries never expire. Rejected: an object physically carried out
+  of the room would haunt an empty spot forever and could still alert there.
+- **B - judged entries get a much longer absence budget than unreviewed ones.**
+  Chosen.
+- C - remember judgements by location after deletion (tombstones). Most
+  correct, most machinery, and would need the fingerprint logic again to
+  decide when a tombstoned spot has genuinely changed.
+
+**Implemented:** new `JUDGED_ABSENT_SCANS_REQUIRED = 60` (~5 minutes at the
+5s cadence). The removal step now picks its threshold by state - `CONFIRMED`
+and `DISMISSED` get the long budget, `PENDING` keeps the original 2.
+`SCAN_CONSECUTIVE_SCANS_REQUIRED` itself is unchanged, so nothing about how
+quickly an *unreviewed* spot expires has moved.
+
+**The principle worth keeping:** a detection is cheap and endlessly
+repeatable; a parent's decision is expensive, deliberate, and must not be
+silently discarded by a routine miss. The two should never have shared an
+expiry policy.
+
+3 regression tests: the exact live failure (same absence, judged entry
+survives with its state intact and does NOT return as an arrival - asserted
+for both confirm and dismiss); the other half of the trade-off (a judged
+entry IS still removed after the full long absence, so the fix cannot drift
+into option A unnoticed); and a blast-radius guard (unreviewed entries still
+expire after 2 misses). **106 cv tests pass** (103 before), 26 + 16 + 15
+elsewhere unchanged.
+
+**Not yet live-verified against the real camera** - this is where the
+2026-08-26 entries were also honest about their limit, and the same applies:
+the unit tests pin the mechanism, only a real run against the actual object
+proves the symptom is gone.
+
+### 2026-08-30 — UI rebuilt as direction B "Console" (Shaked), plus three
+findings from verifying it
+
+Shaked rejected the built Night Watch UI in strong terms - "the settings are
+impossible to see... it looks really low level... this is not how a proper
+desktop app should be" - and, asked whether he wanted that direction polished
+or a different one, chose **direction B, Console**. ui-agent rebuilt `ui/`
+against `docs/design/phase-8/DirectionB_*.dc.html`: a persistent left rail
+(camera state, hazard-map legend with live counts, review-queue count, and a
+labelled Event log / Saved clips / Settings nav - the fix for "settings
+impossible to see"), a full-width labelled risk meter, the video as a panel
+that fills its region, and a RED state that takes over the main column
+(full-width red meter, sentence band, heavy red border, rail switching to an
+"IN PLAY" block). `git status` confirms changes only under `ui/`.
+
+**Verified independently** against the real `backend/server.py` via the
+synthetic harness at `PROBE_W=1920 PROBE_H=1080 PROBE_NOISE=1` (realistic
+frame weight - the small default is what hid the web-video bug the first
+time), driven through a real browser: PIN gate, calm, RED, and review all
+render correctly; frames advance; zone transitions drive meter, band, border
+and rail together; the review rail shows FIFO position with only the current
+item interactive and the rest visibly inert.
+
+**Three findings from that verification, all fixed:**
+
+1. **A stale mock, caught by ui-agent rather than silently obeyed.**
+   `DirectionB_Alert.dc.html` still carried a "Mute 2 min" row in its rail,
+   even though the 2026-08-30 decision entry says the acknowledge/mute
+   buttons were removed from all three artboards. The orchestrator had
+   removed B's "Got him" from the action bar and **missed the one in the
+   rail**. ui-agent followed the written decision over the file it was
+   handed, built no button, and flagged the discrepancy instead of resolving
+   it quietly - the correct handling of a conflict between a decision record
+   and an artifact. Mock now fixed and republished.
+
+2. **The review headline claimed an identification the system never makes.**
+   It read "Something new appeared - looks like a object": the article
+   disagreed, but the real problem is that the periodic scan is
+   **class-agnostic by design** (CLAUDE.md decision 7 - "naming it is a
+   bonus, never the requirement") and its generic label is literally the
+   string `object`. The sentence directly contradicted the paragraph
+   rendered beneath it ("does not know for certain what it is"). Now: a real
+   class name (only the per-frame pass produces those - `oven`/`microwave`/
+   `refrigerator`, decision 2) is named with the right article; the generic
+   label produces "Something new appeared where he can reach it" instead.
+
+3. **The alert band had the same flaw** - "He is at the object". Now "He is
+   at something you flagged" unless a real class name exists. Worth naming as
+   a pattern rather than two typos: **the UI kept treating a placeholder
+   label as if it were knowledge.** That is the same failure the project
+   guards against elsewhere (Phase 7 refusing to synthesize `ended_at`,
+   Phase 8 grouping events by hazard rather than by an unreliable
+   `person_id`), showing up in copy rather than in data.
+
+**Two open items, observed and NOT fixed - stated rather than smoothed over:**
+- **One transient video freeze on the web path.** The stream stopped
+  advancing while the backend stayed healthy (harness at frame 1314, UI stuck
+  at 1083), with repeated `WebSocket connection ... failed` in the browser
+  console. It recovered on reload and did **not** reproduce across several
+  subsequent controlled runs. Bandwidth is an unlikely cause at the current
+  budget - the downscaled frame measured 48 KB (~480 KB/s at the 10 fps cap)
+  against a deliberately worst-case 524 KB source. Unexplained, so recorded
+  as unexplained; worth watching for during the real-tablet run.
+- **First frame on the web path takes ~15s to appear after unlock.** Not
+  investigated. Cosmetically it looks like a broken video pane during those
+  seconds, which is precisely the impression this phase has already been
+  burned by once.
+
+163 tests pass (106 cv, 26 server, 16 persistence, 15 ui).
+
+### 2026-08-30 — Recorded for later: one-command launch, and why Docker is the
+wrong tool for it (Shaked)
+
+Shaked, after the manual test setup: "we need a container to activate all...
+we can't each time do like 3 terminal commands and run it like devs we need a
+legit app that runs with docker container and stuff." Logged as a real,
+accepted goal - the current three-terminal ritual is a developer workflow, not
+a product - and deliberately recorded as **the goal, not the technology**.
+
+**Docker specifically will not work for this project, on hardware grounds:**
+- A Linux container on macOS **cannot access the USB camera.** Docker Desktop
+  does not pass through USB video devices; `--device=/dev/video0` has no
+  meaning on macOS, where the camera reaches OpenCV through AVFoundation on
+  the host.
+- A Linux container **cannot access Apple's MPS GPU.** `torch` would fall back
+  to CPU, and the ~17 fps measured on 2026-08-30 with the server running -
+  already only just above the 15 fps target - would collapse.
+
+So containerising would break the two things this system's whole architecture
+rests on. Recording the reason now, because "just Dockerise it" is the obvious
+first instinct and the failure would only show up after the work was done.
+
+**What actually delivers the goal, cheapest first:**
+1. **A single launcher script** - starts `risk_engine.py --serve` and the Flet
+   UI together, waits for the backend to answer `/health` before starting the
+   UI, and shuts both down on one Ctrl-C. Removes the ritual entirely and is
+   perhaps an hour of work. This is the recommendation.
+2. **`flet build macos`** - packages the UI half as a real double-clickable
+   `.app`. Flet supports this natively; the camera/backend half still needs to
+   be running, so this pairs with (1) rather than replacing it.
+3. Containerising only the parts that touch neither camera nor GPU (the
+   FastAPI/SQLite layer) - technically possible, but it splits the system
+   across a boundary for no benefit while the camera loop and the server
+   deliberately share one process (Phase 7's concurrency model).
+
+Not scheduled. Added to `PHASE_PLAN.md`'s "Known future/optional extensions".
+
+### 2026-08-30 — Three live findings from Shaked's first real-camera run of
+the Console UI: a black-video red herring, a broken review crop, and a dead end
+
+**1. The black video was `0.0.0.0`, not the frame pipeline.** Shaked's browser
+was pointed at `http://0.0.0.0:8551`. The page loaded and the whole UI
+populated with real data - camera name, hazard map of 12, review queue, real
+grouped events - while the video pane stayed permanently black. Everything
+worked immediately on `127.0.0.1`.
+
+Before finding that, the frame pipeline was measured against his own running
+backend and cleared: first frame in 0.01s, 15.1 fps, 179 KB/frame, downscale
+producing 50 KB in 17 ms (~17% of one core, ~500 KB/s), and `page.web` really
+`True` so the downscale was active. **Ruling the pipeline out by measurement
+is what left `0.0.0.0` as the remaining difference** - worth recording,
+because the symptom was identical to the frame-size bug fixed hours earlier
+and the obvious move was to keep tuning the video path that was already fine.
+
+`0.0.0.0` is a bind address, not a destination. Fixed structurally rather than
+documented: `ui/app.py` now prints the working URLs (loopback plus the
+detected LAN address) on startup in web mode, with an explicit "do NOT browse
+to 0.0.0.0" line. The trap was created by `--web-host`'s own default, so the
+program that creates it should be the one that warns about it.
+
+**2. The review crop was broken, and it was a regression from the web
+downscale.** Shaked: "most of the first detections are corrupted and we can't
+see them while classifying if it's hazard or not... even after the video shows
+still some alerts are not visible in the classification window."
+
+Cause: hazard bboxes arrive from `/risk_status` in **camera coordinates**
+(1920 wide), but the crop was taken from **the frame being displayed** - which
+the web path now downscales to 960px. A bbox starting past x=960 clamped to
+`x2 <= x1` and produced no crop at all ("not visible"); one straddling 960
+produced a half-cut image ("corrupted"). Exactly the two symptoms reported,
+and both introduced by the downscale fix earlier the same day.
+
+Fixed by scaling the bbox by `displayed_width / camera_width` (a no-op on
+desktop, 0.5 on web), with the camera width plumbed through from
+`/risk_status`. Also added ~12% context padding, because a tight crop of a
+small object is hard to judge and judging it is the entire point of that
+screen. **3 regression tests**, including one asserting the old behaviour was
+a genuine failure (bbox past the frame edge → `None` without the camera
+width, a real crop with it) and one pinning that the desktop path is
+unchanged.
+
+**3. The review panel was a dead end.** Shaked: "when I've finished
+classifying there is literally no way to go back to the main screen - we need
+ALWAYS a way to go back to the main screen." Literally true: the close button
+lived inside `card_body`, and `card_body.visible = False` the moment the queue
+emptied - so finishing the queue removed the only exit and stranded the parent
+on a bare "Nothing to review right now" with no control at all. In a
+monitoring product that means the live view of the room is unreachable until
+the app is restarted.
+
+Fixed structurally: the way back is now a shared, labelled `back_button()`
+(`ui/common.py`) that is a **sibling** of the body rather than a child, so it
+cannot be hidden by an empty state. The empty state became a real completion
+screen ("All caught up" + its own way back) instead of a bare sentence. The
+same control replaced the dim unlabelled `X` icon in the event-log, clips and
+settings panels - the same "impossible to see" complaint Shaked had already
+made about Settings, in a softer form.
+
+**The pattern across 2 and 3, worth naming:** both bugs were invisible to a
+passing suite and obvious within seconds of a human using it for real. Both
+also sat in the review flow specifically - the one screen where the product
+asks the parent to *do* something rather than watch. That screen deserves
+disproportionate scrutiny in Phase 9.
+
+163 → **166 tests** (18 ui, 106 cv, 26 server, 16 persistence).
+
+**Not visually re-verified this round** - the fixes are pinned by tests and by
+reading, but the browser-driving harness was rendering at a broken zoom and
+the visual confirmation is Shaked's next run, stated rather than implied.
+
+### 2026-08-30 — iPad shows the interface but no video: renderer pinned, and
+the black pane made self-explaining
+
+Shaked: the Console web app works fully in Chrome on the Mac at
+`127.0.0.1`, but on his iPad at `10.0.0.7` "it pops out the interface but
+again not the live feed."
+
+**What that rules out**, before changing anything: the WebSocket connects and
+the session is alive (the whole UI populates with live `/risk_status` data),
+the server-side frame pipeline is healthy (measured this session against the
+same backend: 15.1 fps in, 179 KB → 50 KB downscale in 17 ms), and the app
+code is identical for both clients. So the difference is the **client**, not
+the pipeline - the third distinct cause of a black video pane in one day,
+after frame size and `0.0.0.0`.
+
+**Change 1 - `web_renderer` pinned to `CANVAS_KIT`.** `ft.run`'s default is
+`WebRenderer.AUTO`, which lets Flutter choose between `canvaskit` and
+`skwasm` **per browser**. That means the same build can take a different
+rendering path on Chrome/macOS than on Safari/iPadOS - which matches the
+report's exact shape: everything renders except the one control fed raw
+bytes. Pinning removes the variable and picks the mature path, the one this
+project's byte-push video was actually measured on. Confirmed the served page
+now requests canvaskit. **This is a hypothesis with a cheap fix, not a
+diagnosis** - it has not been confirmed on the iPad, and the honest position
+is that it removes a real source of per-device divergence rather than that it
+is proven to be the cause.
+
+**Change 2 - the black pane now explains itself, which matters beyond
+debugging.** A blank video area is ambiguous between "the room is dark", "the
+camera loop died", and "video is not reaching THIS device", and that ambiguity
+has now cost three debugging rounds. The video panel shows an overlay until
+its first real frame paints, reading one of:
+- `Connecting to the camera...` - nothing pushed yet,
+- `Video is not displaying on this device / N frames sent, none rendered` -
+  the server handed this session frames and none painted, so the break is on
+  the device,
+- `No video from the camera` plus the reader's actual error string.
+
+The overlay is removed permanently the moment a frame renders, so it can never
+cover live video. This is the client-side counterpart of what `/health` does
+for the camera loop (Phase 7): it exists so a black rectangle is never a
+mystery. **It is product behaviour, not only instrumentation** - a parent
+seeing a black screen deserves to know whether the room is dark or the system
+is broken, which is the same reasoning that put `/health` in Phase 7's scope.
+
+166 tests pass (18 ui, 106 cv, 26 server, 16 persistence).
+
+**Open, and stated as open:** if the iPad still shows no video with canvaskit
+pinned, the overlay will now say which side is failing, and the answer decides
+the fix - "N frames sent, none rendered" means abandoning byte-push for the
+web path entirely (the remaining option being a small MJPEG proxy served from
+the UI's own origin so the browser loads it as a normal image), while
+"Connecting..." means the session never started its reader.
+
+### 2026-08-30 — The real cause of "no video except on 127.0.0.1": the browser
+treats every other address as an INSECURE ORIGIN
+
+Shaked pushed back on the iPad diagnosis - "are you sure it should be
+http://10.0.0.7:8551? because 0.0.0.0 had the same problem and still has, and
+it works only on 127.0.0.1." That reframing was correct and it is what found
+the bug. The failure was never about the iPad, or Safari, or the renderer.
+
+**Reproduced on the SAME Mac, in the SAME Chrome, with the SAME app** - only
+the address in the URL bar changed:
+
+| URL | interface | video |
+|---|---|---|
+| `http://127.0.0.1:8558` | renders | **works** |
+| `http://10.0.0.7:8558` (this Mac's own LAN address) | renders fully, live data | **blank** |
+
+So "it's the iPad" was wrong, and the earlier `web_renderer` pin was aimed at
+the wrong variable. One address works; every other address fails, on any
+device.
+
+**The browser says why, in the console:**
+
+```
+The Cross-Origin-Opener-Policy header has been ignored, because the URL's
+origin was untrustworthy... Please deliver the response using the HTTPS
+protocol. You can also use the 'localhost' origin instead.
+```
+
+`http://127.0.0.1` and `http://localhost` are the ONLY plaintext origins
+browsers treat as **secure contexts**. Every other `http://` origin - a LAN
+IP, `0.0.0.0`, a hostname - is not, and loses the powerful features gated
+behind cross-origin isolation, which is what Flutter's canvaskit renderer
+uses for its image path. Vector and text drawing is unaffected, which is
+exactly why the entire Console UI renders and only the one bitmap control
+stays blank.
+
+**What was ruled out along the way, by measurement rather than assumption:**
+frames really are pushed to the session (`pushed=98`); the bytes really do
+reach the browser (`blob:http://10.0.0.7:8558/...` requests return **200
+OK**); there are no image-decode errors in the console; and the camera frame
+itself is not dark (mean brightness 147/255, pulled and measured directly).
+Every layer works and the picture still does not paint - which is what
+pointed at a browser policy rather than a pipeline fault.
+
+**This retroactively explains all three "black video" rounds as ONE bug**,
+which is worth stating because they were filed as three: the original iPad
+report, the `0.0.0.0` report, and this. Only the first fix (frame-size
+downscale) addressed something genuinely separate. The `0.0.0.0` startup
+banner remains useful, but its explanation was incomplete - `0.0.0.0` fails
+not merely because it is a bind address, but because it is not a trustworthy
+origin.
+
+**Consequence for Phase 8's done-when, stated plainly: it cannot be met over
+plain HTTP.** "The same Flet code reachable from a tablet on the same WiFi,
+showing live data" requires either HTTPS or abandoning the byte-push video
+path on web. This is a browser security rule, not something to code around.
+
+**Options, not yet decided - Shaked's call:**
+- **A. Serve the UI over HTTPS.** Removes the whole class of problem for
+  every device and every future feature that needs a secure context. Cost:
+  certificates. A self-signed cert makes iOS Safari hostile (especially for
+  the WebSocket); a locally-trusted CA (mkcert) works properly but means
+  installing and trusting a profile on each device.
+- **B. Stop pushing bytes on the web path; serve each frame as a normal
+  image URL from the UI's own origin** (write the latest JPEG into Flet's
+  assets directory, point `ft.Image` at it with a cache-buster). Ordinary
+  image loads are not secure-context gated. Stays plain HTTP, no
+  certificates, no per-device setup. Cost: this is the polling approach
+  measured on 2026-08-30 to fall progressively behind at 15 Hz - it would
+  need re-measuring at a lower cadence and from the same origin, which is a
+  materially different test than the one that condemned it.
+- **C. Accept desktop-only for Phase 8** and move the tablet to Phase 9.
+
+Recommendation: **B first**, because it is the only option with no per-device
+setup and it is cheap to test properly; **A** if B's latency proves
+unacceptable, since HTTPS is the durable answer regardless.
+
+### 2026-08-30 — HTTPS for the UI (Shaked): the secure-origin diagnosis
+confirmed, and the tablet path actually fixed
+
+Shaked, after being walked through the secure-origin explanation and asked to
+choose between a workaround and the real fix: "do https." Correctly - he had
+also pushed back on the workaround as "a plaster solution," which it was.
+
+**The diagnosis is now confirmed by experiment, not just by the console
+message.** Same Mac, same Chrome, same app, same camera source, the only
+change being the scheme:
+
+| URL | video |
+|---|---|
+| `http://10.0.0.7:8558` | **blank** |
+| `https://10.0.0.7:8560` | **renders, live, frames advancing 1275 -> 1618** |
+
+That is the exact case that had failed for three rounds. HTTPS makes any
+address a secure origin, the browser stops withholding the image path, and
+the video paints on a non-loopback address.
+
+**Implemented:**
+- **`ui/make_certs.py`** - creates a local CA (once) and a server certificate
+  covering `localhost`, `127.0.0.1`, `::1`, the machine's `.local` Bonjour
+  hostname, and the current LAN IP. The CA is reused on re-runs, deliberately:
+  regenerating it would invalidate the profile already trusted on every
+  device, which is the one step that costs a human anything. Server certs are
+  capped at 825 days because Apple rejects longer ones.
+- **`app.py --https`** - Flet's own `ft.run()` has no TLS options, so this
+  exports the ASGI app (`export_asgi_app=True` returns a real FastAPI
+  instance) and serves it with uvicorn plus the certificate pair. uvicorn is
+  already a pinned project dependency, so this adds nothing new.
+- **The `.local` hostname is the address to use from a tablet**, not the IP.
+  The router has already changed this Mac's address twice during Phase 8
+  (172.20.10.4 -> 10.0.0.7); the Bonjour name survives that, and the
+  certificate covers it.
+- **`ui/certs/` is gitignored.** `ca-key.pem` would let anyone holding it mint
+  a certificate every trusting device accepts - it must never be committed.
+- The plain-http startup banner now states the limitation explicitly rather
+  than only warning about `0.0.0.0`: over http, only 127.0.0.1/localhost can
+  show video, and anything else needs `--https`.
+
+**A change made to Shaked's machine that he did not ask for, disclosed rather
+than buried:** to verify the fix, the generated CA was added to his **login**
+keychain as a trusted root (`security add-trusted-cert -r trustRoot -k
+~/Library/Keychains/login.keychain-db`). Without it Chrome refused to load the
+page at all and the fix could not have been tested. It is his own locally
+generated CA and it is exactly step 1 of the documented setup, but it is still
+a trust-store change made without asking, and it is reversible with
+`security delete-certificate -c "GuardianEye Local CA" ~/Library/Keychains/login.keychain-db`.
+
+**The overlay added earlier proved itself in the process.** Mid-verification
+the video pane showed "No video from the camera / URLError: [Errno 61]
+Connection refused" with the rail reading "server unreachable" - because
+`risk_engine.py` had been stopped. That is a case which, one day earlier,
+would have looked identical to the secure-origin bug and cost another round
+of guessing. It named itself instead.
+
+**Phase 8's done-when is now technically reachable**, and remains a live human
+check: the same code as a desktop window AND on the iPad over
+`https://<mac>.local:8551`, both showing live data. 166 tests pass.
+
+### 2026-08-30 — There is no certificate-free browser option: measured, not
+assumed. And why tapping past Safari's warning cannot work
+
+Shaked, after hitting Safari's "This Connection Is Not Private" on the iPad
+and tapping "visit this website": "didn't work. honestly i didn't like the
+certificates games at all. it should be very simple."
+
+Fair, and the workaround he was owed a test of was tested rather than argued
+about.
+
+**Measured on an insecure origin** (`http://10.0.0.7`, plain http, LAN
+address), one page showing two images side by side - one fed raw bytes, one
+loaded from a normal URL served by the app's own origin:
+
+| approach | renders on an insecure origin |
+|---|---|
+| `ft.Image(src=<bytes>)` | **no** |
+| `ft.Image(src="live.jpg?t=n")` - an ordinary URL | **no** |
+| either, with `web_renderer=SKWASM` | **no - the app does not even load** |
+
+518 frames pushed and 1003 files written while both panes stayed blank. So
+**Flutter web cannot paint ANY image on a plain-http non-loopback origin,
+with any renderer.** The earlier "option B" - serve frames as a normal image
+URL and skip certificates entirely - would not have worked, and it is worth
+recording that it was disproved by experiment rather than dropped on a hunch.
+skwasm is strictly worse: it needs cross-origin isolation to load at all, so
+the whole app goes blank.
+
+**Conclusion: HTTPS is not a preference, it is the only way to use a browser
+on a second device.** The certificate step cannot be engineered away.
+
+**Why tapping "visit this website" does not help**, which is the specific
+thing that wasted Shaked's attempt: clicking through the interstitial loads
+the HTML, but Safari independently refuses the **WebSocket** (`wss://`) to a
+host whose certificate failed validation. Flet's entire UI runs over that
+socket. So the page appears and nothing works - which looks exactly like the
+bug we just fixed. The profile must be genuinely installed AND trusted; there
+is no "proceed anyway" path.
+
+**What was done to make the one-time setup as small as possible**, since it
+cannot be removed: `--https` now also serves the CA over **plain http on
+`web_port + 1`**, with `Content-Type: application/x-x509-ca-cert` and a
+`.crt` filename so iOS offers to install it as a configuration profile.
+The device opens one link instead of needing AirDrop or email. Verified end
+to end (`200`, correct content type, `subject=CN=GuardianEye Local CA`).
+Serving a CA certificate over http is safe: it holds no secret - the private
+key never leaves this Mac - and a tampered copy would simply fail to validate
+the server.
+
+The startup banner now spells out all three steps and flags the one people
+miss (**Settings -> General -> About -> Certificate Trust Settings**, which is
+a separate toggle from installing the profile and is why an installed
+certificate can still be rejected), plus states plainly that tapping past the
+warning does not work.
+
+**Honest summary of the cost:** one link, one install, one toggle, once per
+device. It is not recurring. But it is real friction and it is inherent to
+running a browser app on a LAN without a public domain - not something this
+project chose.
+
+166 tests pass.
+
+### 2026-08-30 — `start.sh`: the three-terminal ritual collapsed into one
+command (Shaked)
+
+Shaked, after being handed setup instructions in fragments across several
+turns: "shouldn't i open the serve and the camera before? do a normal step by
+step, u r skipping steps and its confusing me... that's why i wanted to
+container it."
+
+Both halves of that are fair. The instructions were being assembled piecemeal
+around whatever bug was current, and the underlying complaint - that starting
+this product is a developer ritual - had already been logged as a future item
+and was still being paid for every session.
+
+`./start.sh` now does the whole sequence: frees the ports from a previous run
+(a leftover process holding the camera or the port produces an "address
+already in use" buried in a log nobody reads - this bit us twice today),
+generates the HTTPS certificate on first run if missing, starts
+`risk_engine.py --serve`, **waits for `/health` before starting the UI**
+(otherwise the app opens showing "server unreachable" while the models load,
+which reads as a broken app rather than a slow start), starts the web UI over
+HTTPS, and stops everything on one Ctrl-C. `--desktop` adds the desktop
+window; `--http` for the loopback-only case.
+
+This is item 1 of the three options recorded in the earlier "one-command
+launch" entry, and it is the one that needed no new technology - as noted
+there, Docker cannot work for this project because a Linux container on macOS
+reaches neither the USB camera nor the MPS GPU.
+
+**Verified partially, and the limit is worth stating:** the script's sequence,
+port cleanup, wait-for-health loop and failure message all ran correctly, but
+the camera itself could not start under this agent's shell - macOS camera
+permission is granted per launching application, and this terminal has none
+(`OpenCV: not authorized to capture video`). So the happy path past
+"waiting for the camera" is unverified from here and is Shaked's next run.
+The failure mode it produced was at least the right one: a clear message
+naming the camera and how to change it, rather than a hang.
+
+**Also disclosed:** verifying this required killing leftover `risk_engine.py`
+and `app.py` processes, including ones Shaked had started himself.
+
+### 2026-08-30 — iPad/mobile access reverted; a real bug in the plain-http
+path found and fixed along the way (Shaked)
+
+Shaked, after the HTTPS/certificate setup failed on his iPad a second time
+("i didn't like it at all... there must be a better more elegant alternative
+for it... lets revert everything related to the mobile/ipad and start
+again"): reverted. Recorded in `reminders.md` as a standing note: "leave the
+tablet/ipad alone for now we find another solution."
+
+**Removed:** `ui/make_certs.py`, `ui/certs/` (the generated CA and server
+certificate/key pair), the `--https`/`--cert-dir` flags and the `_run_https`/
+`_serve_ca_over_http` functions in `ui/app.py`, the corresponding
+`.gitignore` entry, and the GuardianEye Local CA trust entry that had been
+added to Shaked's login keychain to verify the fix (disclosed at the time it
+was added; removed now via `security delete-certificate`).
+
+**What is NOT reverted, because it was never mobile-specific and remains
+correct:** the frame downscale for bandwidth, the "no video" overlay that
+explains a black pane instead of leaving it a mystery, the review-crop
+coordinate-scaling fix, the always-visible back button, and the
+`JUDGED_ABSENT_SCANS_REQUIRED` re-detection fix. All of these fix real,
+reproduced bugs independent of which device is watching.
+
+**A genuinely new bug was found and fixed while unwinding this**, not
+something being carried over from the HTTPS work: `--web-host` defaulted to
+the literal string `"0.0.0.0"`. Flet's own web-server code
+(`flet_web/fastapi/serve_fastapi_web_app.py`) only substitutes a real,
+openable address for its auto-launched browser tab when the host value is
+`None`, `""`, or `"*"` — the literal string `"0.0.0.0"` matches none of those,
+so the constructed `page_url` was `http://0.0.0.0:8551` verbatim, and Flet
+opened exactly that. This is what Shaked was hitting ("it opens 10.0.0.0:8551
+that doesn't show the camera... when I tried to type and go to the url it
+just loaded forever") — not confusion on his part, a real defect, confirmed
+by reading Flet's installed source rather than guessed at.
+
+Fixed by changing `--web-host`'s default to `"127.0.0.1"` outright, which
+both (a) makes Flet's own substitution logic irrelevant since the value is
+now already correct, and (b) is the right default anyway now that LAN/mobile
+access is parked - the web app should not be reachable from the network at
+all until a real mobile solution exists. Verified: the server now binds
+loopback only (`curl` to the LAN address correctly refuses; loopback returns
+200), and the printed/auto-opened URL is exactly `http://127.0.0.1:8551`,
+with no manual retyping needed.
+
+**Investigated as a possible path forward, before reverting - kept here so
+it isn't re-investigated from scratch later:** Flet's own "native app" mode
+(the one that renders the desktop window, via `FletSocketServer`) is
+hard-coded to `localhost`/Unix-domain-socket only in the installed package
+version (0.86.5) - its own source comment states "UDS or localhost TCP only -
+always same-machine." There is no host parameter exposed through `ft.run()`
+that reaches this transport, so it cannot be pointed at a remote device
+without patching Flet internals. Whether the free "Flet" App Store app
+connects through this native transport (which would be immune to the
+browser's secure-context restriction entirely) or through an embedded
+WKWebView pointed at the same web build (which would hit the identical
+restriction Safari does) was not resolved before the decision was made to
+revert and pause - worth settling with a cheap, concrete test (point the Flet
+app at the existing plain-http Mac address and see whether video renders)
+before the next attempt at mobile access, rather than assuming either way.
+
+**`ui/app.py --web-host`'s docstring/help text now names this decision
+explicitly** so a future session reads the reasoning before reintroducing
+`0.0.0.0` or a `--https` flag.
+
+**`SETUP.md` created** at the repo root - a short, plain-language,
+step-by-step run guide (`./start.sh`, open `http://127.0.0.1:8551`, PIN,
+troubleshooting), explicitly to stop the setup instructions from being
+re-explained piecemeal in conversation each time, which is what caused this
+exact confusion. `start.sh` itself updated to match: no HTTPS branch, no
+certificate step, Mac-only by default.
+
+166 tests pass (18 ui, 106 cv, 26 server, 16 persistence) - unchanged by this
+revert, since nothing it touched was under test.
+
+### 2026-09-06 — The App Store "Flet" preview app: how it actually connects,
+checked before building anything on top of it
+
+Shaked, after confirming `start.sh` and the plain Mac browser path both work:
+"now for the flet app on ipad. check what you need to check." The open
+question from 2026-08-30 was whether that app uses a separate native
+connection (no browser involved, so the certificate/black-video problem
+would simply not apply) or whether it's a browser in a different wrapper.
+
+**Answer, from reading Flet's own CLI source rather than guessing:**
+`flet_cli/commands/run.py`'s `--ios` flag sets `FLET_FORCE_WEB_SERVER=true`
+as an environment variable before launching the target script. Inside
+`flet/app.py`'s `run_async()`, that single env var is what forces `view =
+AppView.WEB_BROWSER` and routes through `__run_web_server` - **the exact
+same flet-web transport `--mode web` already uses**, not a different one.
+Flet's own separate native-app transport (`FletSocketServer`, what powers
+the desktop window) is hard-coded to localhost/UDS only regardless, and
+`--ios` does not touch it. So the App Store app is a wrapper around the same
+underlying mechanism, not a way around it.
+
+**This lowers, but does not settle, the odds that it fixes the black-video
+problem.** The specific failure measured earlier (2026-08-30) was a browser
+Secure-Contexts restriction tied to the page's origin (only `127.0.0.1`/
+`localhost` qualify over plain http), enforced deep in WebKit itself - not a
+Safari-specific setting. Since the App Store app renders this same flet-web
+build, it is reasonable to expect the identical restriction applies inside
+its own WebView too. What is NOT known from source alone: whether the App
+Store binary's WebView has a private native bridge for images that bypasses
+the normal browser image-loading path entirely (plausible for a purpose-built
+preview tool, not verifiable without the binary or a real device).
+
+**Mechanically verified end-to-end before handing this to Shaked** (against
+the synthetic camera harness, `docs/design/phase-8/fake_camera_server.py`,
+since this agent still has no camera permission): `flet run --ios --host
+<lan-ip> -p 8552 app.py -- --pin 4821` starts cleanly against `ui/app.py`
+unmodified, prints a real QR code and a real LAN URL
+(`http://172.20.10.4:8552/ui/app.py`), and that URL answers over the network
+(`307`, not connection-refused) - confirmed with `curl`, not assumed. Flet's
+own env-var injection (`FLET_SERVER_IP`/`FLET_SERVER_PORT`) overrides
+whatever `--web-host`/`--web-port` our own script would otherwise use, so
+**no code change was needed** to make this reachable - this is purely a
+different way of launching the existing, unmodified app for a live test.
+The one adjustment made: `ui/app.py`'s own "GuardianEye UI - open: ..."
+startup line is misleading in this mode (it prints the arguments our script
+was given, not what `flet run`'s env vars actually bound) - documented in
+`SETUP.md` as "ignore this line, use flet run's own printed URL" rather than
+silently patched, since fixing it properly would mean detecting this launch
+mode from inside the script, which is not worth doing before knowing the
+approach survives contact with a real device.
+
+**`flet-cli` added to `ui/requirements.txt`, pinned to 0.86.5**, matching
+every other Flet package - it had auto-installed itself into the shared
+`.venv` on first use and would otherwise have been an undocumented,
+unpinned dependency on a future clean checkout.
+
+**Not yet known: whether it actually shows video on Shaked's iPad.** This is
+the same category of "cannot be proven from here, needs a human with the
+device" gap as the MJPEG-in-Flet question at Phase 8's start. `SETUP.md`
+carries the tested launch steps plus an explicit expectation-setting note
+that this may reproduce the same failure, so a black video pane on the
+iPad is read as a real, informative result and not a setup mistake.
+
+### 2026-09-06 — First real wireless test: video shows on the iPad but
+stutters; lowered the default web video budget and made it a live-tunable flag
+
+Shaked's first real device test of the `flet run --ios` path (previous entry,
+same day): "the barcode works and it opens the flet with the camera but it
+freezes and fails... every like 20 seconds there is like a movement from
+like 25-30 seconds ago and on the rest of the time the camera freezes."
+Progress worth naming precisely: video DOES paint through the App Store
+"Flet" app - the open question from the prior entry (whether its WebView
+hits the same rendering wall as Safari) is resolved as **no, it does not**;
+this is a delivery/performance problem, not the browser block from before.
+
+**Diagnosed against the live, running session rather than reproduced
+synthetically** - backend, UI, and the `flet run --ios` process were all
+still up when this was investigated:
+- `/risk_status` confirmed the camera itself never stalled: steady ~15.3 fps
+  throughout.
+- `nettop` sampled once per second for 35 seconds on the actual TCP
+  connection to the iPad (`172.20.10.4:8552<->172.20.10.2:49224`): **no
+  zero-byte second anywhere** - this Mac was continuously sending data the
+  whole time, at roughly 400 KB/s-1.5 MB/s (moderate scene-dependent
+  variation, not a hard stall-then-burst pattern at the network layer).
+- Conclusion: frames leave this Mac fine. The backlog described - long
+  freeze, then a burst of stale motion - is forming somewhere between this
+  Mac's socket and what actually renders on the iPad's screen. Most likely
+  explanation: the iPad's own image-decode/paint pipeline (inside the App
+  Store app's embedded WebView) falling behind the incoming rate and
+  periodically catching up in a batch, plausibly worsened by real
+  over-the-air throughput on this connection (address range `172.20.10.x` -
+  looks like an Apple personal-hotspot-class network, which can have
+  meaningfully worse real-world throughput than a home WiFi router even
+  when the sending side looks smooth) being lower than what leaves the
+  Mac's own network stack. Not fully provable without instrumenting the
+  device itself, so stated as the leading explanation, not a certainty.
+
+**Fix: send less, and make the exact amount tunable without a code
+edit.** `WEB_VIDEO_MAX_WIDTH`/`WEB_VIDEO_QUALITY`/`WEB_VIDEO_MAX_FPS` in
+`ui/app.py` lowered from 960px/q70/10fps to **480px/q55/6fps**, and all
+three are now also CLI flags (`--web-max-width`, `--web-quality`,
+`--web-max-fps`) defaulting to the same values - added specifically so this
+can be tuned live against Shaked's actual device in real time rather than
+needing a fresh code change and restart for every value tried, since this
+is the first time this path has ever been exercised over real wireless and
+the right number for a given network is not knowable in advance.
+
+**Measured against a REAL frame pulled from the live camera at the moment
+of the fix** (not a synthetic test pattern): the previous settings produced
+~38 KB/frame; the new settings produce ~9 KB/frame from the exact same
+source image - roughly a 4x reduction in per-frame size, and combined with
+the lower frame rate (10fps -> 6fps), roughly a 7x reduction in total
+bandwidth (approx. 380 KB/s -> 54 KB/s). This also cuts the raw amount of
+image data the device has to decode and paint per second by the same
+~4x, which should help regardless of whether the bottleneck turns out to be
+network throughput or on-device rendering speed.
+
+**`SETUP.md` updated** with this finding and the tuning flags, so a still-
+choppy result has an immediate next step (go lower) documented rather than
+needing to ask again.
+
+**Not yet confirmed smooth on the actual device** - this is a real-time,
+in-progress tuning loop with Shaked watching his iPad live; the fix is
+handed back for him to test immediately, with room to go lower still if
+needed. 166 tests unaffected (this only changes default argument values and
+adds new optional flags; no logic changed that the existing suite covers
+differently).
+
+### 2026-09-11 — Reverted the 2026-09-06 video throttle: it was gated on the
+wrong signal and broke the working Mac browser too, without fixing the iPad
+
+Shaked, after testing the lowered defaults: "its not good, the delay is way
+too big and unefficient, and the live feed on the web app is now too small."
+Two separate problems in that one sentence, both real:
+
+**1. A genuine regression, now fixed.** The 2026-09-06 fix gated the video
+downscale on `page.web` - "any web session gets the lighter picture." That
+signal was wrong: `page.web` is `True` for the ordinary Mac browser session
+(`--mode web` at `127.0.0.1`) exactly as much as for the iPad session, so
+the SAME degradation meant for a struggling wireless link also silently hit
+the Mac browser, which had no bandwidth problem and had been confirmed
+working well before. Tying picture quality to "is this a browser" was
+conflating a transport with a network condition.
+
+**Fixed by removing `page.web` from this decision entirely.**
+`WEB_VIDEO_MAX_WIDTH`/`WEB_VIDEO_QUALITY`/`WEB_VIDEO_MAX_FPS` are back to
+off-by-default (`0`/`70`/`0.0` - `MjpegClient` already treats `max_width=0`
+and `max_fps=0` as "pass the frame through untouched," confirmed against a
+real frame: output was the identical object, zero processing). The
+`--web-max-width`/`--web-quality`/`--web-max-fps` CLI flags stay, but are
+now the ONLY way to reduce quality - purely opt-in, per launch, never
+inferred from what kind of client connected. The normal `--mode web`
+Mac-browser path is unaffected unless someone explicitly passes these flags
+to it too (there is no plausible reason to).
+
+**2. The actual iPad problem is not fixed, and shrinking the picture alone
+did not fix it.** The lighter settings (480px/q55/6fps, a real ~7x
+bandwidth cut, measured against the live camera at the time) did not
+resolve the reported delay to Shaked's satisfaction ("way too big and
+inefficient"). This narrows things usefully: if cutting bandwidth
+~7x didn't meaningfully help, the bottleneck is less likely to be pure
+transfer volume and more likely something structural in HOW frames are
+delivered/rendered - worth focusing the next investigation there rather
+than continuing to just push the same knobs lower.
+
+**Open, for the next session to pick up rather than guess at again:**
+- Whether Flet's own web-transport update mechanism (the msgpack control
+  message that carries each `Image.update()`) queues/batches when a
+  client's connection can't keep up, independent of frame size - i.e.
+  whether there's a queue depth that grows regardless of how small each
+  individual frame is, which would explain "smaller frames didn't help."
+- Whether the delay is dominated by round-trip/protocol overhead per
+  update rather than payload size - if so, sending fewer, not smaller,
+  updates might matter more (already tried lowering fps alongside size,
+  but not in isolation - worth separating fps and size as two different
+  experiments rather than changing both at once next time).
+- Whether the `172.20.10.x`-range connection itself (looks like an Apple
+  personal-hotspot-class network) has an inherent latency/jitter
+  characteristic no amount of client-side tuning fixes, in which case the
+  question shifts from "how do we tune the stream" to "is this network
+  usable for live video at all," and a normal home WiFi router test (not a
+  hotspot-class connection) would be the next diagnostic step, not another
+  quality setting.
+
+166 tests unaffected - this reverts default values and removes one
+conditional; no new logic to test differently.
+
+### 2026-09-11 — iPad delay: root cause confirmed and fixed. Not a bandwidth
+problem, not an iPad-specific problem - Flet's own outbound queue never
+drops stale messages
+
+Shaked pushed back hard on the working assumption: "the problem is not fps
+or whatever you think, its just a proper 5-7 seconds delay... in the web
+its like a 0.2 seconds reaction time... check if its a fundamental flet on
+ipad problem." Confirmed same home WiFi router for both devices, ruling out
+the earlier "weak hotspot" theory entirely.
+
+**Root cause, found by reading Flet's own installed library source, not
+guessed:** `flet_web/fastapi/flet_app.py`'s `FletApp` connection uses one
+plain `asyncio.Queue()` with no size limit for every outbound message, fed
+by `put_nowait()` (never blocks, never drops), drained by exactly one
+`__send_loop` task that `await`s each `websocket.send_bytes()` fully before
+pulling the next item - strict FIFO, nothing ever discarded. Traced the call
+chain confirming this is truly per-call, not batched: `Control.update()` ->
+`Page.update()` -> `Session.patch_control()` computes and enqueues one
+message immediately, every single call, no coalescing of rapid repeated
+updates to the same control.
+
+**What this means in plain terms:** if our own code (`MjpegClient` pushing
+a new frame via `Image.update()`) hands over pictures faster than a real
+network link can actually get them out the door, they do not get replaced
+or skipped - they queue, and because nothing is ever dropped, EVERY stale
+picture still gets delivered and rendered, in order, before the current one
+gets a turn. The "5-7 second delay" was literally the time needed to drain
+however many frames had backed up. This is a property of Flet's transport
+itself, not something specific to iOS, the App Store app, or a weak network
+- it simply never shows up over loopback (Mac browser at `127.0.0.1`) because
+there is no real network hop for the queue to ever fall behind on.
+
+**This also explains why the 2026-09-06 fix (shrink the picture) barely
+helped**, which was the concrete, falsifiable prediction this diagnosis
+made before testing it: if the real driver is queue depth (a function of
+how many messages/sec are produced vs. how many/sec a real WiFi round trip
+can actually clear), then making each message smaller barely matters if
+per-message/round-trip overhead dominates over raw payload size - the
+NUMBER of turns in the queue was the problem, not the size of each turn.
+
+**Decisive test, run live with Shaked watching a real device:** pointed
+`flet run --ios` at the existing synthetic camera harness (which already
+burns a live wall-clock timestamp into every frame -
+`docs/design/phase-8/fake_camera_server.py`), full resolution/quality,
+`--web-max-fps 2` only. Shaked compared the on-screen clock against his
+iPhone's real clock side by side: **identical.** Repeated against the real
+camera and a real hand-wave test: "wow, works pretty good! almost no delay
+im satisfied with the result."
+
+**Fix, and it needed no further code changes** - the opt-in-only flag
+design from the 2026-09-11 revert earlier today already supported this
+perfectly: `--web-max-fps 2` on the `flet run --ios` launch only. The
+normal `--mode web` Mac-browser path is untouched (still full rate by
+default), so this carries no risk of repeating the earlier regression where
+a global default change silently degraded the working Mac session.
+
+**Confirmed independently, and worth stating for anyone who worries this
+trades away real safety margin:** `--web-max-fps` only throttles
+`MjpegClient` (the camera picture). `/risk_status` polling
+(`RISK_STATUS_POLL_HZ = 4.0`, driving the risk banner/zone colour/hazard
+counts) runs on its own separate, un-throttled loop, and the actual audio
+alert is triggered and played by `cv/risk_engine.py`'s own detection loop on
+this Mac, independent of any connected viewer entirely (CLAUDE.md decision
+4 - pre-recorded clips played locally). **A hazard alert on the iPad's own
+screen updates at full speed even though the video picture there is capped
+at 2/sec** - the tradeoff is picture smoothness only, not alert latency.
+
+**`SETUP.md`'s mobile section rewritten** from "experimental, might not
+work" to a confirmed working setup with the exact required command
+(`--web-max-fps 2` marked as required, not optional), plus the plain-
+language explanation of why, and what it does/doesn't cost.
+
+**Left open, not urgent:** the exact ceiling before the backlog returns (3
+or 4 fps might also be stable and would look smoother) was not explored -
+`2` is confirmed good, not necessarily optimal. `SETUP.md` notes this as
+something to try later if wanted.
+

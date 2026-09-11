@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+  <style>
+    body { margin: 0; font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; }
+    a { color: #ff8c00; } a:hover { color: #ffb04d; }
+    .cond { font-family: "Barlow Semi Condensed", "IBM Plex Sans", system-ui, sans-serif; }
+  </style>
+</helmet>
+
+<div style="width: 1024px; height: 768px; background: #ff0000; display: flex; flex-direction: column; box-sizing: border-box;">
+
+  <!-- the risk edge IS the alert: 22px of pure engine red around the whole frame -->
+  <div style="flex-grow: 1; padding: 22px 22px 0 22px; display: flex;">
+    <div style="flex-grow: 1; position: relative; background: #0d1014; overflow: hidden;">
+
+      <div style="position: absolute; inset: 0; background: linear-gradient(#0f1319 0%, #0f1319 46%, #171c23 46%, #12161c 100%);"></div>
+      <div style="position: absolute; left: 30px; top: 286px; width: 300px; height: 150px; background: #1b212a; border-radius: 10px 10px 4px 4px;"></div>
+      <div style="position: absolute; left: 452px; top: 388px; width: 190px; height: 78px; background: #1d232c; border-radius: 4px;"></div>
+      <div style="position: absolute; left: 782px; top: 236px; width: 150px; height: 230px; background: #161b22; border-radius: 4px;"></div>
+
+      <!-- child now at the table -->
+      <div style="position: absolute; left: 592px; top: 268px; width: 46px; height: 46px; background: #2a3038; border-radius: 50%;"></div>
+      <div style="position: absolute; left: 596px; top: 316px; width: 40px; height: 108px; background: #2a3038; border-radius: 14px;"></div>
+      <div style="position: absolute; left: 584px; top: 260px; width: 62px; height: 174px; border: 2px solid #00ff00;"></div>
+
+      <!-- the hazard in play gets a heavier stroke, same engine red -->
+      <div style="position: absolute; left: 446px; top: 382px; width: 202px; height: 90px; border: 4px solid #ff0000;"></div>
+      <div style="position: absolute; left: 24px; top: 280px; width: 312px; height: 162px; border: 2px solid #00ffff;"></div>
+      <div style="position: absolute; left: 776px; top: 230px; width: 162px; height: 242px; border: 2px solid #8c8c8c;"></div>
+
+      <div style="position: absolute; left: 0; right: 0; bottom: 0; padding: 24px 26px; background: linear-gradient(rgba(13,16,20,0), rgba(13,16,20,0.95));">
+        <div style="font-size: 15px; color: #ffb3b3;">Started 3 seconds ago &middot; saving a clip</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- the sentence, sized to be read from the doorway -->
+  <div style="height: 208px; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; padding: 0 34px; gap: 28px;">
+    <div style="display: flex; flex-direction: column; gap: 2px;">
+      <div class="cond" style="font-size: 92px; line-height: 0.94; font-weight: 600; letter-spacing: 0.005em; color: #ffffff;">Move him</div>
+      <div class="cond" style="font-size: 40px; line-height: 1.1; color: #ffe0e0;">He is at the low table</div>
+    </div>
+  </div>
+
+</div>
+</x-dc>
+</body>
+</html>

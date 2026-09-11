@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,400;6..72,500&display=swap">
+  <style>
+    body { margin: 0; font-family: "Manrope", ui-sans-serif, system-ui, sans-serif; }
+    a { color: #e0a06a; } a:hover { color: #f0bd90; }
+    .serif { font-family: "Newsreader", Georgia, serif; }
+  </style>
+</helmet>
+
+<div style="width: 1024px; height: 768px; background: #14120f; display: flex; flex-direction: column; align-items: center; box-sizing: border-box; padding: 30px 36px; gap: 18px; color: #f2ede7;">
+
+  <div style="width: 100%; display: flex; align-items: center; justify-content: space-between;">
+    <div style="font-size: 15px; color: #a89f94;">1 of 3</div>
+    <div style="font-size: 15px; color: #a89f94;">Skip all for now</div>
+  </div>
+
+  <!-- a stack, not a table: the next two sit behind, visible but not selectable -->
+  <div style="position: relative; width: 620px; flex-grow: 1; min-height: 0;">
+
+    <div style="position: absolute; left: 34px; right: 34px; top: 18px; height: 90px; border-radius: 24px; background: #211d18;"></div>
+    <div style="position: absolute; left: 18px; right: 18px; top: 9px; height: 90px; border-radius: 24px; background: #2a251f;"></div>
+
+    <div style="position: absolute; inset: 0; border-radius: 24px; background: #1c1915; padding: 26px; display: flex; flex-direction: column; gap: 16px; box-sizing: border-box;">
+
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <div style="display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 13px; border-radius: 15px; background: rgba(255,140,0,0.15);">
+          <div style="width: 7px; height: 7px; border-radius: 50%; background: #ff8c00;"></div>
+          <div style="font-size: 13px; color: #ffb877;">already alerting</div>
+        </div>
+        <div style="font-size: 13px; color: #8f867b;">arrived 14:02</div>
+      </div>
+
+      <div style="flex-grow: 1; border-radius: 14px; background: #0d1014; position: relative; overflow: hidden; min-height: 0;">
+        <div style="position: absolute; inset: 0; background: #12161c;"></div>
+        <div style="position: absolute; left: 160px; top: 66px; width: 248px; height: 96px; background: #232a33; border-radius: 4px;"></div>
+        <div style="position: absolute; left: 154px; top: 60px; width: 260px; height: 108px; border: 3px solid #ff8c00; border-radius: 4px;"></div>
+      </div>
+
+      <div class="serif" style="font-size: 34px; line-height: 1.15; color: #f7f3ee;">Something is on the low table.</div>
+      <div style="font-size: 15px; line-height: 1.55; color: #a89f94;">It was not there when you started. Should he stay away from it?</div>
+
+      <div style="display: flex; gap: 12px;">
+        <div style="flex-grow: 1; display: flex; align-items: center; justify-content: center; height: 62px; border-radius: 31px; background: #ff0000; color: #ffffff; font-size: 18px; font-weight: 700;">Yes, keep him away</div>
+        <div style="flex-grow: 1; display: flex; align-items: center; justify-content: center; height: 62px; border-radius: 31px; border: 1px solid #3a342c; color: #e6e0d8; font-size: 18px;">It is fine</div>
+      </div>
+
+    </div>
+  </div>
+
+  <div style="font-size: 14px; color: #6f675e;">Swipe or use the buttons &middot; one at a time, in the order they arrived</div>
+</div>
+</x-dc>
+</body>
+</html>

@@ -1,0 +1,66 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,400;6..72,500&display=swap">
+  <style>
+    body { margin: 0; font-family: "Manrope", ui-sans-serif, system-ui, sans-serif; }
+    a { color: #e0a06a; } a:hover { color: #f0bd90; }
+    .serif { font-family: "Newsreader", Georgia, serif; }
+  </style>
+</helmet>
+
+<div style="width: 1024px; height: 768px; background: #14120f; display: flex; flex-direction: column; box-sizing: border-box; padding: 34px 36px; gap: 22px; color: #f2ede7;">
+
+  <div style="display: flex; align-items: center; justify-content: space-between;">
+    <div style="display: flex; align-items: center; gap: 11px;">
+      <div style="width: 9px; height: 9px; border-radius: 50%; background: #7bd88f;"></div>
+      <div style="font-size: 15px; color: #a89f94;">Living room &middot; watching since 09:12</div>
+    </div>
+    <div style="display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 16px; border-radius: 19px; border: 1px solid #2e2822; font-size: 14px; color: #a89f94;">Settings</div>
+  </div>
+
+  <!-- the reassurance sentence is the hero, not the video -->
+  <div class="serif" style="font-size: 54px; line-height: 1.12; color: #f7f3ee; max-width: 760px;">All calm. Nothing new since 14:02.</div>
+
+  <div style="display: flex; gap: 20px; flex-grow: 1; min-height: 0;">
+
+    <div style="flex-grow: 1; border-radius: 20px; background: #0d1014; position: relative; overflow: hidden;">
+      <div style="position: absolute; inset: 0; background: linear-gradient(#0f1319 0%, #0f1319 46%, #171c23 46%, #12161c 100%);"></div>
+      <div style="position: absolute; left: 30px; top: 148px; width: 224px; height: 112px; background: #1b212a; border-radius: 8px 8px 3px 3px;"></div>
+      <div style="position: absolute; left: 336px; top: 224px; width: 142px; height: 58px; background: #1d232c; border-radius: 3px;"></div>
+      <div style="position: absolute; left: 560px; top: 118px; width: 110px; height: 164px; background: #161b22; border-radius: 3px;"></div>
+      <div style="position: absolute; left: 332px; top: 220px; width: 150px; height: 66px; border: 2px solid #ff0000; border-radius: 3px;"></div>
+      <div style="position: absolute; left: 26px; top: 144px; width: 232px; height: 120px; border: 2px solid #00ffff; border-radius: 3px;"></div>
+      <div style="position: absolute; left: 18px; bottom: 16px; display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 14px; border-radius: 16px; background: rgba(20,18,15,0.72);">
+        <div style="width: 7px; height: 7px; border-radius: 50%; background: #7bd88f;"></div>
+        <div style="font-size: 13px; color: #d9d2c9;">Live</div>
+      </div>
+    </div>
+
+    <div style="width: 296px; flex-shrink: 0; display: flex; flex-direction: column; gap: 14px;">
+
+      <div style="border-radius: 20px; background: #1c1915; padding: 22px; display: flex; flex-direction: column; gap: 7px;">
+        <div style="font-size: 13px; letter-spacing: 0.07em; text-transform: uppercase; color: #8f867b;">waiting for you</div>
+        <div class="serif" style="font-size: 40px; line-height: 1; color: #f7f3ee;">3 things</div>
+        <div style="font-size: 14px; line-height: 1.5; color: #a89f94;">One of them arrived while you were out, so it is already alerting.</div>
+        <div style="display: flex; align-items: center; justify-content: center; height: 48px; border-radius: 24px; background: #f2ede7; color: #14120f; font-size: 15px; font-weight: 600; margin-top: 8px;">Look at them</div>
+      </div>
+
+      <div style="border-radius: 20px; border: 1px solid #2e2822; padding: 22px; display: flex; flex-direction: column; gap: 7px; flex-grow: 1;">
+        <div style="font-size: 13px; letter-spacing: 0.07em; text-transform: uppercase; color: #8f867b;">saved moments</div>
+        <div style="font-size: 15px; line-height: 1.55; color: #d9d2c9;">2 clips are waiting for you to keep or delete.</div>
+        <div style="font-size: 13px; color: #8f867b;">They delete themselves in 22 hours.</div>
+      </div>
+
+    </div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>
