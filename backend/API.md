@@ -127,7 +127,8 @@ first (flag that as a contract break, don't silently adapt to it):
               "origin": "scan", "is_first_scan": false, "alerts_on_approach": true}],
  "hazard_counts": {"total": 9, "confirmed": 2, "pending_first_scan": 4, "pending_new": 1, "dismissed": 2},
  "review_queue": {"length": 3, "current_id": 7},
- "alert": {"text": "RED - person #3 near object", "active": true},
+ "alert": {"text": "RED - person #3 near object", "active": true,
+           "clip": "immediate_danger.wav"},
  "diagnostics": {"fps": 14.8, "model": "yolo26l.pt", "imgsz": 640, "conf": 0.35,
                   "device": "mps", "scan_enabled": true, "socket_detect_enabled": true,
                   "persistence_enabled": true}}
@@ -137,6 +138,19 @@ first (flag that as a contract break, don't silently adapt to it):
 published its first frame (e.g. server started before the camera loop, or
 in front of `start_server()` in a test). ui-agent should treat 503 here as
 "still booting," not an error state to alarm on.
+
+`alert.clip` is one of `"hazard_detected.wav"` / `"baby_getting_close.wav"`
+/ `"immediate_danger.wav"` / `null`, matching the filenames in `cv/audio/`
+- it names whichever pre-recorded clip this Mac's own speaker just played
+for the currently-active alert, straight from `cv/risk_engine.py`'s
+`audio_for_signal()`. **Do not re-derive which clip to play from
+`risk.zone`** - a "new object appeared" alert can fire with `risk.zone` at
+`"none"` (nobody near anything yet), which `alert.clip` correctly reports
+as `hazard_detected.wav` and a zone-based guess would miss entirely. Also
+correctly `null` while an alert's on-screen banner is still showing but
+nothing should sound (the hysteresis-ending "closed" case) - a UI that
+plays a sound whenever `active` is true, without checking `clip` is
+non-null, will play a sound in a case this Mac's own speaker does not.
 
 ### `GET /health`
 `{"camera_running": bool, "last_frame_age_seconds": float|null, "frame_seq": int}`.

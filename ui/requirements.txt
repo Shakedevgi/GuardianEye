@@ -45,8 +45,11 @@
 # Deliberately NOT included:
 #   - flet-video: clip playback is handed off to the system browser for now
 #     (decision 4, 2026-08-30). Add this pin if that is ever revisited.
-#   - flet-audio: voice alerts are pre-recorded clips played by
-#     cv/risk_engine.py (CLAUDE.md decision 4). The UI does not play audio.
+#
+# flet-audio IS included below (added 2026-09-12) - the UI now also plays the
+# same pre-recorded alert clips on whichever screen is open, alongside
+# cv/risk_engine.py's own always-on speaker output. See that pin's own
+# comment for details.
 #
 # flet-desktop ships the native window client; flet-web ships the browser
 # client. Phase 8's done-when requires BOTH (a desktop window AND a tablet on
@@ -68,6 +71,17 @@ flet-web==0.86.5
 # 2026-09-06). Pinned explicitly rather than left to auto-install (which is
 # what happened the first time it was used) so a clean checkout has it too.
 flet-cli==0.86.5
+
+# flet-audio - plays the same three CLAUDE.md decision 4 alert clips on
+# whichever device is viewing. Built on the `audioplayers` Flutter plugin,
+# not a raw browser <audio> tag - a single, rare, one-off "play now" call,
+# not a sustained stream, so it does NOT hit the queue problem
+# `--web-max-fps` was built to fix (see docs/decision-log.md - the video
+# fix and this one are different problems that happen to share a
+# transport). Verified live on both the Mac browser and the iPad before
+# being treated as working - see that same log for the measured 1.5s
+# settle-window quirk this pin's usage works around in ui/app.py.
+flet-audio==0.86.5
 
 # opencv is used ONLY to downscale frames for the web/tablet path (see
 # ui/video.py MjpegClient._shrink). It is already a cv/ dependency in the

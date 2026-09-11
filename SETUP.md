@@ -101,6 +101,48 @@ again, drop back to `2`.
 
 ---
 
+## Alert sound on whichever screen is open
+
+Whichever screen has the app open — Mac browser, desktop window, or iPad —
+can now play the same alert sound your Mac's speaker plays. Nothing extra
+to install; it's part of the app.
+
+**Two separate things, worth keeping straight:**
+- **Your Mac's own speaker** — always worked, always will, is not affected
+  by anything below. It's driven directly by the camera's detection loop,
+  independent of any screen being open at all.
+- **A screen making its own sound** — the new part below. If this fails
+  for some reason, the Mac's speaker still alerts normally regardless.
+
+**One known, deliberate gap:** a screen's sound isn't armed for about the
+first 1.5 seconds right after you unlock it — a real limitation in the
+Flet library this app is built on, not a choice. If a hazard fires in that
+exact instant, that one screen stays silent for it specifically; the Mac's
+speaker is completely unaffected either way. Anything after those 1.5
+seconds plays normally.
+
+**It won't repeat itself.** One sound per genuinely new alert — it won't
+replay while the same alert is still showing, and if two different alerts
+happen in quick succession, there's a short (2.5 second) gap enforced
+between sounds so it can't feel like spam.
+
+**What to check on each screen you use:**
+- Does the sound play at all?
+- Does it match what the Mac's speaker is saying?
+- Does it stay quiet while one alert is ongoing, and not fire off rapidly
+  for a fast run of different alerts?
+
+**If testing on the iPad:** check the physical silent switch on the side
+is OFF before you test — otherwise it may look like a bug when it's really
+just the iPad being muted.
+
+**If testing the Mac browser in Chrome specifically:** it may stay silent
+there — Flet's own documentation says this doesn't work in Chrome or Edge,
+only desktop, mobile apps, and Safari. That's expected, not a bug to chase;
+the Mac's speaker covers the Mac either way.
+
+---
+
 ## If something goes wrong
 
 **"command not found" or nothing happens**
@@ -163,5 +205,5 @@ Tests: `cd ui && ../.venv/bin/python3 test_ui.py` (and the equivalents in
 
 ---
 
-*Last updated: 2026-08-30. This file gets updated as things change — if a
+*Last updated: 2026-09-12. This file gets updated as things change — if a
 step here is wrong, that's a bug in this file, say so.*

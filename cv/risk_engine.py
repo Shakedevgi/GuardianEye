@@ -220,6 +220,7 @@ from measure_segmentation import (
     PERSON_OVERLAP_THRESHOLD,
     apply_filter as seg_apply_filter,
     load_weights as load_seg_weights,
+    overlap_frac_of_a,
     segment_frame,
 )
 
@@ -890,7 +891,8 @@ class HazardMap:
         return entry
 
     def apply_scan_candidates(
-        self, raw_candidates: list, frame, frame_diagonal: float, is_first_scan_cycle: bool
+        self, raw_candidates: list, frame, frame_diagonal: float, is_first_scan_cycle: bool,
+        person_boxes: tuple = (),
     ) -> ScanDiffResult:
         """The periodic room scan's entire "detect new"/"detect removed"
         mechanism (CLAUDE.md decision 3), run once per scan cadence tick.
@@ -899,6 +901,11 @@ class HazardMap:
         person-suppressed (see generate_scan_candidates), NOT yet
         deduplicated - deduplication happens here first (Step 3's
         duplicate-candidate fix).
+
+        `person_boxes` (added 2026-09-12) is THIS frame's live person boxes,
+        used only to protect an EXISTING, already-known entry from being
+        wrongly counted as absent - see step 3 below for why this is a real
+        bug fix, not a defensive extra.
 
         Sequence:
           1. Dedupe overlapping candidates from this one scan pass.
@@ -913,7 +920,10 @@ class HazardMap:
              does not itself re-raise; a scan that reads unchanged resets
              the counter to 0.
           3. Every known SCAN-origin entry NOT matched this cycle gets its
-             absence counter bumped; once that counter reaches
+             absence counter bumped - UNLESS a person is currently standing
+             on/near its own location (see person_boxes above), in which
+             case this cycle counts as no evidence at all for that entry,
+             not absence. Once the counter reaches
              SCAN_CONSECUTIVE_SCANS_REQUIRED, the entry is removed.
           4. Every candidate NOT matched to a known entry is checked against
              last cycle's provisional (seen-once) list. A second consecutive
@@ -939,12 +949,40 @@ class HazardMap:
             match.hits += 1
             match.absent_scans = 0
             if match.state == HAZARD_STATE_DISMISSED:
+                # A person overlapping the STORED fingerprint_bbox is a
+                # second, distinct way a child's own presence can look like
+                # "the spot changed" - discovered live 2026-09-12 alongside
+                # the arrived/removed occlusion bug (see person_boxes below
+                # and apply_scan_candidates' docstring): even when the
+                # underlying object's own segment survives person-
+                # suppression upstream (so this branch is reached at all),
+                # the FIXED historical crop this compares against is a
+                # DIFFERENT region than that segment, and a child reaching
+                # toward/standing near a dismissed object can overlap the
+                # fingerprint crop without ever showing up as "person
+                # covering the segment" to generate_scan_candidates. Their
+                # body in that crop is real pixel change with nothing to do
+                # with whether the dismissed object itself moved. Treated
+                # exactly like the absence-counting fix: no evidence this
+                # cycle, not evidence of a real swap - changed_scans is left
+                # untouched, not reset (a reset would be its own false
+                # signal that the spot read as genuinely unchanged).
+                person_over_fingerprint = any(
+                    overlap_frac_of_a(
+                        {"x1": match.fingerprint_bbox[0], "y1": match.fingerprint_bbox[1],
+                         "x2": match.fingerprint_bbox[2], "y2": match.fingerprint_bbox[3]},
+                        {"x1": p[0], "y1": p[1], "x2": p[2], "y2": p[3]},
+                    ) > PERSON_OVERLAP_THRESHOLD
+                    for p in person_boxes
+                )
                 # Compare against the STABLE fingerprint_bbox, NOT `candidate`
                 # (this scan's own fresh, possibly-jittering segmentation
                 # box) - see fingerprint_changed's docstring for why using
                 # the wobbling candidate box was the actual root cause of
                 # near-constant false re-raises, not just occasional noise.
-                if fingerprint_changed(match.fingerprint, frame, match.fingerprint_bbox, label=f"entry #{match.id}"):
+                if person_over_fingerprint:
+                    pass
+                elif fingerprint_changed(match.fingerprint, frame, match.fingerprint_bbox, label=f"entry #{match.id}"):
                     match.changed_scans += 1
                 else:
                     # Read as unchanged this scan - whatever tripped the
@@ -966,6 +1004,28 @@ class HazardMap:
         removed: list[HazardEntry] = []
         for entry in scan_entries:
             if entry.id in matched_ids:
+                continue
+            # A person standing on/near this entry's own spot is the SAME
+            # reason its candidate never showed up this scan in the first
+            # place (generate_scan_candidates suppresses anything a person
+            # overlaps, so it can't propose the person's own body as a
+            # hazard) - but that suppression happens BEFORE this method ever
+            # sees the candidate list, so without this check there is no way
+            # to tell "we looked and it's gone" from "we couldn't look,
+            # someone was standing there." Confirmed live, 2026-09-12
+            # (Shaked: a child approaching an EXISTING, still-unreviewed
+            # object - no new hazard anywhere - fired a fresh "new hazard
+            # detected" alongside the correct proximity one). The mechanism
+            # is identical to JUDGED_ABSENT_SCANS_REQUIRED's bug, one layer
+            # earlier: the entry was deleted while occluded, then rediscovered
+            # once the child stepped back, producing a real
+            # HazardMap.entries.arrived event for an object that was there
+            # the whole time. This is evidence-free, not evidence-of-absence,
+            # for ANY entry (judged or still-pending) - so it is checked
+            # before, not instead of, the judged/pending threshold below.
+            entry_box = {"x1": entry.bbox[0], "y1": entry.bbox[1], "x2": entry.bbox[2], "y2": entry.bbox[3]}
+            if any(overlap_frac_of_a(entry_box, {"x1": p[0], "y1": p[1], "x2": p[2], "y2": p[3]})
+                   > PERSON_OVERLAP_THRESHOLD for p in person_boxes):
                 continue
             entry.absent_scans += 1
             # A spot the parent has already ruled on gets a far longer
@@ -1530,6 +1590,17 @@ class AlertDispatcher:
         self._clock = clock
         self.banner_text = None
         self.banner_until = 0.0
+        # Which of the three pre-recorded clips (if any) belongs to the
+        # CURRENTLY active banner - set alongside banner_text/banner_until in
+        # speak(), read back through current_clip() below. Rebuilt
+        # 2026-09-11/12 (Phase 8 iPad+web audio) so a remote UI can play the
+        # SAME sound this Mac's speaker plays, sourced from the one place
+        # that already decides it (audio_for_signal), rather than the UI
+        # guessing from risk.zone - which would miss the "new object
+        # appeared" case entirely (it can fire with nobody near anything)
+        # and would need reimplementing this exact mapping a second time,
+        # at risk of drift.
+        self.banner_clip = None
 
     def speak(self, signal: AlertSignal) -> None:
         """The ONE choke point where a parent is actually told something.
@@ -1543,6 +1614,12 @@ class AlertDispatcher:
         audio_name = audio_for_signal(signal)
         if audio_name is not None and self._audio_player is not None:
             self._audio_player.play(audio_name)
+        # Recorded even when audio_name is None (a "closed" signal, per
+        # audio_for_signal's docstring, still gets a banner via
+        # banner_text_for_signal below but plays no sound) - current_clip()
+        # must report "nothing to play" in exactly that case, not the
+        # PREVIOUS alert's clip left dangling from an earlier speak() call.
+        self.banner_clip = audio_name
         text = banner_text_for_signal(signal)
         # Kept as a print rather than a logger: the terminal's "ALERT:" lines
         # are the evidence trail every live test in this project has been
@@ -1573,13 +1650,37 @@ class AlertDispatcher:
             self.speak(held)
         return held
 
+    def _banner_active(self, now: float) -> bool:
+        """The one boolean both banner() and current_clip() key off, so they
+        can never disagree about whether the banner has expired - factored
+        out rather than duplicated when current_clip() was added.
+        """
+        return self.banner_text is not None and now < self.banner_until
+
     def banner(self, now: float) -> tuple:
         """(text, active) for the current moment - the debug overlay and
         /risk_status's `alert` field read the same state through this one
         accessor, so the pixels and the JSON can never disagree about what the
-        parent is currently being shown.
+        parent is currently being shown. Signature/behaviour UNCHANGED by the
+        current_clip() addition - two existing call sites in main() and four
+        existing tests unpack this as a 2-tuple.
         """
-        return self.banner_text, (self.banner_text is not None and now < self.banner_until)
+        return self.banner_text, self._banner_active(now)
+
+    def current_clip(self, now: float):
+        """Which pre-recorded clip (if any) belongs to the banner that is
+        active RIGHT NOW - None once the banner expires, even though
+        banner_clip itself is left set (harmless; _banner_active(now) gates
+        it here exactly as it gates `active` in banner() above, so the two
+        can never disagree about what's "current" either).
+
+        For the Phase 8 iPad+web audio alert: a remote UI can play the SAME
+        sound this Mac's speaker just played, without re-deriving the
+        mapping from risk.zone (which would miss the "new object appeared"
+        alert kind, and would duplicate a rule that already lives in
+        audio_for_signal - see the module docstring there).
+        """
+        return self.banner_clip if self._banner_active(now) else None
 
 
 class RollingBuffer:
@@ -2005,6 +2106,7 @@ def build_risk_status(
     review_queue: ReviewQueue,
     alert_text,
     alert_active: bool,
+    alert_clip=None,
     smoothed_fps,
     model_name: str,
     imgsz: int,
@@ -2106,6 +2208,13 @@ def build_risk_status(
         "alert": {
             "text": alert_text,
             "active": bool(alert_active),
+            # Which of the three CLAUDE.md decision 4 clips (if any) belongs
+            # to THIS alert - so a remote UI (the Phase 8 iPad+web audio
+            # path) can play the same sound this Mac's speaker plays, via
+            # AlertDispatcher.current_clip(), the same accessor that
+            # decided it here. Deliberately not re-derived from risk.zone by
+            # any consumer of this field - see current_clip()'s docstring.
+            "clip": alert_clip,
         },
         "diagnostics": {
             "fps": None if smoothed_fps is None else float(smoothed_fps),
@@ -2499,7 +2608,8 @@ def main() -> None:
                     else:
                         raw_candidates = generate_scan_candidates(frame, scan_model, person_boxes, args.scan_imgsz, device)
                         diff = hazard_map.apply_scan_candidates(
-                            raw_candidates, frame, frame_diagonal, is_first_scan_cycle=(room_scan_index == 0)
+                            raw_candidates, frame, frame_diagonal, is_first_scan_cycle=(room_scan_index == 0),
+                            person_boxes=person_boxes,
                         )
                         for entry in diff.arrived:
                             enqueue_and_maybe_alert(entry, "room scan")
@@ -2587,6 +2697,10 @@ def main() -> None:
                     # matching the pre-extraction ordering exactly, where
                     # /risk_status was built from alert_text as it stood here.
                     banner_text, banner_active = alert_dispatcher.banner(now)
+                    # Same instant, same accessor family, so /risk_status's
+                    # alert.clip can never point at a different alert than
+                    # alert.text/active do.
+                    banner_clip = alert_dispatcher.current_clip(now)
                     status = build_risk_status(
                         camera_index=camera.index,
                         camera_name=camera.resolved_name,
@@ -2599,6 +2713,7 @@ def main() -> None:
                         review_queue=review_queue,
                         alert_text=banner_text,
                         alert_active=banner_active,
+                        alert_clip=banner_clip,
                         smoothed_fps=smoothed_fps,
                         model_name=args.model,
                         imgsz=args.imgsz,

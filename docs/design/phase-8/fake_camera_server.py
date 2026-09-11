@@ -84,7 +84,11 @@ try:
             "hazard_counts": {"total": 9, "confirmed": 2, "pending_first_scan": 4,
                               "pending_new": 1, "dismissed": 2},
             "review_queue": {"length": 3, "current_id": 7, "queue": [7, 8, 9]},
-            "alert": {"text": f"{zone.upper()} - person #3 near object", "active": zone == "red"},
+            # "clip" matches the real /risk_status shape (backend/API.md) -
+            # matches AUDIO_IMMEDIATE_DANGER for red, since this synthetic
+            # zone cycle never produces a "new object" alert kind.
+            "alert": {"text": f"{zone.upper()} - person #3 near object", "active": zone == "red",
+                      "clip": "immediate_danger.wav" if zone == "red" else None},
             "diagnostics": {"fps": round(n / max(time.time() - t0, 1e-6), 2), "model": "probe",
                             "imgsz": 640, "conf": 0.35, "device": "probe",
                             "scan_enabled": True, "socket_detect_enabled": True,

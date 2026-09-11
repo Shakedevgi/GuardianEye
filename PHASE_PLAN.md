@@ -406,7 +406,47 @@ FastAPI backend only — video embed, risk banner, event log, settings,
 keep/discard clip controls.
 **Done when:** the same Flet code runs as a desktop window AND is reachable
 from a tablet/phone browser on the same WiFi, both showing live data.
-`[ ]`
+
+`[~]` — **status corrected 2026-09-12 by docs-agent's session audit; this
+file previously said `[ ]` ("not started"), which was stale against a large
+amount of real, committed work.** `ui/app.py` (the "Console" direction,
+chosen 2026-08-30 per `docs/decision-log.md`) has existed and been iterated
+on since 2026-08-30, including a PIN-gated auth flow, a real MJPEG-in-Flet
+video path (`MjpegClient`, parsing the multipart stream in Python since
+`ft.Image` cannot consume `/video_feed` directly — measured, not guessed,
+per the 2026-08-30 kickoff entry), and a genuine second device (Shaked's
+iPad, over real WiFi, via the App Store "Flet" preview app) actually
+receiving live video and alert sound as of this session. This is real
+progress toward the done-when bar, not paperwork — see
+`docs/phase-writeups/session-2026-09-11-ui-and-alert-hardening.md` for this
+session's part of it in detail. **Not set to `[x]`, and should not be,
+until:**
+- **The iPad/Mac browser alert-banner desync is fixed, or at least measured
+  and understood, not just diagnosed as plausible.** Reported live by
+  Shaked this session ("they shout completely different alerts"); the
+  working hypothesis (the same unbounded-queue transport property that
+  caused the separately-fixed video delay, now suspected of also affecting
+  the independent `/risk_status` poll loop) is untested. Two devices
+  showing live data that *disagrees with each other* is arguably worse than
+  one device showing stale data consistently, for a safety product — this
+  should block calling Phase 8 done, not just get filed as a known issue.
+- **Two real `cv/` bug fixes from this session (a person occluding an
+  unreviewed hazard's spot, and a person occluding a DISMISSED hazard's
+  fingerprint spot — both causing spurious re-alerts) are verified only by
+  targeted reproduction and unit tests, not yet watched happen on the real
+  camera.** Both are exactly the kind of interaction a parent's own child
+  will cause constantly (reaching toward, standing in front of, a tracked
+  hazard), so this isn't a low-traffic edge case to defer casually.
+- `PHASE_PLAN.md`'s own done-when line ("reachable from a tablet/phone
+  browser... both showing live data") is met for VIDEO (confirmed smooth,
+  `--web-max-fps 2`, 2026-09-11) but the "both showing live data" half needs
+  the desync item above resolved before it's honestly claimable for the
+  RISK/ALERT data too, not just the picture.
+- The event log, settings panel, and keep/discard clip controls named in
+  this phase's own goal line have not been independently re-verified by
+  docs-agent this session (out of scope for the task that produced this
+  update — a documentation-only pass, no code read of those specific
+  panels) — noted here as unverified, not as broken.
 
 ### Phase 9 — Full integration + hardening
 **Owner:** orchestrator (all agents contribute)

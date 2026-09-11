@@ -41,8 +41,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "views"))
 
 import flet as ft
+import flet_audio as fa
 
 from api_client import ApiClient, ApiError, NotReady, ReviewCommandFailed, ReviewNotCurrent
+from alert_audio import AlertSoundPolicy
 from colors import BG_ROOT
 from video import MjpegClient
 import token_store
@@ -85,6 +87,18 @@ WEB_VIDEO_MAX_FPS = 0.0
 RISK_STATUS_POLL_HZ = 4.0
 HEALTH_POLL_HZ = 1.0
 RECENT_EVENTS_POLL_SECONDS = 5.0
+
+# How long to wait after unlock before the alert-sound Service control is
+# trusted to actually play - measured directly against this Flet version
+# (0.86.5): calling .play() on an Audio control within the same burst of
+# code that constructed it reliably times out after 30s (RuntimeError:
+# "Future not completed"), because the client has not finished mounting
+# the newly-registered service yet. A ~1.5s pause after construction fixed
+# it in every trial. See the comment where alert_audio is constructed for
+# the full story and what this costs (a hazard in that exact ~1.5s window
+# stays silent on THIS device only - the Mac's own speaker, driven
+# independently by the detection loop, is unaffected either way).
+ALERT_AUDIO_SETTLE_SECONDS = 1.5
 
 PANEL_NAMES = ("live", "review", "log", "clips", "settings")
 
@@ -144,6 +158,49 @@ def build_app(args: argparse.Namespace):
             "dev_mode": args.dev, "mjpeg": None, "authed": False, "mode": "live",
             "latest_hazards": [], "red_alert_since": None,
         }
+
+        # ---- alert sound: a Service control, not a visual one -
+        # flet_audio.Audio.init() self-registers into the page's service
+        # registry the moment it's constructed (confirmed by reading
+        # flet/controls/services/service.py), so unlike ft.Image there is
+        # no page.overlay.append()/page.services.append() to call. Files
+        # live in ui/assets/audio/ - deliberately duplicated from cv/audio/
+        # rather than fetched over HTTP, so this stays a client-side-only
+        # addition with no new backend route.
+        #
+        # ALERT_AUDIO_SETTLE_SECONDS (defined above) is real and
+        # load-bearing, not defensive padding - see its own comment for the
+        # measured 30s-timeout bug it works around. Constructing with a
+        # real `src` up front (not None) matches exactly what was tested -
+        # not confirmed to matter, not worth re-testing to find out.
+        alert_audio = fa.Audio(src="audio/hazard_detected.wav", autoplay=False)
+        alert_sound_policy = AlertSoundPolicy()
+        state["alert_audio_ready"] = False
+
+        async def _arm_alert_audio() -> None:
+            await asyncio.sleep(ALERT_AUDIO_SETTLE_SECONDS)
+            state["alert_audio_ready"] = True
+
+        async def _play_alert_clip(clip: str) -> None:
+            # Silently skip rather than raise during the settle window -
+            # the PRIMARY alert (this Mac's own speaker, from the real
+            # detection loop) has no such delay and is unaffected either
+            # way; a hazard in the first ~1.5s after unlock still alerts
+            # normally there. Logged so a real miss during testing is
+            # visible rather than silently invisible.
+            if not state["alert_audio_ready"]:
+                print(f"[alert_audio] skipped {clip!r} - still settling", flush=True)
+                return
+            try:
+                alert_audio.src = f"audio/{clip}"
+                await alert_audio.play()
+                # Mirrors cv/risk_engine.py's own "ALERT:" print (its
+                # docstring on speak() calls that line an evidence trail
+                # live tests are checked against) - same idea here, for
+                # this device's OWN, separate playback.
+                print(f"[alert_audio] played {clip!r}", flush=True)
+            except Exception as exc:
+                print(f"[alert_audio] play failed for {clip!r}: {type(exc).__name__}: {exc}", flush=True)
 
         # ---- assemble views (video Image control is created here and is
         # never removed from the tree afterwards - see ui/video.py) -------
@@ -324,6 +381,7 @@ def build_app(args: argparse.Namespace):
             state["authed"] = True
             show_main_shell()
             start_mjpeg()
+            asyncio.create_task(_arm_alert_audio())
             asyncio.create_task(poll_risk_status())
             asyncio.create_task(poll_health())
             asyncio.create_task(poll_recent_events())
@@ -397,6 +455,9 @@ def build_app(args: argparse.Namespace):
                     # the web path downscales. See views/review.py _try_crop.
                     state["camera_width"] = (status.get("camera") or {}).get("width")
                     _track_alert_duration(status)
+                    clip = alert_sound_policy.next_clip(status.get("alert"))
+                    if clip:
+                        await _play_alert_clip(clip)
                     if state["mode"] == "review":
                         await load_review()
                 except NotReady:

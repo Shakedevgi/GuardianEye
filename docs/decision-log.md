@@ -3781,3 +3781,308 @@ or 4 fps might also be stable and would look smoother) was not explored -
 `2` is confirmed good, not necessarily optimal. `SETUP.md` notes this as
 something to try later if wanted.
 
+
+### 2026-09-12 — Alert sound rebuilt (audio wasn't broken, it was reverted
+whole) plus a cooldown layer, verified end-to-end before handoff
+
+After the full revert (2026-09-11), Shaked asked to rebuild the sound
+feature properly, with three real product questions settled up front rather
+than assumed:
+
+1. **The ~1.5s settle-window gap** (real Flet library behavior, see the
+   2026-09-11 entry below this one) - accepted, disclosed. The Mac's own
+   speaker is unaffected regardless.
+2. **Non-spam rule** - the identity-dedup design from before (play once per
+   distinct alert, replay only if it recurs after going quiet) PLUS a new
+   requirement: a minimum cooldown between sounds even for two genuinely
+   DIFFERENT alerts arriving close together, so a fast sequence of hazards
+   can't itself feel spammy.
+3. **Mac-browser-in-Chrome silence** (Flet's own docs: autoplay-style sound
+   doesn't work in Chrome/Edge) - accepted as-is; the Mac's speaker already
+   covers the Mac regardless of what any browser tab does.
+
+Also flagged and deliberately deferred: iOS often mutes in-app sound when
+the physical silent switch is on, which this feature does not override.
+Not built - just remembered as a test precondition (switch must be off).
+
+**Correction worth recording precisely, since it's easy to misread the
+2026-09-11 entries as "the feature had a bug":** it never did. Every
+verification before the revert - 11 unit tests plus a live end-to-end run
+showing exactly one play per distinct alert window, no repeats, no
+failures - passed. The revert was about how it was built (wired into the
+live app on a "is this possible" question, without checking first), not a
+defect in what was built.
+
+**Rebuild:** identical to the reverted implementation - same
+`AlertDispatcher.current_clip()`/`banner_clip` addition in
+`cv/risk_engine.py` (banner()'s 2-tuple signature still unchanged), same
+`alert.clip` field on `/risk_status`, same `ui/alert_audio.py`
+`AlertSoundPolicy` identity-dedup core, same `ALERT_AUDIO_SETTLE_SECONDS`
+Flet-timing workaround in `ui/app.py`, same `ui/assets/audio/` duplication
+rather than a new backend route, same `flet-audio==0.86.5` pin.
+
+**New: a cooldown layer**, `ALERT_SOUND_COOLDOWN_SECONDS = 2.5` in
+`ui/alert_audio.py` - deliberately matching `cv/risk_engine.py`'s own
+`GLOBAL_ALERT_MIN_INTERVAL_SECONDS` rather than a freshly-invented number,
+since that's already this project's answer to "how fast is too fast" for
+the Mac's own speaker. A suppressed alert is NOT remembered as played -
+once the cooldown clears, whatever is active at that moment gets a real
+chance, so the cooldown delays rather than permanently drops. The cooldown
+clock is independent of `active` bouncing false-then-true (tested
+directly - a brief inactive blip must not reset it early). 3 new tests
+covering: a fast flurry of different alerts collapsing to one sound: a
+suppressed alert getting its turn once the window clears; the clock
+surviving a brief inactive blip. 8 tests total for `AlertSoundPolicy` now
+(up from 5 - **corrected 2026-09-12 by docs-agent's session audit**: this
+entry originally said "6 tests total... up from 3," which undercounts what
+is actually in `ui/test_ui.py`. Read directly: 5 identity-dedup tests
+existed before this change (`test_alert_sound_plays_once_for_a_sustained_
+active_alert`, `..._plays_again_for_a_second_alert_after_the_cooldown`,
+`..._replays_the_same_alert_if_it_recurs_after_going_quiet`, `..._never_
+plays_for_a_closed_signal_shown_via_the_banner`, `..._handles_no_alert_
+object_at_all`), plus the 3 new cooldown tests named above = 8, not 6. The
+"3 new tests" part of this entry was always correct; only the running
+total was arithmetic error, not a missing/phantom test - fixed in place
+rather than left to mislead a future reader doing the same count), all
+passing before any Flet wiring was touched - same discipline as before.
+
+**Verified end-to-end again** against the synthetic camera harness (its
+`alert.clip` field restored to match), through the real, unmodified
+`ui/app.py`: unlocked, watched multiple zone cycles, confirmed 7
+consecutive `[alert_audio] played 'immediate_danger.wav'` lines landing
+~12s apart (exactly one full zone cycle, matching the earlier verification
+precisely) with zero failures. The settle-window skip message was not
+re-observed this run - timing-dependent on how soon after unlock the first
+red window lands, which varies run to run - but the mechanism itself
+(`ALERT_AUDIO_SETTLE_SECONDS`, the `alert_audio_ready` gate, `_arm_alert_audio()`
+scheduled from `unlock()`) is unchanged from what was previously observed
+working, and is stated here as "not re-observed," not "removed" - an
+honest distinction worth keeping precise.
+
+**`SETUP.md` updated** with a real, non-experimental "Alert sound on
+whichever screen is open" section: the two-speaker distinction (Mac
+speaker vs. screen sound) stated plainly up front, the settle-window and
+cooldown behavior explained in plain language, and explicit pre-test
+checks for both known gotchas (Chrome silence, iPad silent switch).
+
+178 tests pass (110 cv, 26 ui, 26 server, 16 persistence).
+
+**Not yet confirmed: real sound on Shaked's actual iPad and Mac browser.**
+Same category of "cannot be proven from here, needs a human with the
+device" gap as everything else in this phase - handed back for exactly
+that check.
+
+### 2026-09-12 — Real bug found and fixed: an existing, unreviewed hazard
+firing a fresh "new object" alert when a child simply walked up to it
+
+Shaked corrected an earlier wrong diagnosis of mine directly: "this is not
+the case - you are wrong... when there were NO new hazards, and the baby
+came into the picture it alarmed baby getting close to a hazard AND ALSO
+new hazard detected for no reason with no new hazard." Checked, and he was
+right - the first explanation (decision 4's dual arrival+approach alerts)
+did not fit what he actually described.
+
+**Real root cause, traced through the code rather than guessed a second
+time:** `generate_scan_candidates()` deliberately suppresses any segment
+overlapping a person (`PERSON_OVERLAP_THRESHOLD`, `measure_segmentation.py`
+- exists so the scanner never proposes a person's own body as a hazard).
+That suppression happens BEFORE `apply_scan_candidates()` ever sees the
+candidate list, so an EXISTING, already-known entry whose spot a person is
+currently standing on/near produces no matching candidate that scan -
+indistinguishable, before this fix, from the object genuinely being gone.
+Two consecutive scans of that (~10s at the default cadence) deleted the
+entry; once the child stepped back and the spot became visible again, it
+was picked up as a brand-new arrival - a real
+`hazard_map.entries` deletion-and-rediscovery producing a genuine, fresh
+`AlertManager.open_new_object()` call for an object that never left.
+
+**This is architecturally the SAME family of bug as the 2026-09 (~09-10/11)
+`JUDGED_ABSENT_SCANS_REQUIRED` fix, one layer earlier** - that fix protected
+JUDGED (confirmed/dismissed) entries from being deleted by a routine
+segmenter miss; this one protects ANY entry, judged or still pending, from
+being deleted specifically when the miss is explained by a person standing
+on its own spot - which the child approaching it (exactly what triggers the
+correct proximity alert) is the single most common way to cause.
+
+**Fix:** `apply_scan_candidates()` takes a new `person_boxes` parameter
+(THIS frame's live person boxes, already computed every frame by the
+per-frame YOLO pass in `main()` - no new detection work). Before
+incrementing an unmatched entry's `absent_scans` counter, check whether a
+person's box overlaps the ENTRY'S OWN bbox by more than
+`PERSON_OVERLAP_THRESHOLD` (reusing `measure_segmentation.py`'s own
+`overlap_frac_of_a`, the exact same function and threshold the upstream
+suppression already uses, so the two can't disagree about what counts as
+"occluded"). If so, this cycle counts as NO evidence at all for that entry
+- the counter is not touched, not just capped - rather than "confirmed
+absent." Applies to every entry regardless of state, checked before the
+existing judged/pending threshold branch, so it composes with rather than
+replaces the earlier fix.
+
+**Reproduced first, then fixed, then reproduced-as-fixed** - the exact
+"child walks up to an unreviewed table object" scenario, in isolation,
+before touching the real loop: with the fix, the entry survives the whole
+time a person occludes it and is the SAME entry once revealed (no
+`arrived` event); a genuinely removed object with no one nearby still
+expires normally on the same schedule as before (unchanged - re-verified,
+not assumed).
+
+**3 new regression tests**, including a location-specificity check that
+was NOT part of the original bug report but is the kind of thing a
+careless fix could get wrong: a person ELSEWHERE in frame must not give
+every unrelated entry a free pass on its own absence budget. `main()`'s
+one real call site now passes `person_boxes=person_boxes` (already in
+scope every frame); no other call sites existed.
+
+181 tests pass (113 cv, 26 ui, 26 server, 16 persistence).
+
+**Not yet re-verified against the real camera** - same category of gap as
+the earlier fix: pinned by a direct, faithful reproduction and by tests,
+not yet watched happen live. Worth specifically re-testing the exact
+scenario (place an unreviewed object, then walk up to it) on the next
+camera session.
+
+### 2026-09-12 — A second bug in the same family, fixed the same session but
+never given its own decision-log entry: a person over a DISMISSED hazard's
+fingerprint spot was re-raising it, alongside a spurious "new hazard
+detected" (logged retroactively by docs-agent's end-of-session audit)
+
+**Why this entry exists.** The bug immediately above (person standing on an
+unreviewed entry's own spot, read as absence) and this one were found in the
+same live investigation with Shaked, and the code comments in
+`cv/risk_engine.py` say so explicitly ("discovered live 2026-09-12 alongside
+the arrived/removed occlusion bug"). Only the first got a decision-log entry
+at the time; this second, genuinely separate fix did not, and would have
+been silently absent from the project's own record if this audit hadn't
+caught it. Confirmed by direct code read (`apply_scan_candidates()`,
+`cv/risk_engine.py:951-1002`) and by a dedicated regression test
+(`test_a_person_over_the_fingerprint_spot_does_not_false_reraise_a_dismissed_entry`,
+`cv/test_risk_engine.py:670`) - both are real, committed code, not a claim
+taken on trust.
+
+**The bug, in plain terms.** A DISMISSED hazard-map entry remembers what its
+spot looked like at the moment it was dismissed (`fingerprint`/
+`fingerprint_bbox` - see `HazardMap.dismiss`). Every later scan re-crops that
+same fixed region and pixel-diffs it against the stored fingerprint
+(`fingerprint_changed()`) to decide "did something actually change here" -
+two changed scans in a row re-raise the entry back to PENDING (Shaked's
+"better safe than sorry" rule from 2026-08-13). The bug: `fingerprint_
+changed()` has no idea whether a PERSON, not a new object, is what's
+currently different about that patch of pixels. A child reaching toward or
+standing in front of an already-dismissed object changes those exact pixels
+for real (skin instead of whatever was fingerprinted), and the comparison
+correctly - from its own narrow, pixel-only view - reports "changed." Two
+scans of that in a row re-raised a dismissed entry with nothing new actually
+present, and because a re-raised entry is indistinguishable from a brand-new
+arrival to the alerting logic, it ALSO fired a fresh, spurious "new hazard
+detected" banner riding alongside the correct "baby getting close" proximity
+alert - exactly what Shaked reported ("no new hazards... it alarmed baby
+getting close AND ALSO new hazard detected for no reason").
+
+**Why this is a genuinely different bug from the one logged right above it,
+not a duplicate.** The absence-counting fix (previous entry) protects the
+REMOVAL path: a person overlapping an entry's own bbox stops that entry's
+`absent_scans` counter from incrementing. This fix protects a completely
+different code path - the DISMISSED-entry MATCH branch, where the candidate
+DID match (the object's segment survived person-suppression upstream) and
+the question is instead "does the fingerprint crop, a separately-tracked
+fixed region, look different." A person can overlap the fingerprint_bbox
+without ever registering as "covering the segment" to the upstream
+person-suppression this project already had, because the fingerprint region
+and the current segmentation candidate are not the same box. Confirmed
+directly in code: the fix for this lives inside the `if match.state ==
+HAZARD_STATE_DISMISSED:` block of `apply_scan_candidates()`, several dozen
+lines away from the removal-loop fix, and the earlier fix's own code comment
+says as much ("This is a DIFFERENT code path from the arrived/removed
+occlusion fix above... and was not covered by it").
+
+**The fix.** Same shared mechanism as the first fix, reused rather than
+reinvented: `overlap_frac_of_a` and `PERSON_OVERLAP_THRESHOLD` (0.3, from
+`measure_segmentation.py` - the same function and threshold the upstream
+person-suppression itself uses, so the two mechanisms can never disagree
+about what counts as "a person is standing here"). Before calling
+`fingerprint_changed()`, check whether any live person box overlaps the
+entry's own `fingerprint_bbox` above that threshold. If so, this scan counts
+as no evidence either way for that entry - `changed_scans` is left
+untouched (neither incremented as "changed" nor reset to 0 as "confirmed
+unchanged," since a reset would itself be a false signal that the spot was
+positively checked and found fine).
+
+**Verified not to weaken the real re-raise path.** The regression test
+explicitly re-runs the same genuine-change scenario with the person removed
+from frame afterward and confirms the entry still re-raises correctly after
+two consecutive real-change scans - the fix suppresses a false trigger, it
+does not make the dismiss-reraise mechanism blind to an actual swapped
+object.
+
+**Test evidence:** 1 new test (`test_a_person_over_the_fingerprint_spot_
+does_not_false_reraise_a_dismissed_entry`). Grep-counted directly against
+`cv/test_risk_engine.py`: 114 `def test_` functions now exist in that file
+(up from the 113 the previous entry stated), consistent with exactly one
+new test having landed since. **Caveat, stated precisely because this audit
+has no Bash access this session:** this is a source-level function count,
+not a confirmed pass count - nobody ran `cd cv && python test_risk_engine.py`
+during this audit to verify all 114 (nor the 182-test grand total this
+implies: 114 cv + 26 ui + 26 server + 16 persistence) actually pass. Worth
+running before treating either number as proven, the same caveat this
+project has attached to test counts before when Bash access wasn't
+available (see Phase 5's write-up, same gap, same honesty).
+
+**Not yet re-verified against the real camera** - identical caveat to the
+bug logged immediately above: pinned by reading the code, by a faithful
+targeted reproduction in the test, and by the shared mechanism it reuses,
+but nobody has yet stood a child-height object next to the camera, dismissed
+it, and watched a person's hand hover over the exact spot to confirm no
+false re-raise happens live. Worth testing in the same camera session as the
+first bug's real-hardware check, since both involve exactly the same
+physical action (a person occluding a known hazard-map spot).
+
+### 2026-09-12 — Two smaller session items, checked and recorded for
+completeness rather than left as loose ends (docs-agent audit)
+
+**"Double sound" when two app windows are open is expected behaviour, not a
+bug - confirmed against the code, not just asserted.** Shaked reported
+hearing an alert sound twice, from an open desktop window and Chrome at the
+same time. Each running `ui/app.py` process constructs its own
+`AlertSoundPolicy` instance (`alert_sound_policy = AlertSoundPolicy()`,
+scoped inside `main()`'s per-session setup, not a module-level singleton
+shared across connections) and polls `/risk_status` independently at its
+own `RISK_STATUS_POLL_HZ`. There is no cross-session coordination anywhere
+in `ui/app.py` or `backend/server.py` that would or could suppress a second
+session's sound because a first session already played one - each open
+screen is, correctly, an independent listener. Two screens open at once
+will each decide independently to play, which sounds like "double" from a
+person standing near both. This was never written down anywhere (`SETUP.md`
+was checked directly - its "Alert sound on whichever screen is open" section
+explains the two-speaker distinction, the settle window, and the cooldown,
+but says nothing about what happens with two *screens* open at once) -
+flagged here as a documentation gap, and worth a short addition to
+`SETUP.md` so it isn't re-reported as a bug next time someone has two
+windows open during testing.
+
+**The iPad/Mac browser "shouting completely different alerts" is a real,
+open, unmeasured problem - not fixed, and not the same root cause as the
+video-delay bug already fixed this session.** Shaked's report: watching the
+iPad and a Mac browser side by side, the two screens' alert banners did not
+match. Checked directly, not assumed: `--web-max-fps` (the flag that fixed
+the video-delay bug earlier this session) only throttles `MjpegClient` - the
+picture. `RISK_STATUS_POLL_HZ = 4.0`, the separate loop that drives the
+banner text/zone/clip on every screen, is untouched by it and runs
+independently on each connected client. The working hypothesis, not yet
+tested: the same underlying Flet transport property that caused the video
+delay (an unbounded outbound queue that never drops stale messages,
+confirmed by reading `flet_web/fastapi/flet_app.py` earlier this session)
+could equally be backing up the `/risk_status`-driven UI updates a real
+WiFi client sends/receives, independent of the video path entirely, which
+would mean one screen is reacting to a genuinely older snapshot of
+`/risk_status` than the other at any given instant. This is a plausible,
+mechanism-consistent hypothesis, not a measured finding - nobody has yet
+instrumented two simultaneous clients to confirm which one (or both) is
+actually stale, by how much, or whether it is this mechanism at all versus
+something else (e.g. ordinary poll-timing jitter between two independently-
+scheduled 4Hz loops, which would produce a similar-looking symptom for a
+much less interesting reason). **Recorded here as an open item for the next
+session, explicitly not as solved:** the fix that worked for video
+(`--web-max-fps N`, applied to the picture stream only) has no known
+equivalent for the risk-status poll loop yet, and none should be assumed to
+carry over without separately measuring whether the same failure shape
+actually applies here.

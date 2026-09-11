@@ -392,6 +392,95 @@ def test_unreviewed_entry_absence_budget_is_unchanged_by_the_judged_fix():
     assert len(diff.removed) == 1, "unreviewed entries must still expire quickly"
 
 
+def test_a_person_standing_on_an_entrys_spot_does_not_count_as_absence():
+    """Shaked, live 2026-09-12: with NO new hazard anywhere, a child simply
+    approaching an EXISTING, still-unreviewed object fired both the correct
+    proximity alert AND a fresh "new hazard detected" alert - for an object
+    that never actually left. Root cause: generate_scan_candidates
+    person-suppresses anything a person overlaps (so it doesn't propose the
+    person's own body as a hazard), so a person standing on/near a known
+    entry's spot means that entry's candidate never reaches
+    apply_scan_candidates at all - indistinguishable, before this fix, from
+    the object genuinely being gone. The child getting close to it (the
+    proximity alert) is EXACTLY the action that made it look absent.
+
+    This is a real reproduction, not a synthetic edge case: the fixture
+    values below are literally what a "child walks up to a low table" scan
+    would look like (the entry's spot and the child's own box overlapping
+    enough that the segmenter would suppress it as person-covered).
+    """
+    frame_diagonal = math.hypot(1920, 1080)
+    frame = _solid_frame((100, 100, 100))
+    spot = (460.0, 300.0, 680.0, 460.0)
+    child = (500.0, 250.0, 660.0, 500.0)  # standing right in front of `spot`
+    hm = re.HazardMap()
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False)
+    entry_id = hm.entries[0].id
+
+    # The child stands there through the exact absence budget that would
+    # otherwise remove an unreviewed entry - with a person occluding it the
+    # whole time, none of it should count.
+    for _ in range(re.SCAN_CONSECUTIVE_SCANS_REQUIRED + 2):
+        diff = hm.apply_scan_candidates([], frame, frame_diagonal, is_first_scan_cycle=False,
+                                        person_boxes=[child])
+        assert diff.removed == [], "occluded by a person - must not count as absence"
+    assert len(hm.entries) == 1
+    assert hm.entries[0].id == entry_id
+    assert hm.entries[0].absent_scans == 0, "the counter itself must not move while occluded"
+
+    # Child steps back: the object is exactly where it always was - must be
+    # the SAME entry, never a fresh arrival.
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False, person_boxes=[])
+    diff = hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False, person_boxes=[])
+    assert diff.arrived == [], "must not re-arrive as a new hazard"
+    assert len(hm.entries) == 1
+    assert hm.entries[0].id == entry_id
+
+
+def test_person_occlusion_protects_judged_entries_too_not_just_pending_ones():
+    """The same protection must apply to a CONFIRMED hazard - a child
+    standing in front of a hazard they're already been taught is dangerous
+    is if anything the single most likely real-world moment for this to
+    happen, and it must not cost the parent's earlier judgement."""
+    frame_diagonal = math.hypot(1920, 1080)
+    frame = _solid_frame((100, 100, 100))
+    spot = (460.0, 300.0, 680.0, 460.0)
+    child = (500.0, 250.0, 660.0, 500.0)
+    hm = re.HazardMap()
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False)
+    hm.confirm(hm.entries[0].id)
+
+    for _ in range(5):
+        diff = hm.apply_scan_candidates([], frame, frame_diagonal, is_first_scan_cycle=False,
+                                        person_boxes=[child])
+        assert diff.removed == []
+    assert hm.entries[0].absent_scans == 0
+    assert hm.entries[0].state == re.HAZARD_STATE_CONFIRMED
+
+
+def test_a_person_elsewhere_in_frame_does_not_protect_an_unrelated_entry():
+    """The occlusion check must be LOCATION-specific - a person anywhere in
+    frame must not give every OTHER, unrelated entry a free pass on its own
+    absence budget. Only an entry a person is actually standing on/near is
+    protected."""
+    frame_diagonal = math.hypot(1920, 1080)
+    frame = _solid_frame((100, 100, 100))
+    spot = (100.0, 100.0, 200.0, 200.0)
+    person_far_away = (1500.0, 800.0, 1700.0, 1050.0)
+    hm = re.HazardMap()
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False)
+
+    for _ in range(re.SCAN_CONSECUTIVE_SCANS_REQUIRED - 1):
+        hm.apply_scan_candidates([], frame, frame_diagonal, is_first_scan_cycle=False,
+                                 person_boxes=[person_far_away])
+    diff = hm.apply_scan_candidates([], frame, frame_diagonal, is_first_scan_cycle=False,
+                                    person_boxes=[person_far_away])
+    assert len(diff.removed) == 1, "a person elsewhere in frame must not protect an unrelated spot"
+
+
 def test_apply_scan_candidates_reappearing_before_second_miss_resets_absence():
     frame_diagonal = math.hypot(1920, 1080)
     frame = _solid_frame((100, 100, 100))
@@ -574,6 +663,53 @@ def test_apply_scan_candidates_dismissed_entry_still_reraises_on_real_change_wit
     diff = hm.apply_scan_candidates([(52, 50, 112, 110)], solid, frame_diagonal, is_first_scan_cycle=False)
     assert diff.reraised == []  # first changed scan - not yet 2 consecutive
     diff = hm.apply_scan_candidates([(48, 50, 108, 110)], solid, frame_diagonal, is_first_scan_cycle=False)
+    assert len(diff.reraised) == 1
+    assert entry.state == re.HAZARD_STATE_PENDING
+
+
+def test_a_person_over_the_fingerprint_spot_does_not_false_reraise_a_dismissed_entry():
+    """Shaked, live 2026-09-12, a SECOND bug in the same family as the
+    absence-counting one: with no new hazard anywhere, walking up to an
+    ALREADY-DISMISSED spot fired a fresh "hazard detected," every time.
+    Root cause: fingerprint_changed() does a raw pixel-diff at the entry's
+    STABLE fingerprint_bbox with no awareness of whether a person is
+    currently standing over that exact region - a child reaching toward a
+    dismissed object changes those pixels for real, and the comparison
+    correctly (from its own narrow view) reads "changed," triggering a
+    re-raise for an object that never moved. This is a DIFFERENT code path
+    from the arrived/removed occlusion fix above (that one guards
+    absent_scans; this one guards the fingerprint comparison itself) and
+    was not covered by it.
+    """
+    frame_diagonal = math.hypot(1920, 1080)
+    frame = _solid_frame((100, 100, 100), shape=(1080, 1920, 3))
+    spot = (460.0, 300.0, 680.0, 460.0)
+    child_reaching = (600.0, 280.0, 760.0, 480.0)  # overlaps the fingerprint bbox
+    hm = re.HazardMap()
+
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False)
+    entry = hm.entries[0]
+    hm.dismiss(entry.id, frame)
+
+    # The frame genuinely differs at that spot now (a child's arm/skin
+    # tone) - without the fix this reads as "the spot changed."
+    changed_frame = frame.copy()
+    x1, y1, x2, y2 = (int(v) for v in entry.fingerprint_bbox)
+    changed_frame[y1:y2, x1:x2] = 250
+
+    for _ in range(re.DISMISS_REAPPEAR_CONSECUTIVE_SCANS_REQUIRED + 1):
+        diff = hm.apply_scan_candidates([spot], changed_frame, frame_diagonal, is_first_scan_cycle=False,
+                                        person_boxes=[child_reaching])
+        assert diff.reraised == [], "a person over the fingerprint spot must not count as a real change"
+    assert entry.state == re.HAZARD_STATE_DISMISSED
+
+    # Child steps back: the SAME real change (not just their body) still
+    # correctly re-raises - the fix must not weaken true-positive detection.
+    diff = hm.apply_scan_candidates([spot], changed_frame, frame_diagonal, is_first_scan_cycle=False,
+                                    person_boxes=[])
+    diff = hm.apply_scan_candidates([spot], changed_frame, frame_diagonal, is_first_scan_cycle=False,
+                                    person_boxes=[])
     assert len(diff.reraised) == 1
     assert entry.state == re.HAZARD_STATE_PENDING
 
@@ -1421,7 +1557,7 @@ def test_build_risk_status_empty_case():
         "total": 0, "confirmed": 0, "pending_first_scan": 0, "pending_new": 0, "dismissed": 0,
     }
     assert status["review_queue"] == {"length": 0, "current_id": None, "queue": []}
-    assert status["alert"] == {"text": None, "active": False}
+    assert status["alert"] == {"text": None, "active": False, "clip": None}
     assert status["diagnostics"]["fps"] is None
     assert status["diagnostics"]["model"] == "yolo26l.pt"
     assert status["diagnostics"]["imgsz"] == 640
@@ -1494,7 +1630,7 @@ def test_build_risk_status_populated_case():
     assert status["review_queue"] == {
         "length": 1, "current_id": pending_new.id, "queue": [pending_new.id],
     }
-    assert status["alert"] == {"text": "RED - person #1 near chair", "active": True}
+    assert status["alert"] == {"text": "RED - person #1 near chair", "active": True, "clip": None}
     assert status["diagnostics"]["fps"] == 14.756
 
 
@@ -1737,6 +1873,66 @@ def test_alert_dispatcher_banner_expires_on_its_own_clock():
     text, active = dispatcher.banner(now=100.0 + re.ALERT_BANNER_SECONDS + 0.01)
     assert active is False
     assert text is not None, "text is retained; only `active` goes false"
+
+
+def test_alert_dispatcher_current_clip_matches_the_active_banner():
+    """Phase 8 iPad+web audio alert: a remote UI needs to play the SAME
+    clip this Mac's speaker plays, without re-deriving the choice from
+    risk.zone (see current_clip's docstring for why that would be wrong -
+    a new-object alert can fire at risk.zone == "none"). current_clip() and
+    banner()'s `active` must agree on the SAME clock, tested directly here
+    rather than trusted by inspection.
+    """
+    fake_now = [100.0]
+    dispatcher = re.AlertDispatcher(
+        re.AlertArbiter(), audio_player=None, event_recorder=None,
+        clock=lambda: fake_now[0],
+    )
+    assert dispatcher.current_clip(now=100.0) is None, "nothing voiced yet"
+
+    dispatcher.offer(_new_object_signal(), now=0.0)
+    assert dispatcher.current_clip(now=100.0) == re.AUDIO_HAZARD_DETECTED
+
+    # Same clock the banner itself expires on - must go None at the same
+    # instant banner()'s `active` does, not before or after.
+    assert dispatcher.current_clip(now=100.0 + re.ALERT_BANNER_SECONDS - 0.01) is not None
+    assert dispatcher.current_clip(now=100.0 + re.ALERT_BANNER_SECONDS + 0.01) is None
+
+
+def test_alert_dispatcher_current_clip_matches_zone_for_a_proximity_signal():
+    """The other half of audio_for_signal's mapping - a live RED proximity
+    signal (not a new-object arrival) must report immediate_danger, proving
+    current_clip() carries the real mapping through rather than a
+    hardcoded/only-tested-for-one-case value."""
+    dispatcher = re.AlertDispatcher(re.AlertArbiter(), audio_player=None, event_recorder=None)
+    dispatcher.offer(_proximity_signal("red"), now=0.0)
+    assert dispatcher.current_clip(now=0.0) == re.AUDIO_IMMEDIATE_DANGER
+
+
+def test_alert_dispatcher_current_clip_is_none_for_a_closed_signal_even_while_banner_text_shows():
+    """The exact corner case this feature could get wrong: a 'closed' signal
+    still produces banner text (banner_text_for_signal doesn't special-case
+    it) but audio_for_signal deliberately returns None for it (hysteresis
+    ending is bookkeeping, not something worth interrupting a parent for -
+    see audio_for_signal's docstring). A remote UI naively playing "whatever
+    the active banner implies" would incorrectly play a sound here; reading
+    current_clip() specifically must not.
+    """
+    dispatcher = re.AlertDispatcher(re.AlertArbiter(), audio_player=None, event_recorder=None)
+    dispatcher.speak(_proximity_signal("red", kind="closed"))
+    text, active = dispatcher.banner(now=0.0)
+    assert active is True and text is not None, "banner IS showing something"
+    assert dispatcher.current_clip(now=0.0) is None, "but nothing should play"
+
+
+def test_build_risk_status_carries_alert_clip_through_unchanged():
+    """/risk_status's alert.clip is passed through verbatim, not re-derived -
+    the whole point of exposing it is that server.py and the UI never
+    reimplement audio_for_signal's mapping themselves."""
+    kwargs = _empty_status_kwargs()
+    kwargs["alert_clip"] = re.AUDIO_BABY_GETTING_CLOSE
+    status = re.build_risk_status(**kwargs)
+    assert status["alert"]["clip"] == re.AUDIO_BABY_GETTING_CLOSE
 
 
 def test_alert_dispatcher_closed_signals_never_reach_it():

@@ -315,6 +315,130 @@ def test_clips_bad_status_400_raises_plain_api_error_not_not_ready():
         mod.urllib.request.urlopen = real
 
 
+def test_alert_sound_plays_once_for_a_sustained_active_alert():
+    """/risk_status is polled 4x/sec (RISK_STATUS_POLL_HZ) and an alert's
+    banner stays active for several seconds - naive "play whenever active"
+    would replay the same sound ~16 times over one banner window. It must
+    play exactly once, the first time this alert is seen active."""
+    from alert_audio import AlertSoundPolicy
+
+    policy = AlertSoundPolicy()
+    alert = {"text": "RISK RED: object approaching", "active": True, "clip": "immediate_danger.wav"}
+    assert policy.next_clip(alert, now=0.0) == "immediate_danger.wav"
+    for i in range(1, 16):  # ~4 more seconds at 4Hz, same alert still showing
+        assert policy.next_clip(alert, now=i * 0.25) is None
+
+
+def test_alert_sound_plays_again_for_a_second_alert_after_the_cooldown():
+    """A real failure mode this must handle: AlertDispatcher.speak() resets
+    banner_until on every new signal, so `active` can stay continuously True
+    across two DIFFERENT alerts back to back - it never dips False in
+    between. A rising-edge-on-`active` check would silently miss the second,
+    genuinely new alert. Keying on (text, clip) together catches it - tested
+    here past the cooldown window so identity dedup, not the cooldown, is
+    what's under test."""
+    from alert_audio import AlertSoundPolicy
+
+    policy = AlertSoundPolicy()
+    first = {"text": "RISK ORANGE: object approaching", "active": True, "clip": "baby_getting_close.wav"}
+    second = {"text": "RISK RED: object approaching", "active": True, "clip": "immediate_danger.wav"}
+    assert policy.next_clip(first, now=0.0) == "baby_getting_close.wav"
+    assert policy.next_clip(first, now=0.25) is None  # still the same one, no replay
+    # Past the cooldown, so this is testing IDENTITY dedup, not the cooldown.
+    later = policy._cooldown + 0.1
+    assert policy.next_clip(second, now=later) == "immediate_danger.wav"
+
+
+def test_alert_sound_replays_the_same_alert_if_it_recurs_after_going_quiet():
+    """The other half of the identity-dedup design: resetting on
+    `active: False` must not be so aggressive that a later, genuinely new
+    occurrence of the SAME kind of alert (same text/clip, just much later)
+    gets silently treated as "already played." """
+    from alert_audio import AlertSoundPolicy
+
+    policy = AlertSoundPolicy()
+    alert = {"text": "RISK RED: object approaching", "active": True, "clip": "immediate_danger.wav"}
+    assert policy.next_clip(alert, now=0.0) == "immediate_danger.wav"
+    later = policy._cooldown + 10  # past the cooldown AND a while quiet
+    assert policy.next_clip({"active": False}, now=later) is None
+    assert policy.next_clip({"active": False}, now=later + 5) is None  # quiet for a while
+    assert policy.next_clip(alert, now=later + 10) == "immediate_danger.wav", \
+        "recurrence must play again"
+
+
+def test_alert_sound_never_plays_for_a_closed_signal_shown_via_the_banner():
+    """The exact corner case CLAUDE.md decision 4 and audio_for_signal() care
+    about: a 'closed' signal still shows banner text (active=True) but
+    cv/risk_engine.py deliberately voices no sound for it - clip is None.
+    A UI that plays a sound whenever `active` is true, without checking
+    `clip`, would play a sound in a case the Mac's own speaker does not."""
+    from alert_audio import AlertSoundPolicy
+
+    policy = AlertSoundPolicy()
+    assert policy.next_clip({"text": "some banner text", "active": True, "clip": None}, now=0.0) is None
+    # And a REAL alert right after must still play - the no-clip case must
+    # not get remembered as "already handled" and block the next one, and
+    # must not itself have started the cooldown clock.
+    real = {"text": "RISK RED: object approaching", "active": True, "clip": "immediate_danger.wav"}
+    assert policy.next_clip(real, now=0.1) == "immediate_danger.wav"
+
+
+def test_alert_sound_handles_no_alert_object_at_all():
+    """/risk_status's `alert` key could be missing/None in a degraded
+    response - must not raise."""
+    from alert_audio import AlertSoundPolicy
+
+    policy = AlertSoundPolicy()
+    assert policy.next_clip(None, now=0.0) is None
+    assert policy.next_clip({}, now=0.0) is None
+
+
+def test_alert_sound_cooldown_suppresses_a_fast_flurry_of_different_alerts():
+    """New, 2026-09-12 (Shaked: "add a cooldown too... so a fast sequence of
+    different hazards can't feel like spam"). Three DIFFERENT alerts inside
+    the cooldown window - only the first should ever make a sound."""
+    from alert_audio import AlertSoundPolicy
+
+    policy = AlertSoundPolicy(cooldown_seconds=2.5)
+    a = {"text": "RISK YELLOW: object approaching", "active": True, "clip": "hazard_detected.wav"}
+    b = {"text": "RISK ORANGE: object approaching", "active": True, "clip": "baby_getting_close.wav"}
+    c = {"text": "RISK RED: object approaching", "active": True, "clip": "immediate_danger.wav"}
+    assert policy.next_clip(a, now=0.0) == "hazard_detected.wav"
+    assert policy.next_clip(b, now=0.5) is None, "different alert, but inside the cooldown"
+    assert policy.next_clip(c, now=1.5) is None, "still inside the cooldown"
+
+
+def test_alert_sound_cooldown_lets_a_still_active_alert_through_once_it_clears():
+    """The suppressed alert is NOT remembered as played - once the cooldown
+    passes, whatever is active then gets a real chance, even if it's the
+    SAME alert that got suppressed a moment ago (not just a newer one)."""
+    from alert_audio import AlertSoundPolicy
+
+    policy = AlertSoundPolicy(cooldown_seconds=2.5)
+    first = {"text": "RISK YELLOW: object approaching", "active": True, "clip": "hazard_detected.wav"}
+    second = {"text": "RISK RED: object approaching", "active": True, "clip": "immediate_danger.wav"}
+    assert policy.next_clip(first, now=0.0) == "hazard_detected.wav"
+    assert policy.next_clip(second, now=1.0) is None, "suppressed - inside cooldown"
+    # Still active, cooldown now cleared - must get its turn.
+    assert policy.next_clip(second, now=2.6) == "immediate_danger.wav"
+
+
+def test_alert_sound_cooldown_clock_is_not_reset_by_a_brief_inactive_blip():
+    """The cooldown timer tracks wall-clock time since a sound last
+    actually played, independent of `active` bouncing false then true -
+    a brief blip must not let a new alert slip past the cooldown early."""
+    from alert_audio import AlertSoundPolicy
+
+    policy = AlertSoundPolicy(cooldown_seconds=2.5)
+    first = {"text": "RISK YELLOW: object approaching", "active": True, "clip": "hazard_detected.wav"}
+    second = {"text": "RISK RED: object approaching", "active": True, "clip": "immediate_danger.wav"}
+    assert policy.next_clip(first, now=0.0) == "hazard_detected.wav"
+    assert policy.next_clip({"active": False}, now=0.5) is None  # brief blip
+    # Still well inside the ORIGINAL cooldown window (started at t=0.0) -
+    # must still be suppressed, not treated as a fresh start.
+    assert policy.next_clip(second, now=1.0) is None
+
+
 def run_all():
     tests = [obj for name, obj in list(globals().items())
              if name.startswith("test_") and callable(obj)]
