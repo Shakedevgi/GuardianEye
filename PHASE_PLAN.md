@@ -430,13 +430,28 @@ until:**
   showing live data that *disagrees with each other* is arguably worse than
   one device showing stale data consistently, for a safety product — this
   should block calling Phase 8 done, not just get filed as a known issue.
-- **Two real `cv/` bug fixes from this session (a person occluding an
-  unreviewed hazard's spot, and a person occluding a DISMISSED hazard's
-  fingerprint spot — both causing spurious re-alerts) are verified only by
-  targeted reproduction and unit tests, not yet watched happen on the real
-  camera.** Both are exactly the kind of interaction a parent's own child
-  will cause constantly (reaching toward, standing in front of, a tracked
-  hazard), so this isn't a low-traffic edge case to defer casually.
+- **CRITICAL, UNSOLVED as of 2026-09-12 — "hazard detected" fires
+  alongside a legitimate proximity alert when a child is in frame.** Six
+  distinct, real bugs were found and fixed chasing this in one session (in
+  order: person-occlusion false-removal of an unreviewed AND a dismissed
+  entry; a redesigned alert-priority arbiter with a collection window plus
+  a dedicated alert-time backstop; the same lenient person-overlap
+  threshold used everywhere replaced with a stricter, padded
+  `person_occludes()` built specifically for alert decisions; the occlusion
+  check then found to be reading a single frame instead of PersonTracker's
+  short memory; and two separate hazard-matching failures under detection
+  jitter, the second of which disproved the first's own person-gating
+  assumption) — and live testing kept finding the underlying symptom still
+  present after each one, pointing to a further, different mechanism each
+  time. Marked critical and explicitly deferred to Shaked rather than
+  continuing to iterate blind. Full six-attempt history in
+  `docs/decision-log.md` (search "hazard detected", six entries dated
+  2026-09-12, whose own titles number themselves "Third/Fourth/Fifth/Sixth"
+  live test); tracked going forward, with a corrected and re-ordered
+  six-item summary, in the new `docs/unsolved-gaps.md`. This is exactly the
+  kind of interaction a parent's own child will cause constantly (walking
+  into frame near a tracked hazard), so this blocks Phase 8 done, full
+  stop, until it is actually confirmed fixed live.
 - `PHASE_PLAN.md`'s own done-when line ("reachable from a tablet/phone
   browser... both showing live data") is met for VIDEO (confirmed smooth,
   `--web-max-fps 2`, 2026-09-11) but the "both showing live data" half needs

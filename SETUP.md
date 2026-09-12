@@ -123,8 +123,21 @@ seconds plays normally.
 
 **It won't repeat itself.** One sound per genuinely new alert — it won't
 replay while the same alert is still showing, and if two different alerts
-happen in quick succession, there's a short (2.5 second) gap enforced
-between sounds so it can't feel like spam.
+happen in quick succession, there's a 3.5-second gap enforced between
+sounds so it can't feel like spam.
+
+**Only the most urgent sound ever plays.** If two alerts become true close
+together — say "baby getting close" and "hazard detected," or either of
+those with "immediate danger" — you'll only ever hear the more urgent one.
+Priority, highest first: Immediate Danger, then Baby Getting Close, then
+Hazard Detected. The one that loses isn't queued for later, but it's not
+erased either — it's still in the event history, just silent.
+
+**Two screens open at once will each make their own sound.** If you have,
+say, the desktop window AND a Chrome tab open at the same time, you'll hear
+the alert twice — once from each. That's expected, not a bug: each open
+screen decides independently whether to play, the same way each has its own
+picture of the video.
 
 **What to check on each screen you use:**
 - Does the sound play at all?

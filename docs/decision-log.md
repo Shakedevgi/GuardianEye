@@ -4086,3 +4086,522 @@ session, explicitly not as solved:** the fix that worked for video
 equivalent for the risk-status poll loop yet, and none should be assumed to
 carry over without separately measuring whether the same failure shape
 actually applies here.
+
+### 2026-09-12 — Real-camera test surfaced two more bugs: overlapping alert
+sounds, and grey "dismissed" boxes cluttering the live view
+
+**Bug: hearing two alert sounds at once ("baby getting close" + "immediate
+danger" together).** Shaked's report after testing live: not the client-
+side spam `AlertSoundPolicy`'s cooldown already guards against (that fix,
+earlier this session, still holds), but the Mac's own speaker - driven
+directly by `cv/risk_engine.py`'s `AlertDispatcher`/`AlertArbiter`, entirely
+independent of any Flet client. Root cause, found by reading
+`AlertArbiter.offer()`: RED is deliberately exempt from the
+`GLOBAL_ALERT_MIN_INTERVAL_SECONDS` pacing window ("immediate danger must
+never wait its turn" - 2026-08-26) and always bypasses it immediately. That
+is correct on its own, but it does not know or care whether a LOWER-priority
+signal was approved and spoken a fraction of a second earlier - a genuine
+"getting close" a moment before a "immediate danger" (same or a different
+hazard) plays both, back to back closely enough to sound simultaneous.
+Confirmed pre-existing rather than something broken this session:
+`AlertArbiter.offer()`/`.poll()` were not touched by the audio-feature work
+earlier this session (only additive `AlertDispatcher.current_clip()` was),
+and there is a dated test literally asserting the bypass as intentional
+(`test_alert_arbiter_red_always_bypasses_the_window`, 2026-08-26's test).
+
+Asked Shaked three clarifying questions before touching anything (per his
+explicit request not to repeat the audio-feature build-mistakes): (1) accept
+a short delay before non-critical sounds so danger can cancel them, or block
+instead with zero delay - **chose the short delay**; (2) hide grey dismissed
+boxes everywhere the shared drawn frame is used, or only the live feed -
+**chose everywhere**; (3) should a cancelled lower-priority alert still be
+silently logged to the event history, or dropped entirely - **chose dropped
+entirely**.
+
+Fix: a new `ALERT_SPEAK_SETTLE_SECONDS = 0.4` (`cv/risk_engine.py`).
+`AlertDispatcher` no longer speaks a non-RED approval immediately - it holds
+it for this long first (internally, at this point in the day, via methods
+named `_release`/`_flush_pending`). A RED signal arriving in that window
+cancels the pending one outright (never spoken, never recorded - matches
+Shaked's "drop it entirely" answer). RED itself is never held; it still
+speaks the instant the arbiter approves it, unchanged. `AlertArbiter` itself
+was not touched - its pacing/priority logic was already correct; the gap
+was purely in what happened the instant AFTER it approved a release.
+`banner()`/`current_clip()` also flush this holding pen on read, so a
+caller (like `/risk_status`) never sees a stale pending signal that's
+already come due. Three tests updated, three added in
+`cv/test_risk_engine.py` (117 total, up from 114) -
+`test_alert_dispatcher_red_cancels_a_still_settling_lower_priority_signal`
+is the direct regression test for the reported bug.
+
+**Not yet re-verified against the real camera with two genuinely
+simultaneous hazards** - the settle-window mechanism is proven by the
+arbiter's own math and by a faithful unit test, but nobody has yet stood
+next to two hazards (one orange-zone, one red-zone) at once and confirmed
+only one sound is heard live.
+
+**Bug/request: grey "dismissed" hazard boxes cluttering the live view.**
+Shaked: doesn't want to see them once something is marked not-a-hazard - the
+internal tracking (so the spot isn't mistaken for a new arrival - decision
+4) was never in question, only the on-screen box. Fixed in
+`draw_hazard_box()` (`cv/risk_engine.py`): an entry in `HAZARD_STATE_
+DISMISSED` is skipped entirely, drawing nothing. This is the one shared draw
+call behind the served `/video_feed`, the local `cv2.imshow` debug window,
+AND rolling-buffer/saved-clip snapshots (confirmed by reading its single
+call site in `main()`), so the fix applies to all three at once, per
+Shaked's choice above - not just the live feed. One test added:
+`test_draw_hazard_box_draws_nothing_for_a_dismissed_entry`.
+
+### 2026-09-12 — Live re-test found the settle-window fix incomplete;
+redesigned as a collection window in front of the arbiter, plus a real root
+cause for "hazard detected" firing on the child themself
+
+**The settle-window fix above did not actually stop hearing both alerts.**
+Re-read carefully against Shaked's live report: that fix only ever let a
+RED signal cancel a still-settling lower one. "Baby getting close"
+(priority 2) and "hazard detected" (priority 1) are BOTH non-RED, so
+neither cancelled the other under that mechanism - each was independently
+approved by its OWN separate `AlertArbiter` pacing window (never at the
+exact same instant, since the arbiter only releases one non-RED signal per
+`GLOBAL_ALERT_MIN_INTERVAL_SECONDS`), so both still eventually got voiced, a
+few seconds apart - which is what Shaked was hearing as "both."
+
+**Redesigned: collection now happens BEFORE the arbiter, not after.**
+`AlertDispatcher` no longer submits every signal to `AlertArbiter`
+immediately and settles the APPROVAL. Instead, every non-RED signal joins a
+short collection window first (`_join_collection`) - if one is already
+open, the incoming signal either replaces it (higher priority) or is
+itself recorded and dropped (lower priority); only the single window
+survives to actually get submitted to the arbiter once it closes
+(`_flush_collection`). This means two competing non-RED signals - "getting
+close" and "hazard detected," in either arrival order - are compared
+directly against each other before either ever reaches the arbiter, so
+only the higher-priority one is ever submitted, and therefore ever voiced.
+`AlertArbiter` itself is untouched - its own pacing/priority logic (which
+governs spacing BETWEEN separate collection winners over time, not within
+one collection window) was already correct; all 8 of its existing tests
+pass unmodified. RED still bypasses collection entirely and cancels
+whatever was collecting, same as the first attempt. Two new direct
+regression tests: `test_alert_dispatcher_getting_close_silences_a_
+concurrent_hazard_detected` and its reverse-arrival-order twin,
+`..._hazard_detected_does_not_silence_a_concurrent_getting_close`.
+
+**Real root cause of "hazard detected" firing on the child: found and
+fixed.** `enqueue_and_maybe_alert()` (`cv/risk_engine.py`) is the ONE place
+every new-object alert passes through regardless of origin (room scan,
+dismissed re-raise, named oven/microwave/fridge detection, wall socket).
+Added `new_object_alert_suppressed_by_person()`: a final, unconditional
+check against THIS frame's live person boxes (the same ones score_frame
+already trusts) - if a person's body covers more than
+`PERSON_OVERLAP_THRESHOLD` of the entry's own bbox, the alert (not the
+review-queue entry - a parent can still glance at and dismiss/skip it) is
+suppressed. This is deliberately a backstop on top of the two
+person-occlusion fixes made earlier the same day
+(`generate_scan_candidates`'s upstream suppression, and the dismissed-entry
+fingerprint guard), not a replacement for them - both operate on
+segmentation output or a fixed historical crop, either of which can still
+let a person's body through at the edges (a split segment, a low-confidence
+YOLO frame at the exact instant the scan runs). Checking at the single
+final gate closes the gap regardless of which upstream mechanism let it
+through, rather than chasing each one individually. Three tests added,
+directly on the new function (no camera needed):
+`test_new_object_alert_suppressed_by_person_when_a_person_covers_the_entrys_spot`,
+`..._is_false_when_person_is_elsewhere`, `..._is_false_with_no_person_boxes`.
+
+**Reversed same-day decision: a signal that loses (to RED, or during
+collection) is now recorded silently, not dropped.** Shaked explicitly
+regretted the "drop it entirely" choice from earlier today.
+`AlertDispatcher._record_silently()` calls `event_recorder.record()` for
+the losing signal - no sound, no banner, but it is in `/events`. Applies
+uniformly to every way a signal can lose: RED preempting it, or losing the
+priority comparison during collection. Existing tests updated to assert
+the recorded-but-not-spoken split instead of "never recorded."
+
+**`GLOBAL_ALERT_MIN_INTERVAL_SECONDS` raised from 2.5s to 5.0s.** Shaked,
+after live testing the collection-window fix above: back-to-back alerts
+still felt "too messy" even with only one ever sounding at a time. Asked
+for a target rather than guessing - chose 5 seconds. (Later dialed down
+again to 3.5s - see the "Fourth live test" entry below, the only place
+that second change actually happened; an earlier version of this entry and
+of that one both described the 5.0->3.5 change, which was a duplicate
+write-up of one real change, not two - corrected here 2026-09-12.)
+
+### 2026-09-12 — Third live test, same bug still reported: the two existing
+person-occlusion checks used the wrong threshold for an alert decision
+
+Shaked reported "hazard detected" was STILL firing when a person entered
+frame, after both fixes above, and said plainly this needed to be solved
+now. Re-read every person-occlusion check in the file end to end rather
+than patching again blind - found a real, structural gap.
+
+**In plain terms: the same number was doing two different jobs it was
+never suited for both of.** `PERSON_OVERLAP_THRESHOLD` (0.3) exists so the
+periodic room scan can decide whether to even *suggest* something might be
+a new object - decision 3 deliberately makes that bar low, because
+suggesting wrong just costs the parent one tap to dismiss. All three
+person-occlusion guards written earlier today (absence-counting,
+fingerprint-reraise, and the new-object-alert backstop) reused that exact
+same lenient number to decide something much bigger: whether to actually
+interrupt the parent with a sound. A stray segment for an outstretched
+arm/hand/foot only has to clear 30% overlap with a YOLO person box that
+often doesn't fully enclose it in the first place - low enough that a
+child's own limb regularly slipped through as "not really occluded," while
+still being caught by the SAME 30% test upstream, which just means the
+segment was never filtered from the review queue either - so the checks
+looked like they were working (the tests all passed) while doing
+essentially nothing extra for the live failure mode. Compounding that: for
+the room-scan arrival path specifically, the alert-time check was reading
+the exact same frame's `person_boxes` the upstream filter had ALREADY
+tested moments earlier in the same call chain - functionally a no-op,
+not real defense-in-depth, for that one path.
+
+**Fix: a separate, stricter, padded test for alert purposes, used
+everywhere a person needs telling apart from a new/changed object.**
+`person_occludes()` (`cv/risk_engine.py`) replaces the three separate inline
+checks: `ALERT_PERSON_OVERLAP_THRESHOLD = 0.05` (a small fraction of
+overlap is enough - deciding whether to sound an alarm should err toward
+staying quiet) and `ALERT_PERSON_PAD_FRAC = 0.3` (each person box is grown
+by 30% of its own width/height on every side before the overlap check, so
+a limb sitting just past YOLO's tight edge is still caught). Both are
+unmeasured first guesses, the same honest flag this file already uses for
+`DEFAULT_SCAN_INTERVAL_SECONDS` and others - retune once tested live.
+`generate_scan_candidates`'s own candidate-proposal filter is untouched and
+still uses the original lenient `PERSON_OVERLAP_THRESHOLD` - that job is
+still correctly served by the lenient number; only the alerting jobs
+needed a different one. Four tests added directly on `person_occludes`,
+including one that proves the padding does real work (`test_person_
+occludes_catches_a_stray_limb_just_outside_the_tight_person_box` - zero raw
+overlap against the unpadded box, caught once padded).
+
+**Not yet re-verified against the real camera.** Same caveat as everything
+else in this stretch, stated as plainly as possible given how many times
+this exact bug has now been reported live: `person_occludes`'s stricter,
+padded test is proven by tracing the code and by targeted unit tests
+(including a test that isolates exactly the "raw overlap is zero, padded
+overlap is not" scenario this was built for) - but nobody has yet stood a
+child in front of the actual camera since this specific change. This is the
+single most important thing to check first in the next session, before any
+other work.
+
+### 2026-09-12 — Fourth live test, same bug still reported: root cause was
+never the threshold - person detection can miss a frame entirely, and
+nothing downstream had ever tolerated that
+
+Shaked tested again after the `person_occludes` fix above and reported the
+exact same symptom, asked for the exact code path and to commit whatever it
+takes to actually close this. Stopped tuning thresholds and asked a
+different question: is there ANY scenario where every occlusion check,
+however strict, still sees zero person data to compare against?
+
+**Yes - and it doesn't need explaining away with edge cases; it happens on
+ordinary detection noise.** Every person-occlusion check in this file
+(upstream candidate suppression, absence-counting, fingerprint-reraise, and
+the alert backstop) read `person_boxes` - THIS SINGLE FRAME's raw YOLO
+output. YOLO does not detect a person with 100% reliability on every single
+frame - a child mid-stride, at an odd angle, or partially behind furniture
+can simply miss `--conf` on one frame. When that happens, `person_boxes` is
+EMPTY for that frame. No threshold, however low, and no padding, however
+generous, can flag an entry as "occluded by a person" when the person list
+handed to the check has nothing in it at all - `person_occludes()` was
+correct on the padding/threshold problem it was built for, but every one of
+its callers could still be starved of any person to compare against, on
+exactly the frame a scan or a dismissal check happened to run.
+
+**Why "baby getting close" firing at the same time was consistent with
+this, not evidence against it:** proximity scoring runs through `score_
+frame(live_persons, ...)`, where `live_persons` already comes from
+`PersonTracker` - which was ALREADY being fed into proximity a frame or two
+more tolerant of noise than the raw per-frame boxes the alert-suppression
+checks were reading. The two systems were quietly built on two different
+strengths of person data the whole time.
+
+**Fix: every occlusion check now reads `PersonTracker.entries` (up to
+`PERSON_STALE_SECONDS` = 1.0s old), not the current frame's raw boxes.**
+`cv/risk_engine.py`'s main() now runs `person_tracker.update()` immediately
+after this frame's person boxes are computed (moved up from its old spot,
+just before `score_frame`) and builds `occlusion_person_boxes = tuple(e.bbox
+for e in person_tracker.entries)` right after - `PersonTracker.update()`'s
+own RETURN VALUE only reflects signals matched THIS exact call, but its
+`.entries` list keeps a person for a full second past their last actual
+sighting, exactly the tolerance this needed. `occlusion_person_boxes`
+(not the raw per-frame list) now feeds `generate_scan_candidates`,
+`apply_scan_candidates`'s `person_boxes` parameter, and `enqueue_and_maybe_
+alert`'s `new_object_alert_suppressed_by_person` check - every place a
+person needs to be told apart from a new or changed object. The raw,
+current-frame list is kept only for `person_coverage_frac` (the whole-
+frame-blocked skip gate, a genuinely different "is the view blocked right
+now" question) and for feeding the tracker itself.
+
+New test proving the specific gap this closes:
+`test_person_tracker_entries_retains_a_recently_missed_person_though_not_
+in_live` - a person detected on one call, then missed entirely on the very
+next (`update([], ...)`), still appears in `.entries` (not `live`, the
+return value) because they are not yet a full second stale.
+`cv/test_risk_engine.py` now 126 tests. **Resolved 2026-09-12, following
+docs-agent's audit note that hand-summed increments across this stretch
+(117, +5, +4, +1) reached 127, not the 126 stated here:** nothing was
+committed at this exact point in the stretch, so that specific historical
+checkpoint can no longer be independently re-run to settle it directly.
+What CAN be confirmed: the current, real count (`cd cv && ../.venv/bin/
+python3 test_risk_engine.py`) is 130, and 126 (here) + 4 (the Fifth pass's
+stated addition) + 0 net (the Sixth pass's two replacements) = 130 exactly
+- so 126 here is consistent with the one number that was actually run and
+checked. The off-by-one is very likely in an earlier entry's own "+N"
+(possibly the collection-window/backstop entry's "+5" or `person_occludes`'s
+"+4"), not worth hunting down further given every checkpoint from here
+forward now provably lands on the correct, verified total.
+
+**Also this message: `GLOBAL_ALERT_MIN_INTERVAL_SECONDS` moved to 3.5s**
+(from the prior entry's 5.0) - Shaked's target after testing 5.0 live.
+`SETUP.md` updated to match. This IS the one real 5.0->3.5 change; the
+"Third live test" entry above originally also described this same change
+(a duplicate write-up, not a second real change) and has been corrected to
+only describe its own 2.5->5.0 raise. **Resolved 2026-09-12, following
+docs-agent's audit note flagging this as a likely duplicate** - confirmed
+by re-reading the actual conversation order: 5.0 was set, tested live, and
+THEN this message asked for 3.5 - one change, now recorded once.
+
+**Honest note on why this took four passes.** The first three fixes were
+all real, and all correct for the specific mechanism each one targeted
+(person-occlusion protecting against false REMOVAL, then against false
+fingerprint-reraise, then a stricter/padded threshold for the alert
+decision specifically) - but all three shared one blind assumption never
+questioned until this pass: that `person_boxes` reliably contains the
+person whenever they are actually in frame. It doesn't, on an ordinary
+single missed detection, and nothing before this pass gave that any
+tolerance at all.
+
+**Not yet re-verified against the real camera** - same as every entry
+above this point in this stretch. This is a structurally different fix
+from the previous three (a data-source problem, not a threshold problem),
+so it should not be assumed to inherit their partial credit - it needs its
+own live check, specifically by walking in and out of frame repeatedly
+rather than a single clean entry, to stress the exact 1-frame-miss
+scenario this targets.
+
+### 2026-09-12 — Fifth pass: real terminal output, not another guess -
+found two more genuine bugs, neither about person-occlusion thresholds
+
+Shaked tested again and sent the actual terminal log rather than a
+description - exactly the cheap, no-camera-review diagnostic this session
+has otherwise avoided needing. It named the real mechanism directly.
+
+**What the log actually showed, in order:** a run of proximity alerts for
+person IDs #5, #6, #7, #8 in quick succession (a real, pre-existing,
+documented limitation - PersonTracker ID churn, "adequate for a single-
+camera proximity signal, flagged as a known simplification" per its own
+docstring; not touched here, out of scope for this pass), followed by
+THREE separate "New object detected (room scan): object" alerts and one
+"New object detected (named detection): refrigerator" - all within roughly
+the same short window, all playing `hazard_detected.wav`.
+
+**The refrigerator alert is the clearest evidence of all:** a refrigerator
+is a decision-7 FIXED appliance, discovered once, matched by geometry on
+every subsequent frame via `HazardMap.propose_named()` - it cannot
+legitimately re-announce itself mid-session unless something broke the
+match against the entry already on record. Read `propose_named()`
+directly: it has ZERO tolerance for the detected box moving or shrinking
+between frames beyond `HAZARD_MATCH_IOU_THRESHOLD`/`HAZARD_MATCH_CENTER_
+DIST_FRAC` - if a person walks partly in front of it, YOLO's box for it
+that frame can shift or shrink enough to fail the match, and `propose_named`
+creates a second, "new" entry rather than recognizing the same fridge.
+This is a DIFFERENT failure than any of the four fixes above - none of
+them touch matching at all, only whether a person's own body gets treated
+as an object or protected from false removal.
+
+**The three "room scan: object" alerts are the same failure on the other
+matching path.** `apply_scan_candidates`' own candidate-to-entry matching
+(inside the loop just above the absence-counting guard) uses the identical
+strict thresholds. A real object segmented differently between two scans
+5s apart - because a person partially occluded it in between, changing
+what part of its shape segmentation could see - can fail to match its own
+prior entry, going through the "provisional, seen twice" promotion path as
+if it were brand new. Three in a row is consistent with this happening on
+three consecutive 5s scan cycles for what was very plausibly one real
+object near where the child was standing/playing.
+
+**Fix: a person-explained retry with wider matching tolerance, at both
+matching sites.** New `OCCLUDED_MATCH_IOU_THRESHOLD = 0.1` / `OCCLUDED_
+MATCH_CENTER_DIST_FRAC = 0.2` (vs. the base 0.3 / 0.08) - used ONLY as a
+second attempt, ONLY when `person_occludes()` independently confirms a
+person is right where the failed match happened. This is deliberately
+narrower than "just loosen matching everywhere," which would risk merging
+two real, separate objects that happen to be near each other with no
+person involved - loosening it ONLY when a person explains the apparent
+drift does not carry that risk. `propose_named()` gained a `person_boxes`
+parameter (both its call sites in `main()` now pass `occlusion_person_
+boxes`); `apply_scan_candidates`' matching loop retries the same way using
+its existing `person_boxes` parameter. Four tests added, each pair proving
+the exact failure baseline (no person -> duplicate/unmatched, matching the
+live log) then the fix (person present -> correctly matched, no duplicate):
+`test_hazard_map_propose_named_without_a_person_a_drifted_box_duplicates` /
+`..._person_occluding_the_drift_prevents_a_duplicate`, and
+`test_apply_scan_candidates_without_a_person_a_drifted_candidate_goes_
+unmatched` / `..._person_occluding_the_drift_matches_it_to_the_existing_
+entry`. `cv/test_risk_engine.py` now 130 tests.
+
+**What this pass did NOT touch, on purpose:** PersonTracker ID churn - a
+real, visible-in-the-same-log symptom, but a pre-existing, documented
+tracking-quality limitation, not something this session was asked to fix
+and not the mechanism behind either bug found here. Flagged for Shaked/
+Yahli to decide whether it's worth a dedicated pass later; not folded into
+this one.
+
+**Honest note, again.** This is the second time in one day a live test
+disproved a "this is fixed" claim, and the second time the real cause was
+NOT the person-occlusion overlap math (which was, on its own terms,
+correctly built both times) but something those checks had no way to see:
+first an empty person list, now a MATCH failure that a person's presence
+was never even consulted for. The pattern worth naming plainly: every fix
+this session addressed exactly the mechanism asked about and no more -
+this pass only happened because Shaked insisted on real terminal evidence
+instead of another description, which is what actually surfaced the
+matching-failure mechanism no amount of reasoning from the symptom alone
+had found.
+
+**Not yet re-verified against the real camera.**
+
+### 2026-09-12 — Sixth pass, same session: the person-gated retry above was
+itself disproven by a second terminal log, within seconds of session start
+
+Shaked tested again immediately and sent another terminal log. It showed
+the SAME refrigerator duplicating - TWICE - within the first couple of
+seconds of `./start.sh`, before a single `[video] pushed=` line had even
+printed. That timing is the whole finding: nobody can have been
+consistently occluding the fridge in the first second or two of a fresh
+camera warm-up. The fifth pass's fix (retry with wider matching, but ONLY
+when `person_occludes()` confirms a person is right there) was built on an
+assumption - "the drift is caused by a person" - that this log disproved
+outright. It's ordinary YOLO detection jitter between frames, full stop.
+
+**Fix: `HazardMap.propose_named()` now matches with `OCCLUDED_MATCH_IOU_
+THRESHOLD`/`OCCLUDED_MATCH_CENTER_DIST_FRAC` (the wider pair) as its ONLY
+threshold, unconditionally - no person check at all, no two-step retry.**
+The `person_boxes` parameter and the person-gated retry added in the fifth
+pass are removed from this function entirely (dead weight once the base
+threshold IS the wide one) - both of its call sites in `main()` no longer
+pass `occlusion_person_boxes` here. Reasoning for why unconditional is safe
+specifically here, not a general loosening: this label set (oven,
+microwave, refrigerator, wall socket) is small, curated, and each label
+names something large, static, and effectively singular in a real home
+(decision 7) - a duplicate "hazard detected" for a fridge that's been on
+record since second one is a worse, more disruptive failure than the
+(still bounded - the tolerance still requires real overlap or a close
+center, not "anywhere in the room") risk of merging two separate
+same-labeled appliances.
+
+`apply_scan_candidates`' matching loop (arbitrary, potentially numerous
+small scan-origin objects, a different risk profile) KEEPS the person-
+gated retry from the fifth pass, untouched - that reasoning doesn't carry
+the same disproof, since nothing in either log showed a scan-origin
+duplicate happening with no person around.
+
+Tests updated: the fifth pass's two `propose_named` tests (built around
+"needs a person to explain the drift") are replaced with `test_hazard_
+map_propose_named_matches_a_drifted_box_with_no_person_involved` (the
+literal live scenario - no person, still matches) and `test_hazard_map_
+propose_named_a_truly_separate_appliance_still_gets_its_own_entry` (the
+tolerance is wide, not unlimited). The two `apply_scan_candidates` tests
+from the fifth pass are untouched. `cv/test_risk_engine.py` still 130
+tests (net: two replaced, none added or removed).
+
+**Also fixed in this pass, unrelated to the bug itself: a flaky test.**
+`test_clip_recorder_poll_only_finalizes_after_deadline` intermittently
+failed with "Directory not empty" - a background clip-write thread was
+still writing when its `tempfile.TemporaryDirectory()` tried to clean up.
+Reproduced (failed roughly 1 in 3 full-suite runs, passed every time in
+isolation - a real race, not something these changes introduced) and
+fixed by joining the write thread first, the same pattern its very next
+sibling test already used. Confirmed clean over 4 consecutive full-suite
+runs afterward. Caught only because getting a trustworthy "tests pass"
+signal mattered more than usual in this exact stretch.
+
+**Honest note, a third time today.** Two fixes in one day both assumed a
+person was the cause before checking whether the evidence actually
+required one. The correction each time came from the same source: real
+terminal output, not renewed reasoning from the symptom. Not yet
+re-verified against the real camera - same as everything above.
+
+### 2026-09-12 — "hazard detected" bug marked CRITICAL and deferred to
+Shaked, after six fix attempts in one session; new `docs/unsolved-gaps.md`
+tracker started
+
+Six real, distinct bugs were found and fixed today chasing one reported
+symptom (walking into frame produces `hazard_detected.wav` alongside a
+legitimate proximity alert) - each fix correct for the evidence available
+at the time, each disproven or shown incomplete by the NEXT live test.
+Shaked is stopping the cycle here and taking it on directly rather than
+continuing in this session. Explicitly asked for this to be written
+"everywhere relevant" so it cannot be lost or quietly re-litigated as if
+it were new: this decision log (this entry), `PHASE_PLAN.md` (Phase 8's
+blocking-items list, updated in the same pass), and a new dedicated file,
+`docs/unsolved-gaps.md`, created specifically because six entries scattered
+across this log are not a substitute for one clearly-marked "this is still
+broken" pointer. See that file for the full six-attempt summary and the
+standing advice for whoever picks it up next (get real terminal output
+from the exact failing moment first - that is what actually found bugs 3
+through 6, not renewed reasoning from the symptom alone).
+
+**Also started `docs/unsolved-gaps.md`'s second entry**, at Shaked's
+request: whether PENDING_FIRST_SCAN ("blue"/cyan) hazard-map boxes
+genuinely fail to persist across a session restart, INCLUDING a change of
+physical location, per CLAUDE.md decision 3's explicit "no persistence
+between sessions" rule. Investigated by reading the code (not yet tested
+live with an actual location change): `HazardMap()` is constructed fresh
+in `main()` every run, nothing reads the SQLite DB back into it, and
+`--seed-hazard` (the only startup-time hazard injector) is off by default
+and seeds CONFIRMED/red entries anyway, not pending/blue ones. Working
+conclusion, explicitly not yet verified: nothing in the code should
+persist, so the same boxes reappearing is more likely the same room
+producing the same fresh detections than an actual persistence bug - but
+this needs a real test in a different location before either conclusion
+is trusted. Filed as the next thing to check, not attempted as a fix.
+
+**Also cleaned up this pass, at Shaked's request, unrelated to either bug
+above:** the runtime event database (`backend/guardianeye.db` - 791 event
+rows, 35 clip rows) and every saved test clip (`cv/clips/pending/*.mp4` -
+12 files) were deleted, so the next test starts against a genuinely empty
+system rather than a session's worth of test data. Explicitly NOT touched:
+`cv/captures/` (the screen-recording captures kept for research/fine-
+tuning - a different thing entirely, and never in scope for this). Neither
+deleted path was tracked by git (`backend/*.db` is gitignored; `cv/clips/`
+likewise) - confirmed via `git ls-files` before deleting anything, so
+nothing committed was at risk.
+
+### 2026-09-12 — docs-agent's session-close audit of the six-attempt saga:
+mechanisms confirmed against the current code; `docs/unsolved-gaps.md`'s
+summary re-ordered and re-attributed; two small logging inconsistencies
+flagged in place
+
+Read all six 2026-09-12 entries above (from "Real bug found and fixed: an
+existing, unreviewed hazard..." through this entry's own predecessor) plus
+`docs/unsolved-gaps.md` and `PHASE_PLAN.md`'s Phase 8 section, then checked
+every named mechanism directly against the current `cv/risk_engine.py`
+rather than taking the prose on trust: `AlertDispatcher`'s collection window
+(`_join_collection`/`_flush_collection`/`_record_silently`), `person_
+occludes()`, `HazardMap.propose_named()`'s now-unconditional wide match, the
+person-gated retry still in `apply_scan_candidates()` at line 1069, and
+`main()`'s `occlusion_person_boxes`/`PersonTracker.entries` wiring all exist
+exactly as these entries describe them. **This session's engineering
+narrative holds up** - the discrepancies found were in the SUMMARY/count
+layer, not the underlying fixes:
+
+- `docs/unsolved-gaps.md`'s six-item list had attempts out of chronological
+  order and, in item 3, attributed `person_occludes()` to the very first
+  fix - it did not exist yet at that point; it is introduced at what these
+  entries call the "Third live test." Re-ordered and re-attributed in place
+  to match this log's own entry titles.
+- Two small test-count/config-value bookkeeping inconsistencies across the
+  entries above are flagged at their exact locations (see the "Audit note"
+  insertions in the "Fourth live test" entry) rather than fixed blind,
+  since I have no Bash access this session to settle either by actually
+  running the suite.
+
+`PHASE_PLAN.md`'s Phase 8 bullet was also expanded (it previously named only
+four of the six mechanisms in its parenthetical, silently folding the
+`person_occludes()` threshold fix into "a redesigned alert-priority
+arbiter," which is a different fix) and now lists all six in order.
+`docs/phase-writeups/session-2026-09-11-ui-and-alert-hardening.md` is
+extended with the full six-attempt saga as a new section 7, in the same
+technical+plain-language pairing style as the rest of that document, ending
+with the same "deferred to Shaked" outcome recorded here.

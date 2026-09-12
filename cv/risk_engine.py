@@ -239,6 +239,32 @@ WINDOW_NAME = "GuardianEye - risk engine"
 HAZARD_MATCH_IOU_THRESHOLD = 0.3
 HAZARD_MATCH_CENTER_DIST_FRAC = 0.08
 
+# A real hazard's detected box can shift, shrink, or move off-center from
+# one detection to the next - a fixed appliance doesn't move, but the
+# CAMERA's view of it does. Two call sites, two different justifications for
+# using this wider pair (Shaked, 2026-09-12, live evidence both times):
+#
+# - HazardMap.propose_named() uses this UNCONDITIONALLY, not gated on a
+#   person at all - a refrigerator entry already discovered got a fresh
+#   "hazard detected" TWICE within the first couple of seconds of a
+#   session, before any person could plausibly explain it. Ordinary
+#   detection jitter, not occlusion. Safe to widen unconditionally there
+#   because that label set is small, curated, and each label names
+#   something large, static, and effectively singular in a real home
+#   (decision 7) - a duplicate alert for a known fridge is worse than the
+#   (still unlikely, given the tolerance requires real overlap or a close
+#   center) risk of merging two separate same-labeled appliances.
+# - HazardMap.apply_scan_candidates()'s matching loop uses this ONLY as a
+#   retry, ONLY when person_occludes() independently confirms a person is
+#   right where the mismatch happened - scan-origin candidates are
+#   arbitrary, potentially numerous small objects, where loosening matching
+#   in general would risk merging two real, separate ones; loosening it
+#   only when a person explains the apparent drift does not carry that risk.
+#
+# Unmeasured first guesses, like the thresholds above were.
+OCCLUDED_MATCH_IOU_THRESHOLD = 0.1
+OCCLUDED_MATCH_CENTER_DIST_FRAC = 0.2
+
 # Two overlapping segmentation candidates from the SAME scan pass, above
 # this IoU, are treated as one physical object and deduplicated before
 # anything is queued for review (Step 3's "duplicate-candidate bug" fix) -
@@ -488,7 +514,41 @@ ALERT_HOLD_SECONDS = 2.0
 # WHETHER AlertManager considers something worth an alert (that logic is
 # unchanged), only whether THIS PARTICULAR MOMENT is when the parent
 # actually gets interrupted about it.
-GLOBAL_ALERT_MIN_INTERVAL_SECONDS = 2.5
+# 2.5 originally, raised to 5.0, then back down to 3.5 (Shaked, 2026-09-12 -
+# live testing after the collection-window fix below still felt "too messy"
+# back to back at 2.5; 5.0 was tried and dialed back to 3.5).
+GLOBAL_ALERT_MIN_INTERVAL_SECONDS = 3.5
+
+# Live test, 2026-09-12, TWICE the same day (first attempt below was
+# incomplete - see the second comment paragraph): a parent could hear TWO
+# alert clips within a few seconds of each other for genuinely different
+# things - "baby getting close" AND "hazard detected," or "baby getting
+# close" AND "immediate danger."
+#
+# First attempt (incomplete): only RED cancelled a still-settling lower
+# signal, since RED is deliberately exempt from GLOBAL_ALERT_MIN_INTERVAL_
+# SECONDS' pacing window (AlertArbiter's docstring - "must never wait its
+# turn"), so a lower-priority signal that had ALREADY been approved and
+# voiced moments earlier could not be un-said once RED arrived right after
+# it. That fix (holding every non-RED release briefly before speaking it)
+# closed the RED-vs-lower case, but NOT two non-RED signals close together:
+# each is approved by its OWN, separate GLOBAL_ALERT_MIN_INTERVAL_SECONDS
+# window (AlertArbiter.offer() only compares priority among signals
+# competing WITHIN one window), so "hazard detected" grabbing an open window
+# the instant it occurred, followed shortly after by "baby getting close"
+# having to wait its own separate turn ~2.5s later, meant both still got
+# voiced eventually - just spaced apart, not simultaneous.
+#
+# Real fix: AlertDispatcher now collects EVERY non-RED signal for this long
+# BEFORE it is ever submitted to the arbiter at all (see AlertDispatcher.
+# _join_collection/_flush_collection) - only the single highest-priority
+# signal seen during a collection window is ever submitted onward; anything
+# it beat is recorded (not dropped - Shaked reversed that call the same day)
+# but never spoken. RED still bypasses collection entirely and cancels
+# whatever was collecting, unchanged from the first attempt. Chosen small
+# enough that a lone, uncontested alert (the overwhelming majority) still
+# feels immediate.
+ALERT_SPEAK_SETTLE_SECONDS = 0.4
 
 # CLAUDE.md decision 6: a critical (red) alert stitches the rolling buffer's
 # preceding ~5s plus ~2 more seconds of live tail into a saved clip.
@@ -807,6 +867,52 @@ class ScanDiffResult:
     removed: list = field(default_factory=list)
 
 
+# Shaked, 2026-09-12, second pass the same day: "hazard detected" was STILL
+# firing on a child entering frame after the first person-occlusion fixes
+# (absence-counting, fingerprint-reraise). Root cause, found by actually
+# re-reading what those fixes reuse: all three person-occlusion checks in
+# this file (absence-counting below, the fingerprint-reraise guard below,
+# and new_object_alert_suppressed_by_person further down) reused
+# PERSON_OVERLAP_THRESHOLD (0.3) - the SAME threshold generate_scan_
+# candidates already uses to decide whether to even PROPOSE a segment as a
+# candidate at all. That threshold is deliberately lenient (decision 3:
+# "over-flagging is acceptable by design - it costs one tap"), tuned for a
+# human reviewing a queue, not for deciding whether to interrupt with a
+# sound. A stray limb/hand/hair segment that only grazes 10-25% of a tight,
+# axis-aligned YOLO person box clears the review-queue bar fine but was
+# ALSO clearing the alert-suppression bar - the same number was being asked
+# to do two different jobs with two different acceptable error rates.
+#
+# Fix: a separate, much stricter pair of constants for alert-suppression
+# specifically, used through this one shared helper instead of three
+# separate inline checks. Padding accounts for YOLO's box often not fully
+# enclosing an outstretched limb, which segmentation can still find as an
+# unsuppressed blob right at its edge. Unmeasured first guesses, like
+# PERSON_OVERLAP_THRESHOLD itself was - retune once tested live.
+ALERT_PERSON_OVERLAP_THRESHOLD = 0.05
+ALERT_PERSON_PAD_FRAC = 0.3
+
+
+def person_occludes(box: tuple, person_boxes) -> bool:
+    """True if any live person's PADDED bbox covers more than
+    ALERT_PERSON_OVERLAP_THRESHOLD of `box`'s own area - the shared,
+    deliberately stricter-than-candidate-generation test behind every place
+    this file has to tell "a live person" apart from "a genuinely new or
+    changed object": the absence-counting guard and the fingerprint-reraise
+    guard below, and new_object_alert_suppressed_by_person further down.
+    """
+    box_dict = {"x1": box[0], "y1": box[1], "x2": box[2], "y2": box[3]}
+    for p in person_boxes:
+        w, h = p[2] - p[0], p[3] - p[1]
+        padded = {
+            "x1": p[0] - w * ALERT_PERSON_PAD_FRAC, "y1": p[1] - h * ALERT_PERSON_PAD_FRAC,
+            "x2": p[2] + w * ALERT_PERSON_PAD_FRAC, "y2": p[3] + h * ALERT_PERSON_PAD_FRAC,
+        }
+        if overlap_frac_of_a(box_dict, padded) > ALERT_PERSON_OVERLAP_THRESHOLD:
+            return True
+    return False
+
+
 class HazardMap:
     """Layer A per CLAUDE.md decision 3: in-memory only, empty at
     construction, never written to or read from disk - a fresh HazardMap()
@@ -857,9 +963,29 @@ class HazardMap:
         refreshes position on a match, otherwise creates a new PENDING
         entry. Returns (entry, created) so the caller can enqueue/alert only
         on genuinely new entries.
+
+        Matches with OCCLUDED_MATCH_IOU_THRESHOLD/OCCLUDED_MATCH_CENTER_
+        DIST_FRAC - the WIDER of this file's two match-tolerance pairs - as
+        the ONLY threshold, unconditionally, not gated on a person being
+        nearby. Live evidence, 2026-09-12 (fifth pass, same day): a
+        refrigerator re-announced itself as "hazard detected" TWICE within
+        the first couple of seconds of a session, before any person could
+        plausibly have been consistently occluding it - so this is ordinary
+        YOLO box jitter between frames/detections, not something occlusion
+        explains, and gating the retry on a person (this function's own
+        previous version) does nothing for it. This label set is small,
+        curated, and each label names something large, static, and
+        effectively singular in a real home (decision 7) - a duplicate
+        "new" alert for the SAME known fridge is a worse, more disruptive
+        failure than the (already unlikely, given the wide tolerance still
+        requires either real overlap or a close center) risk of merging two
+        genuinely separate same-labeled appliances. Scan-origin candidates
+        (arbitrary, potentially numerous small objects) are a different risk
+        profile and keep the narrower, person-gated retry - see
+        apply_scan_candidates.
         """
         candidates = [e for e in self.entries if e.label == label and e.origin == HAZARD_ORIGIN_NAMED]
-        match = find_match(bbox, candidates, frame_diagonal, HAZARD_MATCH_IOU_THRESHOLD, HAZARD_MATCH_CENTER_DIST_FRAC)
+        match = find_match(bbox, candidates, frame_diagonal, OCCLUDED_MATCH_IOU_THRESHOLD, OCCLUDED_MATCH_CENTER_DIST_FRAC)
         if match is not None:
             match.bbox = bbox
             match.last_seen = time.monotonic()
@@ -940,6 +1066,13 @@ class HazardMap:
         for candidate in candidates:
             pool = [e for e in scan_entries if e.id not in matched_ids]
             match = find_match(candidate, pool, frame_diagonal, HAZARD_MATCH_IOU_THRESHOLD, HAZARD_MATCH_CENTER_DIST_FRAC)
+            if match is None and person_occludes(candidate, person_boxes):
+                # A real object's segmented shape can drift between scans
+                # while a person is near it (partial occlusion changes what
+                # part of it segmentation sees) - see OCCLUDED_MATCH_IOU_
+                # THRESHOLD's comment. Retried only when a person explains
+                # the drift, not loosened in general.
+                match = find_match(candidate, pool, frame_diagonal, OCCLUDED_MATCH_IOU_THRESHOLD, OCCLUDED_MATCH_CENTER_DIST_FRAC)
             if match is None:
                 unmatched_candidates.append(candidate)
                 continue
@@ -967,14 +1100,12 @@ class HazardMap:
                 # cycle, not evidence of a real swap - changed_scans is left
                 # untouched, not reset (a reset would be its own false
                 # signal that the spot read as genuinely unchanged).
-                person_over_fingerprint = any(
-                    overlap_frac_of_a(
-                        {"x1": match.fingerprint_bbox[0], "y1": match.fingerprint_bbox[1],
-                         "x2": match.fingerprint_bbox[2], "y2": match.fingerprint_bbox[3]},
-                        {"x1": p[0], "y1": p[1], "x2": p[2], "y2": p[3]},
-                    ) > PERSON_OVERLAP_THRESHOLD
-                    for p in person_boxes
-                )
+                #
+                # person_occludes() (not the bare PERSON_OVERLAP_THRESHOLD
+                # used elsewhere) - this decides whether to interrupt with a
+                # sound, which needs the stricter, padded test. See that
+                # function's comment, 2026-09-12 second pass.
+                person_over_fingerprint = person_occludes(match.fingerprint_bbox, person_boxes)
                 # Compare against the STABLE fingerprint_bbox, NOT `candidate`
                 # (this scan's own fresh, possibly-jittering segmentation
                 # box) - see fingerprint_changed's docstring for why using
@@ -1023,9 +1154,12 @@ class HazardMap:
             # the whole time. This is evidence-free, not evidence-of-absence,
             # for ANY entry (judged or still-pending) - so it is checked
             # before, not instead of, the judged/pending threshold below.
-            entry_box = {"x1": entry.bbox[0], "y1": entry.bbox[1], "x2": entry.bbox[2], "y2": entry.bbox[3]}
-            if any(overlap_frac_of_a(entry_box, {"x1": p[0], "y1": p[1], "x2": p[2], "y2": p[3]})
-                   > PERSON_OVERLAP_THRESHOLD for p in person_boxes):
+            # person_occludes() - not the bare PERSON_OVERLAP_THRESHOLD used
+            # for candidate generation - see that function's comment,
+            # 2026-09-12 second pass: the padded, stricter test is what
+            # decides whether an entry survives, ultimately gating whether a
+            # false "arrived" alert can fire later from a false removal.
+            if person_occludes(entry.bbox, person_boxes):
                 continue
             entry.absent_scans += 1
             # A spot the parent has already ruled on gets a far longer
@@ -1423,6 +1557,34 @@ class AlertManager:
         return True
 
 
+def new_object_alert_suppressed_by_person(hazard_entry: HazardEntry, person_boxes) -> bool:
+    """True if a live person's body covers enough of this entry's own bbox
+    (per person_occludes' padded, alert-strength test) that announcing it as
+    "hazard detected" would really be announcing the person, not a new
+    object.
+
+    Live test, 2026-09-12: a parent heard "hazard detected" the instant
+    their child walked into frame - TWICE the same day, since the first
+    attempt at this function (and the absence-counting/fingerprint-reraise
+    guards next to it) all reused the same PERSON_OVERLAP_THRESHOLD (0.3)
+    generate_scan_candidates uses to decide whether to even PROPOSE a
+    candidate - a bar tuned for a human reviewing a queue, not for deciding
+    whether to interrupt with a sound. See person_occludes' comment for the
+    stricter, padded replacement now used here instead.
+
+    This remains a final, unconditional backstop at the one place every
+    "new object" alert - regardless of origin (room scan, dismissed
+    re-raise, named oven/microwave/fridge detection, wall socket, several of
+    which have no person-awareness at all upstream) - has to pass through
+    (enqueue_and_maybe_alert), rather than something to trust only for one
+    origin.
+
+    `person_boxes` should be THIS frame's live YOLO detections - the same
+    ones score_frame/proximity already trust - not a stale or averaged set.
+    """
+    return person_occludes(hazard_entry.bbox, person_boxes)
+
+
 # Cross-signal severity ranking used by AlertArbiter to pick the most
 # important of several signals competing inside one pacing window (Shaked,
 # 2026-08-26). Higher number = more urgent. Exactly the three tiers from
@@ -1590,6 +1752,14 @@ class AlertDispatcher:
         self._clock = clock
         self.banner_text = None
         self.banner_until = 0.0
+        # ALERT_SPEAK_SETTLE_SECONDS collection window, sitting in FRONT of
+        # the arbiter - see that constant's comment for why. At most one
+        # signal is ever "collecting" here: nothing new starts a collection
+        # while one is already open (a competing signal either replaces it,
+        # if higher priority, or is itself recorded silently and dropped -
+        # see _join_collection).
+        self._collecting_signal = None
+        self._collect_until = None
         # Which of the three pre-recorded clips (if any) belongs to the
         # CURRENTLY active banner - set alongside banner_text/banner_until in
         # speak(), read back through current_clip() below. Rebuilt
@@ -1631,20 +1801,93 @@ class AlertDispatcher:
         if self._event_recorder is not None:
             self._event_recorder.record(signal)
 
-    def offer(self, signal: AlertSignal, now: float):
-        """A freshly-produced signal. Voices it if the arbiter says this is
-        the moment, otherwise the arbiter holds it and poll() releases it
-        later. Returns whatever was voiced (or None), mostly for tests.
+    def _record_silently(self, signal: AlertSignal) -> None:
+        """A signal that lost to a higher-priority one during collection, or
+        that RED preempted outright - persisted (Shaked, 2026-09-12: reversed
+        the original "drop it entirely" call from earlier the same day - a
+        real escalation that got cut off by something more urgent elsewhere
+        should still leave a trace in the event history) but never spoken and
+        never bannered.
         """
-        voiced = self._arbiter.offer(signal, now)
-        if voiced is not None:
-            self.speak(voiced)
-        return voiced
+        if self._event_recorder is not None:
+            self._event_recorder.record(signal)
+
+    def _flush_collection(self, now: float) -> None:
+        """If the collection window has closed with nothing further to
+        preempt it, submit its winner to the arbiter (exactly as offer()
+        submitted every signal before this collection stage existed) and
+        speak it immediately if the arbiter approves. Called at the top of
+        every method below that takes a `now`, so a submission or speak
+        never waits on a fresh signal to trigger it - in production that's
+        every frame via poll(), well inside ALERT_SPEAK_SETTLE_SECONDS of the
+        deadline.
+        """
+        if self._collecting_signal is not None and now >= self._collect_until:
+            winner = self._collecting_signal
+            self._collecting_signal = None
+            self._collect_until = None
+            voiced = self._arbiter.offer(winner, now)
+            if voiced is not None:
+                self.speak(voiced)
+            # else: the arbiter's OWN pacing window is still closed for a
+            # different reason - it now holds `winner` internally, same as
+            # it always has, and poll() below releases it later unchanged.
+
+    def _join_collection(self, signal: AlertSignal, now: float) -> None:
+        """A non-RED signal joins whatever collection window is currently
+        open, or starts a new one. Only the highest-priority signal seen
+        during a window is ever submitted onward - see ALERT_SPEAK_SETTLE_
+        SECONDS' comment for why this exists: two DIFFERENT non-RED signals
+        (e.g. "baby getting close" and "hazard detected") arriving a moment
+        apart were previously both eventually voiced, a few seconds apart,
+        because each is approved by a SEPARATE arbiter pacing window - this
+        stage runs BEFORE the arbiter ever sees either of them, so only the
+        more urgent one is ever submitted at all.
+        """
+        if self._collecting_signal is None:
+            self._collecting_signal = signal
+            self._collect_until = now + ALERT_SPEAK_SETTLE_SECONDS
+        elif alert_priority(signal) > alert_priority(self._collecting_signal):
+            self._record_silently(self._collecting_signal)
+            self._collecting_signal = signal
+        else:
+            self._record_silently(signal)
+
+    def offer(self, signal: AlertSignal, now: float):
+        """A freshly-produced signal. RED bypasses collection entirely - it
+        cancels (silently records, never speaks) whatever was still
+        collecting, then goes straight to the arbiter and speaks immediately
+        if approved, exactly as before this collection stage existed. A
+        non-RED signal joins the collection window instead - see
+        _join_collection - and is only submitted to the arbiter once that
+        window closes with nothing higher-priority still competing.
+
+        Returns the signal the arbiter actually voiced this call for a RED
+        signal, or None for a non-RED one (it never speaks synchronously
+        within offer() any more - mostly used by tests).
+        """
+        self._flush_collection(now)
+        if alert_priority(signal) == ALERT_PRIORITY_RED:
+            if self._collecting_signal is not None:
+                self._record_silently(self._collecting_signal)
+                self._collecting_signal = None
+                self._collect_until = None
+            voiced = self._arbiter.offer(signal, now)
+            if voiced is not None:
+                self.speak(voiced)
+            return voiced
+        self._join_collection(signal, now)
+        return None
 
     def poll(self, now: float):
-        """Call once per frame. Releases a signal the pacing window held back.
-        THIS is the path that was silently unpersisted before the Phase 6 fix.
+        """Call once per frame. Flushes this dispatcher's own collection
+        window (see _flush_collection) and releases a signal the ARBITER's
+        pacing window held back (always non-RED - see AlertArbiter.offer(),
+        which only ever populates _held on a non-RED signal), speaking it
+        immediately. THIS release path is the one that was silently
+        unpersisted before the Phase 6 fix.
         """
+        self._flush_collection(now)
         held = self._arbiter.poll(now)
         if held is not None:
             self.speak(held)
@@ -1661,10 +1904,13 @@ class AlertDispatcher:
         """(text, active) for the current moment - the debug overlay and
         /risk_status's `alert` field read the same state through this one
         accessor, so the pixels and the JSON can never disagree about what the
-        parent is currently being shown. Signature/behaviour UNCHANGED by the
+        parent is currently being shown. Signature UNCHANGED by the
         current_clip() addition - two existing call sites in main() and four
-        existing tests unpack this as a 2-tuple.
+        existing tests unpack this as a 2-tuple. Also flushes the collection
+        window (see _flush_collection) so a caller who reads banner() without
+        ever calling poll() first still sees a winner that has come due.
         """
+        self._flush_collection(now)
         return self.banner_text, self._banner_active(now)
 
     def current_clip(self, now: float):
@@ -1672,7 +1918,8 @@ class AlertDispatcher:
         active RIGHT NOW - None once the banner expires, even though
         banner_clip itself is left set (harmless; _banner_active(now) gates
         it here exactly as it gates `active` in banner() above, so the two
-        can never disagree about what's "current" either).
+        can never disagree about what's "current" either). Flushes the
+        collection window first, same reason as banner() above.
 
         For the Phase 8 iPad+web audio alert: a remote UI can play the SAME
         sound this Mac's speaker just played, without re-deriving the
@@ -1680,6 +1927,7 @@ class AlertDispatcher:
         alert kind, and would duplicate a rule that already lives in
         audio_for_signal - see the module docstring there).
         """
+        self._flush_collection(now)
         return self.banner_clip if self._banner_active(now) else None
 
 
@@ -1977,6 +2225,17 @@ def hazard_state_tag(entry: HazardEntry) -> str:
 
 
 def draw_hazard_box(image, entry: HazardEntry, is_review_candidate: bool) -> None:
+    # Shaked, 2026-09-12: a dismissed entry stays fully tracked internally
+    # (HazardMap still needs its bbox/fingerprint to keep it from being
+    # mistaken for a new arrival - decision 4's per-spot dismissal) but is no
+    # longer drawn at all - a room with several dismissed items was filling
+    # the screen with grey boxes nobody needed to look at. This is the one
+    # shared draw call behind the served /video_feed, the local cv2.imshow
+    # debug window, AND rolling-buffer/clip snapshots (see its call site in
+    # main()), so skipping it here hides dismissed boxes from all three at
+    # once, consistently.
+    if entry.state == HAZARD_STATE_DISMISSED:
+        return
     x1, y1, x2, y2 = (int(round(v)) for v in entry.bbox)
     frame_height, frame_width = image.shape[:2]
     color = hazard_box_color(entry)
@@ -2487,10 +2746,17 @@ def main() -> None:
         alert_dispatcher.offer(signal, now)
 
     def enqueue_and_maybe_alert(entry: HazardEntry, alert_reason: str) -> None:
+        # Still goes on the review queue either way - a real parent can
+        # glance at it and dismiss/skip in one tap either way (decision 3/4).
+        # Only the ALERT is gated below - see
+        # new_object_alert_suppressed_by_person's docstring for why.
         review_queue.enqueue(entry.id)
-        if not entry.is_first_scan:
-            now = time.monotonic()
-            handle_alert_signal(alert_manager.open_new_object(entry, alert_reason, now), now)
+        if entry.is_first_scan:
+            return
+        if new_object_alert_suppressed_by_person(entry, occlusion_person_boxes):
+            return
+        now = time.monotonic()
+        handle_alert_signal(alert_manager.open_new_object(entry, alert_reason, now), now)
 
     smoothed_fps = None
     last_frame_time = time.monotonic()
@@ -2580,6 +2846,25 @@ def main() -> None:
                         elif cls_id in hazard_class_id_to_label:
                             hazard_detections.append((hazard_class_id_to_label[cls_id], bbox))
 
+                # Moved up from its old spot just before score_frame (Shaked,
+                # 2026-09-12, FOURTH pass on the same live bug): every
+                # person-occlusion check below (upstream scan-candidate
+                # suppression, absence-counting, fingerprint-reraise, and the
+                # new-object-alert backstop) was using ONLY `person_boxes` -
+                # THIS SINGLE FRAME's raw YOLO output. A child mid-stride,
+                # partially occluded by furniture, or at an odd angle can
+                # simply fail this frame's confidence threshold - `person_
+                # boxes` is then EMPTY, and no overlap/padding tuning can
+                # help, because there is nothing to compare against. Every
+                # occlusion check downstream now reads `occlusion_person_
+                # boxes` instead - PersonTracker.entries, pruned only by
+                # PERSON_STALE_SECONDS (1.0s), so a person detected up to a
+                # second ago still counts even if THIS exact frame missed
+                # them. `live_persons` (this call's freshly-matched subset)
+                # still feeds score_frame/proximity below, unchanged.
+                live_persons = person_tracker.update(person_boxes, frame_diagonal)
+                occlusion_person_boxes = tuple(e.bbox for e in person_tracker.entries)
+
                 for label, bbox in hazard_detections:
                     entry, created = hazard_map.propose_named(bbox, label, frame_diagonal, is_first_scan=not first_scan_done)
                     if created:
@@ -2606,10 +2891,10 @@ def main() -> None:
                         # tradeoff over busy-polling every frame).
                         last_room_scan_time = now
                     else:
-                        raw_candidates = generate_scan_candidates(frame, scan_model, person_boxes, args.scan_imgsz, device)
+                        raw_candidates = generate_scan_candidates(frame, scan_model, occlusion_person_boxes, args.scan_imgsz, device)
                         diff = hazard_map.apply_scan_candidates(
                             raw_candidates, frame, frame_diagonal, is_first_scan_cycle=(room_scan_index == 0),
-                            person_boxes=person_boxes,
+                            person_boxes=occlusion_person_boxes,
                         )
                         for entry in diff.arrived:
                             enqueue_and_maybe_alert(entry, "room scan")
@@ -2636,8 +2921,6 @@ def main() -> None:
                     if swept:
                         print(f"Auto-delete sweep: expired {swept} undecided pending clip(s).")
                     last_sweep_time = now
-
-                live_persons = person_tracker.update(person_boxes, frame_diagonal)
 
                 live_person_ids = {p.id for p in live_persons}
                 for key in list(rolling_windows.keys()):

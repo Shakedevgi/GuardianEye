@@ -152,6 +152,19 @@ nothing should sound (the hysteresis-ending "closed" case) - a UI that
 plays a sound whenever `active` is true, without checking `clip` is
 non-null, will play a sound in a case this Mac's own speaker does not.
 
+A non-critical `alert.clip` (`hazard_detected.wav` / `baby_getting_close.wav`)
+can lag its underlying event by up to `ALERT_SPEAK_SETTLE_SECONDS` (0.4s,
+`cv/risk_engine.py`) - deliberate: every non-critical signal is briefly held
+in `AlertDispatcher` so a higher-priority one arriving in that window (a
+same-instant `immediate_danger.wav`, or simply a higher-priority non-
+critical signal, e.g. `baby_getting_close.wav` over `hazard_detected.wav`)
+replaces it before this field ever reports it at all (2026-09-12: fixes
+hearing two alerts overlap - see `docs/decision-log.md`). A signal that
+loses this way is still persisted to `/events`, just never surfaced here.
+`immediate_danger.wav` itself is never delayed.
+A poller reading this field gets exactly what this Mac's speaker played, in
+the order it played it - it never needs its own priority logic.
+
 ### `GET /health`
 `{"camera_running": bool, "last_frame_age_seconds": float|null, "frame_seq": int}`.
 `camera_running` is false both before the first publish and after the

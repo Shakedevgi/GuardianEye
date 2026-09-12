@@ -217,6 +217,46 @@ def test_hazard_map_propose_named_merges_same_object():
     assert len(hm.entries) == 3
 
 
+def test_hazard_map_propose_named_matches_a_drifted_box_with_no_person_involved():
+    """Live bug, 2026-09-12 (fifth pass, found from real terminal output): a
+    refrigerator re-announced itself as "hazard detected" TWICE within the
+    first couple of seconds of a session - before any person could
+    plausibly have been consistently occluding it. This is ordinary YOLO
+    box jitter between detections, not something a person explains, so the
+    fourth pass's person-gated retry (tested in an earlier version of this
+    file) did nothing for it. propose_named now matches with OCCLUDED_
+    MATCH_*'s wider tolerance UNCONDITIONALLY - see its docstring for why
+    that's safe specifically for this small, curated, large-static-
+    appliance label set.
+    """
+    frame_diagonal = math.hypot(1920, 1080)
+    hm = re.HazardMap()
+    original = (100.0, 100.0, 300.0, 300.0)
+    e1, created1 = hm.propose_named(original, "refrigerator", frame_diagonal, is_first_scan=True)
+    assert created1 is True
+
+    drifted = (335.0, 335.0, 465.0, 465.0)  # zero IoU, center ~283px away - fails the OLD strict threshold
+    e2, created2 = hm.propose_named(drifted, "refrigerator", frame_diagonal, is_first_scan=False)
+    assert created2 is False, "matched via the wider tolerance - no person needed"
+    assert e2.id == e1.id
+    assert e2.bbox == drifted
+    assert len(hm.entries) == 1
+
+
+def test_hazard_map_propose_named_a_truly_separate_appliance_still_gets_its_own_entry():
+    """The wider tolerance is not unlimited - two genuinely different,
+    far-apart detections of the same label (a real second appliance, or the
+    label-scoped case test_hazard_map_propose_named_merges_same_object
+    already covers) must still create separate entries.
+    """
+    frame_diagonal = math.hypot(1920, 1080)
+    hm = re.HazardMap()
+    e1, _ = hm.propose_named((100.0, 100.0, 300.0, 300.0), "refrigerator", frame_diagonal, is_first_scan=True)
+    e2, created2 = hm.propose_named((1500.0, 800.0, 1700.0, 1000.0), "refrigerator", frame_diagonal, is_first_scan=False)
+    assert created2 is True
+    assert e2.id != e1.id
+
+
 def test_hazard_map_propose_named_confirmed_state_untouched_by_match():
     """A human-confirmed named entry re-detected next frame stays CONFIRMED
     (position refresh only) - propose_named never downgrades state.
@@ -714,6 +754,53 @@ def test_a_person_over_the_fingerprint_spot_does_not_false_reraise_a_dismissed_e
     assert entry.state == re.HAZARD_STATE_PENDING
 
 
+def test_apply_scan_candidates_without_a_person_a_drifted_candidate_goes_unmatched():
+    """Live bug, 2026-09-12 (fourth pass, found from real terminal output):
+    "New object detected (room scan)" fired three times for what was
+    plausibly the SAME real object, moments apart. A person partially
+    occluding it between scans changes what part of its shape segmentation
+    sees, which can drift the candidate box enough to fail the strict match
+    against the entry already on record - documented here as the failure
+    baseline, with no person around to explain the drift.
+    """
+    frame_diagonal = math.hypot(1920, 1080)
+    frame = _solid_frame((100, 100, 100), shape=(1080, 1920, 3))
+    hm = re.HazardMap()
+    spot = (300.0, 300.0, 500.0, 500.0)
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False)
+    entry = hm.entries[0]
+    assert entry.bbox == spot
+
+    drifted = (600.0, 600.0, 700.0, 700.0)  # zero IoU, center ~354px away
+    hm.apply_scan_candidates([drifted], frame, frame_diagonal, is_first_scan_cycle=False)
+    assert entry.bbox == spot, "no person to explain the drift - stays unmatched"
+    assert entry.absent_scans == 1
+
+
+def test_apply_scan_candidates_person_occluding_the_drift_matches_it_to_the_existing_entry():
+    """The fix: person_occludes() confirms a person is right where the
+    drifted candidate landed, so the match is retried with OCCLUDED_MATCH_
+    *'s wider tolerance instead of letting the known entry go "unmatched"
+    (which is what feeds the false re-arrival three scans in a row).
+    """
+    frame_diagonal = math.hypot(1920, 1080)
+    frame = _solid_frame((100, 100, 100), shape=(1080, 1920, 3))
+    hm = re.HazardMap()
+    spot = (300.0, 300.0, 500.0, 500.0)
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=True)
+    hm.apply_scan_candidates([spot], frame, frame_diagonal, is_first_scan_cycle=False)
+    entry = hm.entries[0]
+
+    drifted = (600.0, 600.0, 700.0, 700.0)
+    person_covering_the_drifted_box = (590.0, 590.0, 710.0, 710.0)
+    hm.apply_scan_candidates([drifted], frame, frame_diagonal, is_first_scan_cycle=False,
+                              person_boxes=[person_covering_the_drifted_box])
+    assert entry.bbox == drifted, "matched via the occluded retry, position refreshed"
+    assert entry.absent_scans == 0
+    assert len(hm.entries) == 1, "no duplicate entry was created"
+
+
 # --- proximity-alert eligibility (Step 5 / CLAUDE.md decision 4) ------------
 
 
@@ -795,6 +882,27 @@ def test_person_tracker_persists_id_across_frames():
     ids = {p.id for p in live3}
     assert person_id in ids
     assert len(ids) == 2
+
+
+def test_person_tracker_entries_retains_a_recently_missed_person_though_not_in_live():
+    # The exact mechanism behind occlusion_person_boxes (cv/risk_engine.py,
+    # 2026-09-12, fourth pass on the live "hazard detected on a person" bug):
+    # a single frame where detection misses the child (partial occlusion, an
+    # odd angle, momentary low confidence) must not make every person-
+    # occlusion check see an empty person list. `update()`'s RETURN VALUE
+    # (`live`) only reflects THIS call's matches, but `.entries` keeps the
+    # person until PERSON_STALE_SECONDS has actually elapsed.
+    frame_diagonal = math.hypot(1920, 1080)
+    tracker = re.PersonTracker()
+
+    live1 = tracker.update([(100, 100, 200, 400)], frame_diagonal)
+    person_id = live1[0].id
+
+    # This frame's detection missed them entirely.
+    live2 = tracker.update([], frame_diagonal)
+    assert live2 == [], "live() correctly reports nobody matched THIS frame"
+    assert any(e.id == person_id for e in tracker.entries), \
+        "but .entries must still remember them - not yet stale"
 
 
 def test_person_tracker_drops_stale_entries():
@@ -988,6 +1096,21 @@ def test_draw_hazard_box_review_outline_does_not_crash_near_frame_edges():
     assert frame[0].max() > 0
 
 
+def test_draw_hazard_box_draws_nothing_for_a_dismissed_entry():
+    # Shaked, 2026-09-12: dismissed entries stay tracked internally (their
+    # bbox is still what stops a re-scan from treating the same spot as a
+    # brand-new arrival) but must no longer appear on screen at all - a grey
+    # box nobody needs to look at. Confirmed with a bright bbox filling most
+    # of the frame, so any drawing at all would be obvious.
+    frame = np.zeros((60, 80, 3), dtype=np.uint8)
+    entry = re.HazardEntry(
+        id=1, label="object", bbox=(0, 0, 79, 59), origin=re.HAZARD_ORIGIN_SCAN,
+        state=re.HAZARD_STATE_DISMISSED, is_first_scan=False,
+    )
+    re.draw_hazard_box(frame, entry, is_review_candidate=False)
+    assert frame.max() == 0, "a dismissed entry must draw nothing"
+
+
 def test_review_candidate_label_includes_position_and_total():
     assert re.review_candidate_label(1, 3) == "REVIEW 1/3 - h=hazard n=not s=skip queued"
     assert "REVIEW 0/" not in re.review_candidate_label(1, 5)
@@ -1110,6 +1233,59 @@ def test_open_new_object_creates_one_shot_opened_signal():
     assert signal.event.reason == "room scan"
     assert signal.event.person_id is None
     assert signal.event.hazard_label == "knife"
+
+
+def test_person_occludes_true_for_direct_overlap():
+    entry_box = (100.0, 100.0, 300.0, 300.0)
+    person = (110.0, 110.0, 290.0, 290.0)  # covers almost all of it
+    assert re.person_occludes(entry_box, [person]) is True
+
+
+def test_person_occludes_false_when_person_is_far_away():
+    entry_box = (100.0, 100.0, 300.0, 300.0)
+    person_far_away = (800.0, 800.0, 900.0, 900.0)
+    assert re.person_occludes(entry_box, [person_far_away]) is False
+
+
+def test_person_occludes_catches_a_stray_limb_just_outside_the_tight_person_box():
+    # The exact second-pass fix, 2026-09-12: a segment for an outstretched
+    # limb can sit just past a YOLO person box's tight edge, with ZERO raw
+    # overlap against the box as YOLO drew it - the ORIGINAL person-
+    # occlusion checks (bare PERSON_OVERLAP_THRESHOLD, no padding) would
+    # have missed this entirely and let the alert through.
+    person = (100.0, 100.0, 200.0, 300.0)  # w=100, h=200
+    entry_box = (205.0, 150.0, 255.0, 250.0)  # w=50, h=100 - just past x2=200
+
+    # Confirm the premise: zero overlap against the RAW (unpadded) box.
+    raw_overlap = re.overlap_frac_of_a(
+        {"x1": entry_box[0], "y1": entry_box[1], "x2": entry_box[2], "y2": entry_box[3]},
+        {"x1": person[0], "y1": person[1], "x2": person[2], "y2": person[3]},
+    )
+    assert raw_overlap == 0.0
+
+    assert re.person_occludes(entry_box, [person]) is True, \
+        "padding must catch what the raw box's own edge misses"
+
+
+def test_new_object_alert_suppressed_by_person_when_a_person_covers_the_entrys_spot():
+    # Live bug, 2026-09-12: "hazard detected" fired the instant a child
+    # walked into frame. This is the final backstop, checked regardless of
+    # which upstream mechanism let the entry through.
+    entry = _hazard(bbox=(100.0, 100.0, 300.0, 300.0))
+    person_standing_there = (110.0, 110.0, 290.0, 290.0)  # covers almost all of it
+    assert re.new_object_alert_suppressed_by_person(entry, [person_standing_there]) is True
+
+
+def test_new_object_alert_suppressed_by_person_is_false_when_person_is_elsewhere():
+    entry = _hazard(bbox=(100.0, 100.0, 300.0, 300.0))
+    person_far_away = (800.0, 800.0, 900.0, 900.0)
+    assert re.new_object_alert_suppressed_by_person(entry, [person_far_away]) is False
+
+
+def test_new_object_alert_suppressed_by_person_is_false_with_no_person_boxes():
+    # A real new object arriving with nobody in frame at all must still alert.
+    entry = _hazard(bbox=(100.0, 100.0, 300.0, 300.0))
+    assert re.new_object_alert_suppressed_by_person(entry, []) is False
 
 
 # --- Phase 5: should_trigger_clip (decision 6 gate) ---------------------------
@@ -1406,6 +1582,13 @@ def test_clip_recorder_poll_only_finalizes_after_deadline():
         assert path.endswith("_event1_object.mp4")
         assert returned_event is event  # Phase 6: poll() now returns (path, event) pairs
         assert recorder._pending == []
+        # Join the write thread before the tempdir context exits below -
+        # without this, cleanup can race the background write and fail with
+        # "Directory not empty" (flaky, timing-dependent - not this file's
+        # own logic). Same pattern the very next test already uses.
+        for t in threading.enumerate():
+            if t.name != threading.main_thread().name:
+                t.join(timeout=5.0)
 
 
 def test_clip_recorder_poll_calls_on_write_complete_with_path_and_event():
@@ -1796,24 +1979,35 @@ def test_alert_dispatcher_every_voiced_signal_is_also_recorded_including_held_re
     """
     dispatcher, recorder, spoken = _dispatcher_with_spies()
 
-    # t=0: first signal is voiced immediately (window has never been used).
+    # t=0: #1 joins an empty collection window - NOT yet submitted to the
+    # arbiter at all (collection now happens BEFORE the arbiter - see
+    # ALERT_SPEAK_SETTLE_SECONDS' comment), so nothing is voiced yet.
     first = dispatcher.offer(_new_object_signal(hazard_id=1), now=0.0)
-    assert first is not None
-    assert len(spoken) == 1
+    assert first is None, "non-RED never speaks synchronously within offer() any more"
+    assert len(spoken) == 0
 
-    # t=0.5: inside the 2.5s pacing window, so this one is HELD, not voiced.
+    # t=0.5: this offer() call's own flush-check sees #1's collection window
+    # (0.4s) has closed with nothing to preempt it, submits #1 to the
+    # arbiter (window open, never voiced before - speaks immediately), THEN
+    # #2 joins its OWN fresh collection window.
     second = dispatcher.offer(_new_object_signal(hazard_id=2), now=0.5)
-    assert second is None, "should have been held by the pacing window"
-    assert len(spoken) == 1, "a held signal must not be voiced yet"
-    assert len(recorder.recorded) == 1, "and must not be persisted yet either"
+    assert second is None
+    assert len(spoken) == 1, "#1 flushed and spoken; #2 is only just collecting"
+    assert len(recorder.recorded) == 1, "and #2 must not be persisted yet either"
 
-    # A poll before the window reopens releases nothing.
-    assert dispatcher.poll(now=1.0) is None
+    # A poll before #2's own collection window closes releases nothing.
+    assert dispatcher.poll(now=0.7) is None
     assert len(spoken) == 1
 
-    # t=3.0: window has reopened - poll() releases the held signal. THIS is
-    # the path that used to speak without recording.
-    released = dispatcher.poll(now=3.0)
+    # t=0.9: #2's collection window closes - submitted to the arbiter, whose
+    # OWN pacing window is still closed (last voiced at t=0.5) - held there.
+    assert dispatcher.poll(now=0.9) is None
+    assert len(spoken) == 1
+
+    # The ARBITER's pacing window (last voiced at t=0.5) has now reopened -
+    # poll() releases the held signal and speaks it immediately. THIS is the
+    # path that used to speak without recording.
+    released = dispatcher.poll(now=0.5 + re.GLOBAL_ALERT_MIN_INTERVAL_SECONDS + 0.1)
     assert released is not None
     assert released.event.hazard_id == 2
     assert len(spoken) == 2
@@ -1835,8 +2029,96 @@ def test_alert_dispatcher_records_red_signals_that_bypass_pacing():
     red = dispatcher.offer(_proximity_signal("red", hazard_id=9), now=0.1)
 
     assert red is not None, "RED must never be held by the pacing window"
-    assert len(spoken) == 2
+    assert len(spoken) == 1, "RED speaks; hazard #1 never gets the chance - see below"
+    # hazard #1 was still settling when RED preempted it - never spoken, but
+    # still recorded (2026-09-12: reversed same-day from "drop it entirely").
+    assert len(recorder.recorded) == 2
+    assert recorder.recorded[1] is spoken[0]
+
+
+def test_alert_dispatcher_red_cancels_a_still_settling_lower_priority_signal():
+    """The exact live bug (Shaked, 2026-09-12): a parent heard BOTH "getting
+    close" and "immediate danger" together. hazard #1's new-object signal is
+    approved at t=0.0 and would normally speak at t=0.4
+    (ALERT_SPEAK_SETTLE_SECONDS) - but RED arrives at t=0.1, well before that,
+    and must cancel it: never spoken. Recorded silently though, not dropped -
+    Shaked reversed his own earlier "drop it entirely" call the same day: a
+    real escalation that got cut off by something more urgent elsewhere
+    should still leave a trace in the event history.
+    """
+    dispatcher, recorder, spoken = _dispatcher_with_spies()
+
+    dispatcher.offer(_new_object_signal(hazard_id=1), now=0.0)
+    dispatcher.offer(_proximity_signal("red", hazard_id=9), now=0.1)
+    # Even well past hazard #1's original settle deadline (0.4), it must
+    # never surface - poll()'s own flush-check has nothing left to flush.
+    dispatcher.poll(now=1.0)
+
+    assert len(spoken) == 1
+    assert spoken[0].event.hazard_id == 9, "only RED was ever voiced"
+    assert len(recorder.recorded) == 2, "hazard #1 is recorded, just not voiced"
+    assert recorder.recorded[0].event.hazard_id == 1
+    assert recorder.recorded[1] is spoken[0]
+
+
+def test_alert_dispatcher_uncontested_lower_priority_signal_still_speaks_after_settling():
+    """The other half of the same fix: when nothing higher-priority shows up
+    to cancel it, a lone alert must still be heard - just ~0.4s later than
+    before, not silently dropped.
+    """
+    dispatcher, recorder, spoken = _dispatcher_with_spies()
+
+    dispatcher.offer(_new_object_signal(hazard_id=1), now=0.0)
+    assert len(spoken) == 0, "still settling"
+
+    dispatcher.poll(now=re.ALERT_SPEAK_SETTLE_SECONDS + 0.01)
+    assert len(spoken) == 1
     assert recorder.recorded == spoken
+
+
+def test_alert_dispatcher_getting_close_silences_a_concurrent_hazard_detected():
+    """The exact live bug Shaked reported still happening after the RED-only
+    fix above (2026-09-12, same day): "baby getting close" (priority 2) and
+    "hazard detected" (priority 1) are BOTH non-RED, so the RED-only cancel
+    never applied between them - each was approved by its OWN separate
+    AlertArbiter pacing window, so both were still eventually voiced, just a
+    few seconds apart, which is what he was hearing as "both."
+
+    Real fix: collection now happens BEFORE either signal ever reaches the
+    arbiter (see ALERT_SPEAK_SETTLE_SECONDS' comment) - hazard #1's new-
+    object signal is still collecting when the higher-priority proximity
+    signal arrives, so it never gets submitted to the arbiter at all.
+    """
+    dispatcher, recorder, spoken = _dispatcher_with_spies()
+
+    dispatcher.offer(_new_object_signal(hazard_id=1), now=0.0)
+    dispatcher.offer(_proximity_signal("orange", hazard_id=9), now=0.1)
+    # Well past both signals' original collection deadline (0.4) - only the
+    # winner should ever surface, however many frames later this runs.
+    dispatcher.poll(now=1.0)
+
+    assert len(spoken) == 1
+    assert spoken[0].event.hazard_id == 9, "only the higher-priority signal was voiced"
+    assert len(recorder.recorded) == 2, "hazard #1 is recorded, just not voiced"
+    assert recorder.recorded[0].event.hazard_id == 1
+    assert recorder.recorded[1] is spoken[0]
+
+
+def test_alert_dispatcher_hazard_detected_does_not_silence_a_concurrent_getting_close():
+    """The reverse order of the test above - a LOWER-priority signal arriving
+    after a higher-priority one is already collecting must not unseat it.
+    """
+    dispatcher, recorder, spoken = _dispatcher_with_spies()
+
+    dispatcher.offer(_proximity_signal("orange", hazard_id=9), now=0.0)
+    dispatcher.offer(_new_object_signal(hazard_id=1), now=0.1)
+    dispatcher.poll(now=1.0)
+
+    assert len(spoken) == 1
+    assert spoken[0].event.hazard_id == 9
+    assert len(recorder.recorded) == 2
+    assert recorder.recorded[0].event.hazard_id == 1, "the loser, recorded first"
+    assert recorder.recorded[1] is spoken[0]
 
 
 def test_alert_dispatcher_with_persistence_disabled_still_voices():
@@ -1845,8 +2127,8 @@ def test_alert_dispatcher_with_persistence_disabled_still_voices():
     refactor making persistence load-bearing for voicing.
     """
     dispatcher = re.AlertDispatcher(re.AlertArbiter(), audio_player=None, event_recorder=None)
-    voiced = dispatcher.offer(_new_object_signal(), now=0.0)
-    assert voiced is not None
+    dispatcher.offer(_new_object_signal(), now=0.0)
+    dispatcher.poll(now=re.ALERT_SPEAK_SETTLE_SECONDS + 0.01)  # past the collection window
     assert dispatcher.banner_text is not None
 
 
