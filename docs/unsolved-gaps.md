@@ -145,6 +145,77 @@ to confirm either way before assuming it's a real bug.
 
 ---
 
+*Items 3–10 below were added 2026-11-24 from a gap review with Shaked.*
+*Shaked's own list was: double alarms (item 1), Mac/iPad alert desync*
+*(listed under "Also open" below), too many false alarms, re-alarms on*
+*already-reviewed objects, the design/interface, and the voice clip. The*
+*review also found the other items in this file, `PHASE_PLAN.md` and the*
+*recent commits. Items 3–6 are Shaked's; items 7–10 came from the review.*
+
+## 3. Too many false alarms overall
+
+**Reported by Shaked, 2026-11-24.** Separate from item 1's specific
+double-alert symptom: the system raises alerts too often in general.
+Probably overlaps with items 1 and 4, but the cause hasn't been
+investigated. Not measured: no count of false alarms per session exists.
+A first step would be to log every alert during a normal session and label
+each one real or false, so it's clear which mechanism produces most of them.
+
+## 4. Re-alarms on objects the parent already reviewed
+
+**Reported by Shaked, 2026-11-24.** Objects already marked "hazard" or "not
+a hazard" alert again as if they were new. Related to the dismissal
+fingerprint check (`fingerprint_changed()`, `cv/risk_engine.py`) and the
+hazard-matching jitter fixed in item 1's attempts 5–6. The 2026-09-12 fixes
+targeted parts of this, but Shaked still sees it. Not confirmed fixed live.
+
+## 5. Design and interface quality
+
+**Raised by Shaked, 2026-11-24.** The current Flet UI ("Console" direction,
+`ui/app.py`) works but isn't good enough for a parent. Phase 8 work, lower
+priority than the alert bugs above.
+
+## 6. Replace the voice alert clips
+
+**Raised by Shaked, 2026-11-24; suggestion from the lecturer.** The current
+pre-recorded clips aren't good. The lecturer suggested a recorded voice note
+of the mother saying "NO", aimed at stopping the child from getting closer.
+**Design note:** today's clips ("Hazard detected", "Baby getting close")
+address the *parent*; a "NO" addresses the *child*. That likely means two
+outputs: the "NO" played loudly in the child's room, and the normal alert
+on the parent's screen. Still pre-recorded audio, so it stays within
+CLAUDE.md decision 4.
+
+## 7. iPad video only smooth at 2 fps (workaround, not a fix)
+
+`--web-max-fps 2` on the `flet run --ios` launch fixed the iPad video delay
+(2026-09-11) by throttling, not by fixing Flet's unbounded outbound
+websocket queue. Higher rates (3–4 fps) were never tried. Picture smoothness
+only, not alert latency. See `docs/decision-log.md`, search
+"--web-max-fps 2".
+
+## 8. cv/ fixes never verified on the real camera
+
+Several fixes were reproduced and verified only with isolated scripts and
+unit tests, not live. Example: commit 57b0fc7's two occlusion fixes ("neither
+has been verified against the real camera yet"). Items 1 and 4 can't be
+called closed until a live run confirms them.
+
+## 9. UI panels not re-verified
+
+The event log, settings panel, and clip keep/discard controls named in
+Phase 8's goal line haven't been checked by docs-agent against the code (see
+`PHASE_PLAN.md`, Phase 8). They aren't known to be broken.
+
+## 10. No long hands-off run yet (Phase 9)
+
+Phase 9's done-when bar is "full run-through works unattended for an
+extended session without manual intervention." Not started (`[ ]` in
+`PHASE_PLAN.md`). Several items above, such as false alarm rates, are only
+really measurable in such a run.
+
+---
+
 ## Resolved
 
 *(move items here, with the date and the decision-log entry that closed
